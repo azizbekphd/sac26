@@ -48,12 +48,22 @@ class PlaybackJob:
     task: asyncio.Task | None = None
     touched: float = field(default_factory=monotonic)
     images: dict[str, bytes] = field(default_factory=dict)
+    records: tuple[Exposure, ...] = ()
+    patch: tuple[float, float, int] | None = None
+    mode: str = "matched"
+    inventory: list | None = None
+    exposure_issues: dict[str, str] = field(default_factory=dict)
 
     def snapshot(self):
-        return {
+        snapshot = {
             "status": self.status, "message": self.message, "preview": self.preview,
-            "frames": self.frames, "comparison": self.comparison, "partial": self.partial,
+            "frames": self.frames, "comparison": self.comparison, "partial": self.partial, "mode": self.mode,
         }
+        if self.inventory is not None:
+            snapshot["exposures"] = self.inventory
+        if self.exposure_issues:
+            snapshot["exposureIssues"] = self.exposure_issues
+        return snapshot
 
     def image(self, name, png):
         self.images[name] = png
@@ -142,12 +152,24 @@ def shared_mask(valid_a, band_a, valid_b, band_b):
     return valid_a & valid_b & (overlap >= MIN_OVERLAP - 1e-12)
 
 
+def publish_frames(job, frames):
+    stretch = np.percentile(np.concatenate([image[valid] for _, image, valid in frames]), [1, 99.5])
+    job.frames = [
+        {**metadata, "imageUrl": job.image(f"frame-{index}", render_png(image, valid, stretch))}
+        for index, (metadata, image, valid) in enumerate(frames)
+    ]
+
+
 @dataclass(frozen=True)
 class Center:
     exposure: Exposure
     visit: int
     wavelength: float
     bandwidth: float
+
+    @property
+    def band(self):
+        return self.wavelength - self.bandwidth / 2, self.wavelength + self.bandwidth / 2
 
 
 class PlaybackSearch:
@@ -187,7 +209,7 @@ class PlaybackSearch:
         return wave, band
 
     async def calibration_rows(self, key, first, last):
-        calibration = await asyncio.shield(self.read(("calibration", key), self.calibration, key))
+        calibration = await self.read(("calibration", key), self.calibration, key)
         if calibration is None:
             return None
         # The two rasters use separate ranges in the same calibration product.
@@ -196,7 +218,7 @@ class PlaybackSearch:
         ))
         return None if wave is None or band is None else (wave, band)
 
-    async def center(self, item, visit):
+    async def center(self, item, visit, minimum_area=MIN_AREA):
         science = await self.science(item)
         if science is None:
             return None
@@ -205,9 +227,10 @@ class PlaybackSearch:
         height, width = science.shape
         if not (-.5 <= x < width - .5 and -.5 <= y < height - .5):
             return None
-        inside, _, _ = detector_pixels(wcs, self.world, science.shape)
-        if inside.mean() < MIN_AREA:
-            return None
+        if minimum_area:
+            inside, _, _ = detector_pixels(wcs, self.world, science.shape)
+            if inside.mean() < minimum_area:
+                return None
         x, y = np.clip(x, 0, width - 1), np.clip(y, 0, height - 1)
         col, row = min(int(x), width - 2), min(int(y), height - 2)
         # Nearby centers can reuse a small stripe of calibrated detector rows.
@@ -229,13 +252,19 @@ class PlaybackSearch:
             return None
         if self.preview_key == item.key:
             self.job.preview["wavelength"] = wavelength
+            self.job.preview["bandwidth"] = bandwidth
         return Center(item, visit, wavelength, bandwidth)
 
-    async def image(self, item):
+    async def image_pixels(self, item, *, require_science=False):
         science = await self.science(item)
         if science is None:
+            if require_science:
+                raise ArchiveError("Could not read the science image header.")
             return None
-        pixels = await exposure_pixels(self.client, item, self.world, 0, science=science, bilinear=True)
+        return await exposure_pixels(self.client, item, self.world, 0, science=science, bilinear=True)
+
+    async def image(self, item):
+        pixels = await self.image_pixels(item)
         if pixels is not None and self.job.preview is None:
             image, valid, _, _ = pixels
             self.preview_key = item.key
@@ -243,6 +272,7 @@ class PlaybackSearch:
             center = center.result() if center is not None and center.done() else None
             self.job.preview = {
                 **exposure_metadata(item, center.wavelength if center else None, float(valid.mean())),
+                "bandwidth": center.bandwidth if center else None,
                 "imageUrl": self.job.image("preview", render_png(image, valid)),
             }
             self.job.message = "Looking for a matching visit…"
@@ -348,12 +378,12 @@ class PlaybackSearch:
 
     def publish(self, result):
         items, images, valid, overlap, coverage = result
-        stretch = np.percentile(np.concatenate([image[valid] for image in images]), [1, 99.5])
-        self.job.frames = [
-            {**exposure_metadata(center.exposure, center.wavelength, coverage),
-             "imageUrl": self.job.image(f"frame-{index}", render_png(image, valid, stretch))}
-            for index, (center, image) in enumerate(zip(items, images))
-        ]
+        self.job.records = tuple(center.exposure for center in items)
+        publish_frames(self.job, [
+            ({**exposure_metadata(center.exposure, center.wavelength, coverage),
+              "bandwidth": center.bandwidth}, image, valid)
+            for center, image in zip(items, images)
+        ])
         self.job.comparison = {
             "days": items[1].exposure.mjd - items[0].exposure.mjd,
             "overlap": overlap, "coverage": coverage,
@@ -448,9 +478,12 @@ class PlaybackSearch:
             for task in self.preview_tasks:
                 task.cancel()
             await asyncio.gather(*self.preview_tasks, return_exceptions=True)
-            for task in self.reads.values():
-                task.cancel()
-            await asyncio.gather(*self.reads.values(), return_exceptions=True)
+            await self.close_reads()
+
+    async def close_reads(self):
+        for task in self.reads.values():
+            task.cancel()
+        await asyncio.gather(*self.reads.values(), return_exceptions=True)
 
 
 async def run_playback(client, job, ra, dec, field_size):

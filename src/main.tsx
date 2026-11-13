@@ -4,7 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } fro
 import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
-import { watchPlayback, type PlaybackUpdate } from './exposure';
+import { ManualPicker } from './ManualPicker';
+import { watchPlayback, type ArchivePatch, type PlaybackUpdate } from './exposure';
 import './styles.css';
 
 const fieldSizes = [3, 6, 12, 24, 48] as const;
@@ -28,13 +29,13 @@ function restorePreset(): PatchDraft {
   return { preset: '', fields: emptyFields };
 }
 
-type SubmittedPatch = {
-  position: SkyPosition;
+type SubmittedPatch = ArchivePatch & {
   coordinates: CoordinateFields;
   fieldSize: typeof fieldSizes[number];
 };
 
-type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate };
+type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
+type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 
 function App() {
   const [drawerOpen, setDrawerOpen] = useState(true);
@@ -42,6 +43,7 @@ function App() {
   const [errors, setErrors] = useState<Partial<CoordinateFields>>({});
   const [fieldSizeIndex, setFieldSizeIndex] = useState(1);
   const [view, setView] = useState<WorkspaceState | null>(null);
+  const [manual, setManual] = useState<ManualState | null>(null);
   const [frameIndex, setFrameIndex] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -62,6 +64,7 @@ function App() {
   const observationTime = exposure?.observedAt.replace('T', ' ').slice(0, 19);
   const workspaceOpen = Boolean(exposure);
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
+  const exploratory = result?.mode === 'exploratory';
 
   useEffect(() => {
     try {
@@ -78,9 +81,9 @@ function App() {
 
   useEffect(() => {
     if (!playing || !canPlay) return;
-    const timer = window.setInterval(() => setFrameIndex((index) => 1 - index), 1000);
+    const timer = window.setInterval(() => setFrameIndex((index) => (index + 1) % frameCount), 1000);
     return () => window.clearInterval(timer);
-  }, [canPlay, playing]);
+  }, [canPlay, frameCount, playing]);
 
   useEffect(() => () => requestRef.current?.abort(), []);
 
@@ -109,10 +112,11 @@ function App() {
       status: 'searching', message: 'Searching the SPHEREx archive…', preview: null,
       frames: [], comparison: null, partial: false,
     } });
-    void watchPlayback(patch.position, patch.fieldSize, controller.signal, (result) => {
+    void watchPlayback(patch, controller.signal, (result) => {
       if (controller.signal.aborted) return;
       if (result.status !== 'searching') requestRef.current = null;
-      setView({ patch, result });
+      const autoSelectedSources = result.status === 'ready' ? new Set(result.frames.map((frame) => frame.sourceUrl)) : undefined;
+      setView({ patch, result, autoSelectedSources });
     }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
       requestRef.current = null;
@@ -141,11 +145,34 @@ function App() {
     }
 
     if (!draftPosition) return;
-    loadComparison({
+    const submitter = (event.nativeEvent as SubmitEvent).submitter;
+    const chooseManually = submitter instanceof HTMLButtonElement && submitter.value === 'manual';
+    const patch: SubmittedPatch = {
       position: draftPosition,
       coordinates: { ra: fields.ra.trim(), dec: fields.dec.trim() },
       fieldSize,
-    });
+    };
+    if (chooseManually) {
+      setManual({ patch });
+    } else {
+      loadComparison(patch);
+    }
+  }
+
+  function editComparison() {
+    if (!view) return;
+    setPlaying(false);
+    setManual({ patch: view.patch, seed: view.result, autoSelectedSources: view.autoSelectedSources });
+  }
+
+  function applySelection(result: PlaybackUpdate) {
+    if (!manual) return;
+    setFrameIndex(0);
+    setPlaying(false);
+    setDetailsOpen(false);
+    setView({ patch: manual.patch, result, autoSelectedSources: manual.autoSelectedSources });
+    setManual(null);
+    requestAnimationFrame(() => backAction.current?.focus({ preventScroll: true }));
   }
 
   function backToSky() {
@@ -157,9 +184,9 @@ function App() {
     requestAnimationFrame(() => submitAction.current?.focus({ preventScroll: true }));
   }
 
-  function stepFrame() {
+  function stepFrame(direction: number) {
     setPlaying(false);
-    setFrameIndex((index) => 1 - index);
+    setFrameIndex((index) => (index + direction + frameCount) % frameCount);
   }
 
   const drawerAction = drawerOpen ? 'Hide patch' : 'Choose patch';
@@ -234,6 +261,7 @@ function App() {
                 } : undefined}>
                 {isLoading ? 'Cancel' : 'Compare visits'}
               </button>
+              {!isLoading && <button className="control" type="submit" value="manual">Choose exposures manually</button>}
               {view && canRetry && !workspaceOpen && (
                 <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
               )}
@@ -269,11 +297,13 @@ function App() {
                         {exposure.wavelength !== null && (
                           <span title="Wavelength at patch center">{exposure.wavelength.toFixed(3)} µm</span>
                         )}
+                        {view.autoSelectedSources?.has(exposure.sourceUrl) && <span className="auto-selected">Auto-selected</span>}
                       </div>
                     </div>
-                    {view.result.message && (
-                      <p className="lookup-status" role="status">{view.result.message}</p>
-                    )}
+                    {exploratory && <strong>Exploratory blink</strong>}
+                    {view.result.message && <p className="lookup-status" role="status">
+                      {exploratory && 'Matched playback was unavailable. '}{view.result.message}
+                    </p>}
                     {canPlay && (
                       <>
                         <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
@@ -284,14 +314,14 @@ function App() {
                           }} />
                         <div className="exposure-control-row">
                           <div className="playback-controls" role="group" aria-label="Playback controls">
-                            <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={stepFrame}>
+                            <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
                               <span aria-hidden="true">⏮︎</span>
                             </button>
                             <button className="control symbol-control" type="button" aria-label={playbackLabel} title={playbackLabel}
                               onClick={() => setPlaying((active) => !active)}>
                               <span aria-hidden="true">{playing ? '⏸︎' : '▶︎'}</span>
                             </button>
-                            <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={stepFrame}>
+                            <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={() => stepFrame(1)}>
                               <span aria-hidden="true">⏭︎</span>
                             </button>
                           </div>
@@ -304,6 +334,7 @@ function App() {
                         <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
                       </div>
                     )}
+                    {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
                     <button ref={detailsAction} className="control details-toggle" type="button"
                       aria-expanded={detailsOpen} aria-controls="exposure-details"
                       onClick={() => setDetailsOpen((open) => !open)}>
@@ -334,16 +365,27 @@ function App() {
                           {exposure.wavelength !== null && (
                             <tr><th scope="row">Wavelength</th><td>{exposure.wavelength.toFixed(3)} µm at center</td></tr>
                           )}
-                          {!view.result.comparison && <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>}
+                          {exposure.bandwidth != null && (
+                            <tr><th scope="row">Bandwidth</th><td>{exposure.bandwidth.toFixed(4)} µm at center</td></tr>
+                          )}
+                          {exposure.visit != null && <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>}
+                          {(!view.result.comparison || exposure.visit != null) && (
+                            <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>
+                          )}
                         </tbody>
                       </table>
                       {view.result.comparison && (
                         <table>
-                          <caption>Match</caption>
+                          <caption>{exploratory ? 'Comparison' : 'Match'}</caption>
                           <tbody>
-                            <tr><th scope="row">Time apart</th><td>{view.result.comparison.days.toFixed(2)} days</td></tr>
-                            <tr><th scope="row">Center overlap</th><td>{(100 * view.result.comparison.overlap).toFixed(1)}%</td></tr>
-                            <tr><th scope="row">Shared area</th><td>{(100 * view.result.comparison.coverage).toFixed(1)}%</td></tr>
+                            <tr><th scope="row">Time span</th><td>{view.result.comparison.days < 1
+                              ? `${(view.result.comparison.days * 1440).toFixed(1)} minutes`
+                              : `${view.result.comparison.days.toFixed(2)} days`}</td></tr>
+                            {view.result.comparison.overlap !== null && (
+                              <tr><th scope="row">Center overlap</th><td>{(100 * view.result.comparison.overlap).toFixed(1)}%</td></tr>
+                            )}
+                            <tr><th scope="row">{view.result.comparison.coverageIncludesBandpass === false
+                              ? 'Shared valid area' : 'Shared matched area'}</th><td>{(100 * view.result.comparison.coverage).toFixed(1)}%</td></tr>
                           </tbody>
                         </table>
                       )}
@@ -355,6 +397,8 @@ function App() {
             </div>
           )}
         </section>
+        {manual && <ManualPicker patch={manual.patch} seed={manual.seed}
+          autoSelectedSources={manual.autoSelectedSources} onClose={() => setManual(null)} onApply={applySelection} />}
       </main>
     </div>
   );

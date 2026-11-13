@@ -48,6 +48,7 @@ class Exposure:
     observation_id: str
     mjd: float
     footprint: tuple[tuple[float, float], ...] = ()
+    wavelength_bounds: tuple[float, float] | None = None
 
     @property
     def release(self):
@@ -110,6 +111,16 @@ def archive_footprint(row):
     return ()
 
 
+def archive_wavelength_bounds(row):
+    try:
+        lower, upper = (float(row[name]) * 1e6 for name in ("em_min", "em_max"))
+        if math.isfinite(upper) and 0 < lower <= upper:
+            return lower, upper
+    except (KeyError, ValueError, TypeError):
+        pass
+    return None
+
+
 def archive_records(body, compact):
     if compact and not body.lstrip().startswith(b"<"):
         try:
@@ -165,7 +176,10 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
             mjd = float(row["t_min"])
             if not match or not math.isfinite(mjd):
                 raise ValueError("Invalid archive record")
-            exposures[key] = Exposure(key, int(match[1]), str(row["obs_id"]), mjd, archive_footprint(row))
+            item = Exposure(
+                key, int(match[1]), str(row["obs_id"]), mjd, archive_footprint(row), archive_wavelength_bounds(row),
+            )
+            exposures[key] = item
         except (KeyError, ValueError, TypeError):
             truncated = True
     return sorted(exposures.values(), key=lambda exposure: (-exposure.mjd, exposure.key)), truncated
@@ -340,6 +354,7 @@ async def exposure_pixels(client, exposure, world, minimum_coverage, *, science=
 
 def exposure_metadata(exposure, wavelength, coverage):
     return {
+        "key": exposure.key,
         "observationId": exposure.observation_id,
         "detector": exposure.detector,
         "observedAt": Time(exposure.mjd, format="mjd", scale="utc").isot + "Z",
