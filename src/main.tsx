@@ -32,7 +32,6 @@ type SubmittedPatch = {
   position: SkyPosition;
   coordinates: CoordinateFields;
   fieldSize: typeof fieldSizes[number];
-  target?: 'wise-0855';
 };
 
 type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate };
@@ -114,7 +113,7 @@ function App() {
       if (controller.signal.aborted) return;
       if (result.status !== 'searching') requestRef.current = null;
       setView({ patch, result });
-    }, patch.target).catch((error: unknown) => {
+    }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
       requestRef.current = null;
       const message = error instanceof Error && !(error instanceof TypeError)
@@ -146,7 +145,6 @@ function App() {
       position: draftPosition,
       coordinates: { ra: fields.ra.trim(), dec: fields.dec.trim() },
       fieldSize,
-      target: preset === 'WISE 0855' ? 'wise-0855' : undefined,
     });
   }
 

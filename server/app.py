@@ -22,10 +22,6 @@ class Patch(BaseModel):
     fieldSize: Literal[3, 6, 12, 24, 48]
 
 
-class PlaybackPatch(Patch):
-    target: Literal["wise-0855"] | None = None
-
-
 @asynccontextmanager
 async def lifespan(app):
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
@@ -54,7 +50,7 @@ def playback_job(request: Request, job_id: str):
 
 
 @app.post("/api/playback", status_code=202)
-async def start_playback(patch: PlaybackPatch, request: Request):
+async def start_playback(patch: Patch, request: Request):
     jobs = request.app.state.playback
     cutoff = monotonic() - JOB_RETENTION
     for job_id in list(jobs):
@@ -62,7 +58,7 @@ async def start_playback(patch: PlaybackPatch, request: Request):
             del jobs[job_id]
     job = PlaybackJob(uuid4().hex)
     job.task = asyncio.create_task(run_playback(
-        request.app.state.archive, job, patch.ra, patch.dec, patch.fieldSize, target=patch.target,
+        request.app.state.archive, job, patch.ra, patch.dec, patch.fieldSize,
     ))
     jobs[job.id] = job
     return {"id": job.id}

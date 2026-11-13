@@ -45,13 +45,12 @@ function nextPoll(signal: AbortSignal) {
 
 export async function watchPlayback(
   position: SkyPosition, fieldSize: number, signal: AbortSignal, update: (result: PlaybackUpdate) => void,
-  target?: 'wise-0855',
 ) {
   // Read the job ID even if the visitor cancels before the POST response arrives.
   const { id } = await jsonResponse<{ id: string }>(await fetch('/api/playback', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ...position, fieldSize, target }),
+    body: JSON.stringify({ ...position, fieldSize }),
   }));
   const path = `/api/playback/${encodeURIComponent(id)}`;
   let finished = false;

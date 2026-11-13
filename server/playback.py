@@ -17,7 +17,6 @@ from .exposure import (
     ArchiveError, Exposure, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
     exposure_pixels, interpolate_pixels, raster, render_png, rows, search, sky_grid,
 )
-from .target import WISE_DETECTORS, measure_wise
 
 ARCHIVE_ERRORS = (ArchiveError, httpx.HTTPError, OSError, ValueError, KeyError)
 VISIT_GAP = 10 / (24 * 60)
@@ -28,7 +27,6 @@ FALLBACK_METADATA_LIMIT = 128
 JOB_SECONDS = 180
 ARCHIVE_FALLBACK_SECONDS = 8
 METADATA_SECONDS = 75
-TARGET_SEARCH_SECONDS = 65
 log = logging.getLogger(__name__)
 
 
@@ -153,13 +151,11 @@ class Center:
 
 
 class PlaybackSearch:
-    def __init__(self, client, job, ra, dec, field_size, *, target=None):
+    def __init__(self, client, job, ra, dec, field_size):
         self.client = client
         self.job = job
-        self.target = target
         self.ra, self.dec = ra, dec
         self.world, self.corners = sky_grid(ra, dec, field_size)
-        self.pixel_scale = field_size * 60 / self.world[0].shape[0]
         radius = ceil(field_size / (60 * sqrt(2)) * 1e6) / 1e6
         self.point = f"CIRCLE {ra:.9f} {dec:.9f} 0"
         self.circle = f"CIRCLE {ra:.9f} {dec:.9f} {radius:.6f}"
@@ -249,9 +245,7 @@ class PlaybackSearch:
                 **exposure_metadata(item, center.wavelength if center else None, float(valid.mean())),
                 "imageUrl": self.job.image("preview", render_png(image, valid)),
             }
-            self.job.message = (
-                "Looking for WISE 0855 in both visits…" if self.target else "Looking for a matching visit…"
-            )
+            self.job.message = "Looking for a matching visit…"
         return pixels
 
     async def field_bandpass(self, exposure, wcs, shape):
@@ -352,63 +346,6 @@ class PlaybackSearch:
                     await asyncio.gather(*checks, return_exceptions=True)
         return None
 
-    async def wise_detection(self, item):
-        science = await asyncio.shield(self.science(item))
-        if science is None:
-            return None
-        key = calibration_key(item)
-
-        async def calibration(first, last):
-            return await self.calibration_rows(key, first, last)
-
-        return await measure_wise(self.client, item, science, calibration)
-
-    def target_visible(self, mask, detection):
-        ra, dec = self.world
-        position = detection.position
-        east = ((ra - position.ra.deg + 180) % 360 - 180) * np.cos(position.dec.rad)
-        distance = np.hypot(east, dec - position.dec.deg) * 3600
-        closest = np.unravel_index(distance.argmin(), mask.shape)
-        return distance[closest] <= self.pixel_scale / sqrt(2) and mask[closest]
-
-    async def find_wise_pair(self, visits):
-        # The offline scan found the clearest long-baseline pairs on D5.
-        for detector in WISE_DETECTORS:
-            items = [(item, visit) for visit, group in enumerate(visits) for item in group
-                     if item.detector == detector]
-            if len({visit for _, visit in items}) < 2:
-                continue
-            centers = []
-            for batch in batches(items, 8):
-                found = await asyncio.gather(*(asyncio.shield(
-                    self.read(("center", item.key), self.center, item, visit),
-                ) for item, visit in batch))
-                centers.extend(replace(center, visit=visit) for center, (_, visit) in zip(found, batch)
-                               if center is not None)
-            candidates = []
-            for a, b in combinations(centers, 2):
-                if a.visit == b.visit:
-                    continue
-                overlap = float(bandpass_overlap(a.wavelength, a.bandwidth, b.wavelength, b.bandwidth))
-                if overlap >= MIN_OVERLAP - 1e-12:
-                    candidates.append((abs(a.exposure.mjd - b.exposure.mjd), overlap, a, b))
-            candidates.sort(key=lambda candidate: candidate[:2], reverse=True)
-            for _, overlap, a, b in candidates:
-                da, db = await asyncio.gather(*(self.read(
-                    ("wise detection", center.exposure.key), self.wise_detection, center.exposure,
-                ) for center in (a, b)))
-                if da is None or db is None:
-                    continue
-                target_overlap = bandpass_overlap(da.wavelength, da.bandwidth, db.wavelength, db.bandwidth)
-                if target_overlap < MIN_OVERLAP - 1e-12:
-                    continue
-                result = await asyncio.shield(self.read(
-                    ("pair", a.exposure.key, b.exposure.key), self.pair, a, b, overlap,
-                ))
-                if result is not None and all(self.target_visible(result[2], detection) for detection in (da, db)):
-                    return result
-        return None
-
     def publish(self, result):
         items, images, valid, overlap, coverage = result
         stretch = np.percentile(np.concatenate([image[valid] for image in images]), [1, 99.5])
@@ -481,7 +418,6 @@ class PlaybackSearch:
             visits = []
             full_field = False
             previews = []
-            target_deadline = asyncio.get_running_loop().time() + TARGET_SEARCH_SECONDS
             async with aclosing(self.discover()) as results:
                 async for exposures, truncated, full_field in results:
                     if self.job.preview is None:
@@ -490,25 +426,9 @@ class PlaybackSearch:
                         previews.append(preview)
                         self.preview_tasks.append(preview)
                     visits = group_visits(exposures)
-                    if self.target == "wise-0855":
-                        try:
-                            async with asyncio.timeout_at(target_deadline):
-                                result = await self.find_wise_pair(visits)
-                        except TimeoutError:
-                            result = None
-                        if result is not None:
-                            self.job.partial |= truncated
-                            self.publish(result)
-                            return
-                        if self.job.preview is not None:
-                            self.job.message = "Looking for a matching visit…"
                     if (result := await self.find_pair(visits)) is not None:
                         self.job.partial |= truncated
                         self.publish(result)
-                        if self.target:
-                            self.job.message += (" " if self.job.message else "") + (
-                                "WISE 0855 could not be confirmed in both frames."
-                            )
                         return
             self.job.partial |= not full_field
             if self.job.preview is None:
@@ -533,10 +453,10 @@ class PlaybackSearch:
             await asyncio.gather(*self.reads.values(), return_exceptions=True)
 
 
-async def run_playback(client, job, ra, dec, field_size, *, target=None):
+async def run_playback(client, job, ra, dec, field_size):
     try:
         async with asyncio.timeout(JOB_SECONDS):
-            await PlaybackSearch(client, job, ra, dec, field_size, target=target).run()
+            await PlaybackSearch(client, job, ra, dec, field_size).run()
     except httpx.TimeoutException:
         job.status = "error"
         job.message = "IRSA timed out while listing exposures. Try again."

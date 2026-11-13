@@ -11,7 +11,6 @@ from PIL import Image
 from .app import app
 from .exposure import QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, rows, search
 from .playback import Center, PlaybackJob, PlaybackSearch, bandpass_overlap, group_visits, run_playback, shared_mask
-from .target import Detection, point_source_signal, wise_position
 
 
 def exposure(name, mjd):
@@ -19,38 +18,6 @@ def exposure(name, mjd):
 
 
 class PlaybackTests(unittest.IsolatedAsyncioTestCase):
-    def test_point_source_fit_distinguishes_a_detection_from_background(self):
-        y, x = np.mgrid[-7:8, -7:8]
-        py, px = np.mgrid[-16:17, -16:17] / 5
-        psf = np.exp(-(px**2 + py**2) / 2)
-        template = np.exp(-(x**2 + y**2) / 2)
-        background = 3 + .1 * x - .2 * y
-        variance = np.full(x.shape, .01)
-        usable = np.ones(x.shape, dtype=bool)
-        args = (variance, usable, psf, x, y, (5, 5))
-        self.assertGreater(point_source_signal(background + 2 * template, *args), 5)
-        self.assertAlmostEqual(point_source_signal(background, *args), 0)
-        usable[7, 7] = usable[7, 6] = False
-        self.assertIsNone(point_source_signal(background + 2 * template, *args))
-
-    async def test_wise_pair_skips_a_longer_match_with_an_undetected_target(self):
-        early, middle, late = [Exposure(name, 5, name, date) for name, date in (
-            ("early", 60801), ("middle", 60831), ("late", 61174),
-        )]
-        position = wise_position(middle.mjd)
-        runner = PlaybackSearch(None, PlaybackJob("wise"), position.ra.deg, position.dec.deg, 6, target="wise-0855")
-        valid = np.ones(runner.world[0].shape, dtype=bool)
-        runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 4.3, .04))
-        runner.wise_detection = AsyncMock(side_effect=lambda item: (
-            None if item is early else Detection(position, 7, 4.3, .04)
-        ))
-        pair = ((middle, late), (), valid, 1, 1)
-        runner.pair = AsyncMock(return_value=pair)
-
-        self.assertIs(await runner.find_wise_pair([[early], [middle], [late]]), pair)
-        runner.pair.assert_awaited_once()
-        self.assertEqual({c.exposure for c in runner.pair.await_args.args[:2]}, {middle, late})
-
     async def test_playback_interpolates_only_usable_detector_pixels(self):
         pixels = np.array([[0, 8, 16, 24], [4, 12, 20, 28], [8, np.nan, 24, 32]])
         flags = np.zeros_like(pixels, dtype=np.int32)
@@ -329,7 +296,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         first_started = asyncio.Event()
         first_stopped = asyncio.Event()
 
-        async def lookup(client, job, ra, dec, field_size, *, target=None):
+        async def lookup(client, job, ra, dec, field_size):
             if ra == 10:
                 first_started.set()
                 try:
