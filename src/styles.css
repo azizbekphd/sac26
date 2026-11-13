@@ -119,6 +119,14 @@ form { display: grid; gap: 10px; }
 .field-size-heading { display: flex; justify-content: space-between; gap: 8px; }
 .field-size-heading span { color: var(--muted); font-size: 12px; }
 .field-size input[type='range'] { height: 28px; margin: 0; padding: 0; accent-color: #dedede; }
+.patch-filters > summary { display: list-item; cursor: pointer; padding-block: 8px; }
+.patch-filters > summary:focus-visible { outline: 2px solid #f5f5f5; outline-offset: 2px; }
+.patch-filters fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
+.patch-filters > fieldset { display: grid; gap: 10px; margin-top: 8px; }
+.patch-filter-range { display: grid; gap: 4px 8px; grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.patch-filter-range legend { padding: 0; margin-bottom: 4px; font-size: 12px; font-weight: 600; }
+.patch-filter-range .field label { color: var(--muted); font-size: 11px; font-weight: 400; }
+.patch-filter-range input { min-width: 0; }
 .error { color: #fff; font-size: 11px; line-height: 1.45; }
 .form-actions { display: grid; gap: 5px; }
 .form-actions .control { justify-content: flex-start; }

@@ -20,9 +20,9 @@ CALIBRATION_BATCH = 12
 PREVIEW_CACHE_SIZE = 64
 
 
-def indexed_visits(records):
+def indexed_visits(records, filters):
     return [(item, index) for index, visit in enumerate(group_visits(records), 1)
-            for item in visit]
+            for item in visit if filters.includes(item)]
 
 
 def common_overlap(bands):
@@ -43,7 +43,7 @@ async def discover_inventory(runner, seeds):
     runner.job.records = tuple(records.values())
     runner.job.inventory = [
         {**exposure_metadata(item, None, None), "visit": visit, "wavelengthBounds": item.wavelength_bounds}
-        for item, visit in reversed(indexed_visits(runner.job.records))
+        for item, visit in reversed(indexed_visits(runner.job.records, runner.job.filters))
     ]
     runner.job.partial = not full_field
     runner.job.status = "ready"

@@ -3,15 +3,16 @@
 import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
+from datetime import date
 from time import monotonic
 from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, Response
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
-from .exposure import ArchiveError, NoExposure, find_exposure
+from .exposure import ArchiveError, ArchiveFilters, NoExposure, Release, find_exposure
 from .manual import (
     CALIBRATION_BATCH, MAX_FRAMES, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
     indexed_visits, render_selection, run_manual,
@@ -19,12 +20,46 @@ from .manual import (
 from .playback import PlaybackJob, run_playback
 
 JOB_RETENTION = 30 * 60
+MJD_EPOCH = date(1858, 11, 17)
 
 
 class Patch(BaseModel):
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
     fieldSize: Literal[3, 6, 12, 24, 48]
+    release: Release | None = None
+    startDate: date | None = None
+    endDate: date | None = None
+    minWavelength: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    maxWavelength: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def check_ranges(self):
+        if self.startDate is not None and self.endDate is not None and self.startDate > self.endDate:
+            raise ValueError("The start date must be on or before the end date.")
+        if self.minWavelength is not None and self.maxWavelength is not None and self.minWavelength > self.maxWavelength:
+            raise ValueError("Minimum wavelength must be at most maximum wavelength.")
+        return self
+
+    def archive_filters(self):
+        return ArchiveFilters(
+            release=self.release,
+            start_mjd=(self.startDate - MJD_EPOCH).days if self.startDate is not None else None,
+            end_mjd=(self.endDate - MJD_EPOCH).days + 1 if self.endDate is not None else None,
+            min_wavelength=self.minWavelength,
+            max_wavelength=self.maxWavelength,
+        )
+
+
+class PlaybackPatch(Patch):
+    minGapDays: float = Field(default=0, ge=0, allow_inf_nan=False)
+    maxGapDays: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def check_gap(self):
+        if self.maxGapDays is not None and self.minGapDays > self.maxGapDays:
+            raise ValueError("Minimum time gap must be at most maximum time gap.")
+        return self
 
 
 class InventoryPatch(Patch):
@@ -67,32 +102,36 @@ def playback_job(request: Request, job_id: str):
     return job
 
 
-def register_job(request, coordinates, run, *args):
+def register_job(request, coordinates, run, *args, filters, min_gap=0, max_gap=None):
     jobs = request.app.state.playback
     cutoff = monotonic() - JOB_RETENTION
     for job_id in list(jobs):
         if jobs[job_id].task.done() and jobs[job_id].touched < cutoff:
             del jobs[job_id]
-    job = PlaybackJob(uuid4().hex, patch=coordinates)
+    job = PlaybackJob(uuid4().hex, patch=coordinates, filters=filters, min_gap=min_gap, max_gap=max_gap)
     job.task = asyncio.create_task(run(request.app.state.archive, job, *args))
     jobs[job.id] = job
     return {"id": job.id}
 
 
 @app.post("/api/playback", status_code=202)
-async def start_playback(patch: Patch, request: Request):
+async def start_playback(patch: PlaybackPatch, request: Request):
     coordinates = patch.ra, patch.dec, patch.fieldSize
-    return register_job(request, coordinates, run_playback, *coordinates)
+    return register_job(
+        request, coordinates, run_playback, *coordinates,
+        filters=patch.archive_filters(), min_gap=patch.minGapDays, max_gap=patch.maxGapDays,
+    )
 
 
 @app.post("/api/manual/inventory", status_code=202)
 async def start_inventory(patch: InventoryPatch, request: Request):
     coordinates = patch.ra, patch.dec, patch.fieldSize
+    filters = patch.archive_filters()
     source = request.app.state.playback.get(patch.fromPlayback)
     seeds = ()
     if source and source.patch == coordinates:
-        seeds = source.records
-    return register_job(request, coordinates, run_manual, discover_inventory, seeds)
+        seeds = tuple(item for item in source.records if filters.includes(item))
+    return register_job(request, coordinates, run_manual, discover_inventory, seeds, filters=filters)
 
 
 def inventory_selection(request, job_id, keys):
@@ -102,7 +141,7 @@ def inventory_selection(request, job_id, keys):
     selected = set(keys)
     if len(selected) != len(keys):
         raise HTTPException(422, "Choose distinct exposures.")
-    records = [(item, visit) for item, visit in indexed_visits(job.records) if item.key in selected]
+    records = [(item, visit) for item, visit in indexed_visits(job.records, job.filters) if item.key in selected]
     if len(records) != len(keys):
         raise HTTPException(422, "Choose exposures from this sky patch’s archive listing.")
     return job, records
@@ -118,7 +157,7 @@ async def manual_calibration(job_id: str, selection: CalibrationRequest, request
 @app.post("/api/manual/{job_id}/comparison", status_code=202)
 async def start_manual_comparison(job_id: str, selection: ManualSelection, request: Request):
     job, records = inventory_selection(request, job_id, selection.keys)
-    return register_job(request, job.patch, run_manual, render_selection, records)
+    return register_job(request, job.patch, run_manual, render_selection, records, filters=job.filters)
 
 
 @app.get("/api/manual/{job_id}/preview")
@@ -208,7 +247,7 @@ async def read_exposure(request, prepare, no_exposure):
 async def exposure(patch: Patch, request: Request):
     async def prepare(deadline):
         return await find_exposure(
-            request.app.state.archive, patch.ra, patch.dec, patch.fieldSize, deadline=deadline,
+            request.app.state.archive, patch.ra, patch.dec, patch.fieldSize, deadline=deadline, filters=patch.archive_filters(),
         )
 
     return await read_exposure(request, prepare, "No usable SPHEREx exposure covers this patch.")

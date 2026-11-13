@@ -8,6 +8,7 @@ from io import BytesIO, StringIO
 import json
 import math
 import re
+from typing import Literal, get_args
 from urllib.parse import quote, urlsplit
 
 from astropy.io import fits
@@ -23,7 +24,8 @@ IRSA_DATA_PREFIX = "/ibe/data/spherex/"
 BUCKET = "nasa-irsa-spherex"
 REGION = "us-east-1"
 S3 = f"https://{BUCKET}.s3.{REGION}.amazonaws.com/"
-RELEASES = ("dr1", "qr3")
+Release = Literal["dr1", "qr3"]
+RELEASES = get_args(Release)
 CAL_VERSION = "cal-swcs-v5-2026-191"
 EXPOSURE_KEY = re.compile(rf"(?:{'|'.join(RELEASES)})/level2/[\w-]+/[\w.-]+/([1-6])/level2_[\w-]+D\1_spx_[\w.-]+\.fits")
 QUALITY_MASK = sum(1 << bit for bit in (1, 4, 6, 7, 9, 10, 11, 15, 17, 26, 27, 28, 29))
@@ -39,6 +41,33 @@ class ArchiveError(Exception):
 
 class NoExposure(Exception):
     pass
+
+
+@dataclass(frozen=True)
+class ArchiveFilters:
+    release: Release | None = None
+    start_mjd: float | None = None
+    end_mjd: float | None = None
+    min_wavelength: float | None = None
+    max_wavelength: float | None = None
+
+    @property
+    def limits_wavelength(self):
+        return self.min_wavelength is not None or self.max_wavelength is not None
+
+    def includes(self, item):
+        if self.release is not None and item.release != self.release:
+            return False
+        if self.start_mjd is not None and item.mjd < self.start_mjd:
+            return False
+        if self.end_mjd is not None and item.mjd >= self.end_mjd:
+            return False
+        if self.limits_wavelength and item.wavelength_bounds is not None:
+            return self.overlaps_band(*item.wavelength_bounds)
+        return True
+
+    def overlaps_band(self, low, high):
+        return max(low, self.min_wavelength or 0) <= min(high, self.max_wavelength or math.inf)
 
 
 @dataclass(frozen=True)
@@ -153,10 +182,19 @@ def archive_key(row, compact):
     return aws["key"]
 
 
-async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False):
+async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False, filters=ArchiveFilters()):
     if region is None:
         region = "POLYGON " + " ".join(f"{value:.9f}" for corner in corners for value in corner)
-    params = {"COLLECTION": [f"spherex_{release}" for release in RELEASES], "POS": region, "MAXREC": limit}
+    releases = RELEASES if filters.release is None else (filters.release,)
+    params = {"COLLECTION": [f"spherex_{name}" for name in releases], "POS": region, "MAXREC": limit}
+    if filters.start_mjd is not None or filters.end_mjd is not None:
+        start = filters.start_mjd if filters.start_mjd is not None else "-Inf"
+        end = filters.end_mjd if filters.end_mjd is not None else "+Inf"
+        params["TIME"] = f"{start} {end}"
+    if filters.limits_wavelength:
+        low = (filters.min_wavelength or 0) * 1e-6
+        high = f"{filters.max_wavelength * 1e-6:.12g}" if filters.max_wavelength is not None else "+Inf"
+        params["BAND"] = f"{low:.12g} {high}"
     if compact:
         params["RESPONSEFORMAT"] = "CSV"
     async with client.stream("GET", SIA, params=params, timeout=httpx.Timeout(45, connect=8)) as response:
@@ -179,7 +217,8 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
             item = Exposure(
                 key, int(match[1]), str(row["obs_id"]), mjd, archive_footprint(row), archive_wavelength_bounds(row),
             )
-            exposures[key] = item
+            if filters.includes(item):
+                exposures[key] = item
         except (KeyError, ValueError, TypeError):
             truncated = True
     return sorted(exposures.values(), key=lambda exposure: (-exposure.mjd, exposure.key)), truncated
@@ -365,9 +404,9 @@ def exposure_metadata(exposure, wavelength, coverage):
     }
 
 
-async def find_exposure(client, ra, dec, field_size, *, deadline):
+async def find_exposure(client, ra, dec, field_size, *, deadline, filters=ArchiveFilters()):
     world, corners = sky_grid(ra, dec, field_size)
-    exposures, truncated = await search(client, corners)
+    exposures, truncated = await search(client, corners, filters=filters)
     failed = False
     best = None
     coverage = 0.

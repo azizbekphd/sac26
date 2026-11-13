@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 
 from .app import app
-from .exposure import QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, rows, search
+from .exposure import ArchiveFilters, QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, rows, search
 from .playback import Center, PlaybackJob, PlaybackSearch, bandpass_overlap, group_visits, run_playback, shared_mask
 
 
@@ -98,7 +98,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         job = PlaybackJob("test")
         runner = PlaybackSearch(None, job, 10, 20, 6)
 
-        async def query(client, corners, limit, *, region=None, compact=False):
+        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
             if region == runner.circle:
                 return [], False
             raise httpx.ReadTimeout("Slow response")
@@ -118,7 +118,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         items = [exposure("earlier", 60000), exposure("later", 60001)]
         stopped = asyncio.Event()
 
-        async def query(client, corners, limit, *, region=None, compact=False):
+        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
             if region == "CIRCLE 10.000000000 20.000000000 0":
                 return items[::-1], False
             try:
@@ -143,7 +143,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         job = PlaybackJob("test")
         runner = PlaybackSearch(None, job, 10, 20, 12)
 
-        async def query(client, corners, limit, *, region=None, compact=False):
+        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
             if region == runner.point:
                 return [], False
             raise httpx.ReadTimeout("Slow footprint response")
@@ -164,7 +164,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         release_full_query = asyncio.Event()
         values = np.ones((3, 3), dtype=np.float32)
 
-        async def query(client, corners, limit, *, region=None, compact=False):
+        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
             self.assertTrue(compact)
             if region:
                 return [item], True
@@ -256,6 +256,25 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         async with asyncio.timeout(2):
             self.assertEqual(await runner.find_pair([[a], [b], [c]]), "verified")
         self.assertTrue(stopped.is_set())
+
+    async def test_auto_checks_both_gap_bounds_and_calibrated_wavelength_before_reading_pixels(self):
+        days = (0, 1, 4, 7, 10)
+        items = [exposure(str(day), 60000 + day) for day in days]
+        # The last exposure would otherwise match the exposure at day 7.
+        waves = dict(zip(items, (1.08, 1.08, 1.08, 1.08, 1.14)))
+        job = PlaybackJob("test", filters=ArchiveFilters(min_wavelength=1.01, max_wavelength=1.01),
+                          min_gap=3, max_gap=3)
+        runner = PlaybackSearch(None, job, 10, 20, 6)
+        runner.center = AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, waves[item], .25))
+        runner.pair = AsyncMock(return_value=None)
+        try:
+            await runner.find_pair(group_visits(items))
+        finally:
+            await runner.close_reads()
+
+        checked = {frozenset((a.exposure, b.exposure)) for a, b, _ in
+                   (call.args for call in runner.pair.await_args_list)}
+        self.assertEqual(checked, {frozenset((items[1], items[2])), frozenset((items[2], items[3]))})
 
     async def test_preview_remains_when_visits_have_no_matching_bandpass(self):
         newest, oldest = exposure("newest", 60001), exposure("oldest", 60000)

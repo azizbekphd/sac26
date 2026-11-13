@@ -1,6 +1,17 @@
 import type { SkyPosition } from './coordinates';
 
-export type ArchivePatch = { position: SkyPosition; fieldSize: number };
+export const archiveReleases = ['dr1', 'qr3'] as const;
+export type ArchiveRelease = typeof archiveReleases[number];
+export type ArchivePatch = {
+  position: SkyPosition;
+  fieldSize: number;
+  release: ArchiveRelease | null;
+  startDate: string | null;
+  endDate: string | null;
+  minWavelength: number | null;
+  maxWavelength: number | null;
+};
+export type PlaybackPatch = ArchivePatch & { minGapDays: number; maxGapDays: number | null };
 
 export type ArchiveExposure = {
   key: string;
@@ -97,21 +108,21 @@ async function watchJob<T extends PlaybackUpdate>(
 }
 
 export function watchPlayback(
-  { position, fieldSize }: ArchivePatch,
+  { position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, minGapDays, maxGapDays }: PlaybackPatch,
   signal: AbortSignal, update: (result: PlaybackUpdate) => void,
 ) {
   return watchJob('/api/playback', {
-    ...position, fieldSize,
+    ...position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, minGapDays, maxGapDays,
   }, signal, update);
 }
 
 export function watchInventory(
-  { position, fieldSize }: ArchivePatch,
+  { position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength }: ArchivePatch,
   fromPlayback: string | undefined, signal: AbortSignal,
   update: (result: InventoryUpdate) => void,
 ) {
   return watchJob('/api/manual/inventory', {
-    ...position, fieldSize, fromPlayback,
+    ...position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, fromPlayback,
   }, signal, update,
     'This server version cannot list exposures for Manual. Restart or update the API server, then retry.');
 }

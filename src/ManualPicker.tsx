@@ -110,7 +110,7 @@ function ExposurePreview({ exposure, source, onClose }: {
 }
 
 export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onApply }: Props) {
-  const { position, fieldSize } = patch;
+  const { position, fieldSize, release: patchRelease } = patch;
   const dialog = useRef<HTMLDialogElement>(null);
   const request = useRef<AbortController | null>(null);
   const revealedExposure = useRef<HTMLInputElement>(null);
@@ -270,7 +270,15 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
         <header className="manual-heading">
           <div>
             <h2 id="manual-title">Select exposures</h2>
-            <p>{position.ra.toFixed(5)}°, {position.dec.toFixed(5)}° · {fieldSize}′ × {fieldSize}′</p>
+            <p>{position.ra.toFixed(5)}°, {position.dec.toFixed(5)}° · {fieldSize}′ × {fieldSize}′{patchRelease && ` · ${patchRelease.toUpperCase()}`}</p>
+            {(patch.startDate || patch.endDate) && <p>
+              UTC dates {patch.startDate ?? 'any start'} through {patch.endDate ?? 'any end'}
+            </p>}
+            {(patch.minWavelength !== null || patch.maxWavelength !== null) && <p>
+              Archive wavelength {patch.minWavelength !== null && `≥ ${patch.minWavelength} µm`}
+              {patch.minWavelength !== null && patch.maxWavelength !== null && ' and '}
+              {patch.maxWavelength !== null && `≤ ${patch.maxWavelength} µm`}
+            </p>}
           </div>
           <button className="control" type="button" onClick={onClose}>Close</button>
         </header>
@@ -287,12 +295,12 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
         {inventoryId && (
           <>
             <fieldset className="manual-filters" disabled={Boolean(status)} onChange={() => changePage(0)}>
-              <label className="field">Release
+              {!patchRelease && <label className="field">Release
                 <select value={release} onChange={(event) => setRelease(event.target.value)}>
                   <option value="">All releases</option>
                   {[...new Set(exposures.map((item) => item.release))].sort().map((name) => <option key={name}>{name}</option>)}
                 </select>
-              </label>
+              </label>}
               <label className="field">Detector
                 <select value={detector} onChange={(event) => setDetector(event.target.value)}>
                   <option value="">All detectors</option>

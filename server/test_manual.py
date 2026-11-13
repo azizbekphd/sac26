@@ -19,6 +19,99 @@ def fixture():
 
 
 class ManualTests(unittest.IsolatedAsyncioTestCase):
+    async def test_release_limits_auto_and_manual_archive_queries(self):
+        def archive(request):
+            self.assertEqual(request.url.params.get_list("COLLECTION"), ["spherex_qr3"])
+            self.assertEqual(request.url.params["TIME"], "61181 61182")
+            self.assertNotIn("BAND", request.url.params)
+            rows = ["obs_id,t_min,em_min,em_max,access_url"]
+            for release, name, mjd, band in (
+                ("dr1", "old", 61181, "1e-6,2e-6"),
+                ("qr3", "in-range", 61181.9999, "1e-6,2e-6"),
+                ("qr3", "wrong-band", 61181.5, "3e-6,4e-6"),
+                ("qr3", "next-day", 61182, "1e-6,2e-6"),
+            ):
+                key = f"{release}/level2/2026W21_1A/l2b-v27/2/level2_{name}D2_spx_l2b-v27.fits"
+                rows.append(f"{name},{mjd},{band},https://irsa.ipac.caltech.edu/ibe/data/spherex/{key}")
+            return httpx.Response(200, text="\n".join(rows))
+
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.MockTransport(archive)) as archive_client,
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            app.state.archive = archive_client
+            payload = {
+                "ra": 10, "dec": 20, "fieldSize": 6, "release": "qr3",
+                "startDate": "2026-05-21", "endDate": "2026-05-21", "minWavelength": 1, "maxWavelength": 2,
+            }
+            with (
+                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=(
+                    np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool), None, (3, 3),
+                ))),
+                patch.object(PlaybackSearch, "center", AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, 1.5, .25))),
+            ):
+                auto = await client.post("/api/playback", json=payload)
+                auto.raise_for_status()
+                auto_job = app.state.playback[auto.json()["id"]]
+                await asyncio.wait_for(auto_job.task, 2)
+                self.assertEqual(auto_job.preview["release"], "QR3")
+                self.assertEqual(auto_job.preview["observationId"], "in-range")
+
+            inventory = await client.post("/api/manual/inventory", json=payload)
+            inventory.raise_for_status()
+            inventory_job = app.state.playback[inventory.json()["id"]]
+            await asyncio.wait_for(inventory_job.task, 2)
+            self.assertEqual([item["release"] for item in inventory_job.inventory], ["QR3"])
+            self.assertEqual([item["observationId"] for item in inventory_job.inventory], ["in-range"])
+
+    async def test_wavelength_filter_keeps_visit_membership(self):
+        early, middle, late = (
+            Exposure(f"dr1/{i}", 2, str(i), 60000 + i / 1440, wavelength_bounds=band)
+            for i, band in ((0, (1, 2)), (8, (2, 3)), (16, (1, 2)))
+        )
+
+        async def discover(runner):
+            yield [late, middle, early], False, True
+
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            with (
+                patch.object(PlaybackSearch, "discover", discover),
+                patch.object(PlaybackSearch, "center", AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, 1.5, .25))),
+                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=(
+                    np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool), None, (3, 3),
+                ))),
+                patch.object(PlaybackSearch, "field_bandpass", AsyncMock(return_value=(
+                    np.full((3, 3), 1.5), np.full((3, 3), .25),
+                ))),
+                patch.object(PlaybackSearch, "pair", AsyncMock()) as pair,
+            ):
+                async def submit(path, payload):
+                    response = await client.post(path, json=payload)
+                    response.raise_for_status()
+                    job = app.state.playback[response.json()["id"]]
+                    await asyncio.wait_for(job.task, 2)
+                    return job
+
+                patch_data = {"ra": 10, "dec": 20, "fieldSize": 6, "minWavelength": 1.5, "maxWavelength": 1.5}
+                auto = await submit("/api/playback", patch_data)
+                self.assertEqual(auto.status, "no-match")
+                self.assertIsNotNone(auto.preview)
+                pair.assert_not_awaited()
+
+                inventory = await submit("/api/manual/inventory", patch_data)
+                self.assertEqual([(item["key"], item["visit"]) for item in inventory.inventory],
+                                 [(late.key, 1), (early.key, 1)])
+                path = f"/api/manual/{inventory.id}/comparison"
+                excluded = await client.post(path, json={"keys": [early.key, middle.key]})
+                self.assertEqual(excluded.status_code, 422)
+                manual = await submit(path, {"keys": [late.key, early.key]})
+                self.assertEqual(manual.mode, "exploratory")
+                self.assertIn("same visit", manual.message)
+
     async def test_inventory_and_comparison_use_exact_exposures(self):
         early, nearby, later, last = fixture()
 

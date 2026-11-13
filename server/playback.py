@@ -4,7 +4,7 @@ import asyncio
 from collections import deque
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
-from itertools import chain, combinations, islice, zip_longest
+from itertools import chain, combinations, islice, pairwise, zip_longest
 import logging
 from math import ceil, sqrt
 from time import monotonic
@@ -14,7 +14,7 @@ import httpx
 import numpy as np
 
 from .exposure import (
-    ArchiveError, Exposure, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
+    ArchiveError, ArchiveFilters, Exposure, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
     exposure_pixels, interpolate_pixels, raster, render_png, rows, search, sky_grid,
 )
 
@@ -53,6 +53,12 @@ class PlaybackJob:
     mode: str = "matched"
     inventory: list | None = None
     exposure_issues: dict[str, str] = field(default_factory=dict)
+    filters: ArchiveFilters = ArchiveFilters()
+    min_gap: float = 0
+    max_gap: float | None = None
+
+    def accepts_gap(self, days):
+        return days >= self.min_gap - 1e-10 and (self.max_gap is None or days <= self.max_gap + 1e-10)
 
     def snapshot(self):
         snapshot = {
@@ -116,7 +122,7 @@ def footprint_hint(item, tangent):
     return position[1], along / np.linalg.norm(along)
 
 
-def promising_candidates(visits, ra, dec):
+def promising_candidates(visits, ra, dec, accepts_gap):
     # SIA footprints give a rough detector position and rotation for ordering only.
     tangent = WCS(naxis=2)
     tangent.wcs.crpix = [1, 1]
@@ -131,9 +137,10 @@ def promising_candidates(visits, ra, dec):
     options = []
     for items in detectors.values():
         for (a, va, row_a, along_a), (b, vb, row_b, along_b) in combinations(items, 2):
+            days = abs(a.mjd - b.mjd)
             row_difference = abs(row_a - row_b)
-            if va != vb and row_difference <= .02 and np.dot(along_a, along_b) >= .85:
-                options.append((abs(a.mjd - b.mjd), -row_difference, (a, va), (b, vb)))
+            if va != vb and accepts_gap(days) and row_difference <= .02 and np.dot(along_a, along_b) >= .85:
+                options.append((days, -row_difference, (a, va), (b, vb)))
     options.sort(key=lambda option: option[:2], reverse=True)
     ordered = dict.fromkeys(item for _, _, a, b in options for item in (a, b))
     return tuple(islice(ordered, 32))
@@ -318,16 +325,33 @@ class PlaybackSearch:
         return items, (image_a, image_b), valid, overlap, coverage
 
     async def find_usable(self, exposures):
+        async def candidate(item):
+            if self.job.filters.limits_wavelength:
+                center = await self.auto_center(item, 0)
+                if center is None or not self.job.filters.overlaps_band(*center.band):
+                    return None
+            return await self.read(("image", item.key), self.image, item)
+
         for batch in batches(exposures, 4):
-            for result in asyncio.as_completed([
-                self.read(("image", item.key), self.image, item) for item in batch
-            ]):
+            checks = [self.read(("preview candidate", item.key), candidate, item) for item in batch]
+            for result in asyncio.as_completed(checks):
                 if await result is not None:
                     return True
         return False
 
+    def auto_center(self, item, visit):
+        if self.job.filters.limits_wavelength:
+            return asyncio.shield(self.read(("center", item.key), self.center, item, visit, minimum_area=0))
+        return asyncio.shield(self.read(("center", item.key), self.center, item, visit))
+
     async def find_pair(self, visits):
         if len(visits) < 2:
+            return None
+        if visits[-1][-1].mjd - visits[0][0].mjd < self.job.min_gap - 1e-10:
+            return None
+        if self.job.max_gap is not None and all(
+            later[0].mjd - earlier[-1].mjd > self.job.max_gap + 1e-10 for earlier, later in pairwise(visits)
+        ):
             return None
         order = visit_order(len(visits))
         remaining_visits = (
@@ -335,13 +359,12 @@ class PlaybackSearch:
             for round_ in zip_longest(*([(item, index) for item in visits[index]] for index in group))
             for item in round_ if item is not None
         )
-        promising = promising_candidates(visits, self.ra, self.dec)
+        promising = promising_candidates(visits, self.ra, self.dec, self.job.accepts_gap)
         candidates = chain(promising, (item for item in remaining_visits if item not in promising))
         remaining = iter(batches(candidates, 8))
 
         def next_centers():
-            return [(self.read(("center", item.key), self.center, item, visit), visit)
-                    for item, visit in next(remaining, ())]
+            return [(self.auto_center(item, visit), visit) for item, visit in next(remaining, ())]
 
         centers = []
         pending = next_centers()
@@ -353,14 +376,16 @@ class PlaybackSearch:
             for center, visit in zip(found, visits_for_batch):
                 if center is None:
                     continue
+                if self.job.filters.limits_wavelength and not self.job.filters.overlaps_band(*center.band):
+                    continue
                 # Additional footprint records can change the visit grouping.
                 center = replace(center, visit=visit)
                 for other in centers:
-                    if center.visit == other.visit:
+                    baseline = abs(center.exposure.mjd - other.exposure.mjd)
+                    if center.visit == other.visit or not self.job.accepts_gap(baseline):
                         continue
                     overlap = float(bandpass_overlap(center.wavelength, center.bandwidth, other.wavelength, other.bandwidth))
                     if overlap >= MIN_OVERLAP - 1e-12:
-                        baseline = abs(center.exposure.mjd - other.exposure.mjd)
                         pairs.append((baseline, overlap, center, other))
                 centers.append(center)
             pairs.sort(key=lambda pair: pair[:2], reverse=True)
@@ -392,12 +417,15 @@ class PlaybackSearch:
         self.job.status = "ready"
 
     async def discover(self):
+        # Keep wavelength-ineligible exposures in the timeline for visit grouping.
+        filters = replace(self.job.filters, min_wavelength=None, max_wavelength=None)
+
         async def query(corners, limit, region=None, delay=0):
             if delay:
                 await asyncio.sleep(delay)
             try:
                 async with asyncio.timeout(METADATA_SECONDS):
-                    return await search(self.client, corners, limit=limit, region=region, compact=True)
+                    return await search(self.client, corners, limit=limit, region=region, compact=True, filters=filters)
             except TimeoutError as error:
                 raise httpx.ReadTimeout("The exposure list exceeded the metadata budget.") from error
 
@@ -450,12 +478,17 @@ class PlaybackSearch:
             previews = []
             async with aclosing(self.discover()) as results:
                 async for exposures, truncated, full_field in results:
+                    visits = [
+                        eligible for visit in group_visits(exposures)
+                        if (eligible := [item for item in visit if self.job.filters.includes(item)])
+                    ]
                     if self.job.preview is None:
                         self.job.message = "Preparing the first exposure…"
-                        preview = asyncio.create_task(self.find_usable(exposures))
+                        preview = asyncio.create_task(self.find_usable(
+                            item for item in exposures if self.job.filters.includes(item)
+                        ))
                         previews.append(preview)
                         self.preview_tasks.append(preview)
-                    visits = group_visits(exposures)
                     if (result := await self.find_pair(visits)) is not None:
                         self.job.partial |= truncated
                         self.publish(result)
@@ -465,6 +498,10 @@ class PlaybackSearch:
                 await asyncio.gather(*previews)
             if self.job.preview is None:
                 self.job.message = "No usable exposures cover this patch."
+                if self.job.filters != ArchiveFilters():
+                    self.job.message = "No usable exposures found for this patch with the selected filters."
+            elif not self.job.partial and (self.job.filters != ArchiveFilters() or self.job.min_gap or self.job.max_gap is not None):
+                self.job.message = "No matched pair meets the selected filters and playback requirements."
             elif not self.job.partial:
                 other_visits = [item for visit in visits if all(item.key != self.preview_key for item in visit) for item in visit]
                 if await self.find_usable(other_visits):

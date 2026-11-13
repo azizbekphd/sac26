@@ -5,7 +5,7 @@ import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
-import { watchPlayback, type ArchivePatch, type PlaybackUpdate } from './exposure';
+import { archiveReleases, watchPlayback, type ArchiveRelease, type PlaybackPatch, type PlaybackUpdate } from './exposure';
 import './styles.css';
 
 const fieldSizes = [3, 6, 12, 24, 48] as const;
@@ -15,6 +15,13 @@ const axes = [
   { key: 'ra', name: 'Right ascension (RA)', example: '133.795129° or 08h55m10.831s', range: '0° to less than 360°' },
   { key: 'dec', name: 'Declination (Dec)', example: '−7.245147° or −7d14m42.53s', range: '−90° to +90°' },
 ] as const;
+const filterRanges = [
+  { label: 'Observation dates (UTC)', fields: ['startDate', 'endDate'], bounds: ['From', 'Through'], type: 'date' },
+  { label: 'Wavelength (µm)', fields: ['minWavelength', 'maxWavelength'], bounds: ['Minimum', 'Maximum'], type: 'number' },
+  { label: 'Time between exposures (days, Auto)', fields: ['minGapDays', 'maxGapDays'], bounds: ['Minimum', 'Maximum'], type: 'number' },
+] as const;
+const emptyFilters = { startDate: '', endDate: '', minWavelength: '', maxWavelength: '', minGapDays: '', maxGapDays: '' };
+type FilterField = keyof typeof emptyFilters;
 
 type PatchDraft = { preset: string; fields: CoordinateFields };
 
@@ -29,7 +36,7 @@ function restorePreset(): PatchDraft {
   return { preset: '', fields: emptyFields };
 }
 
-type SubmittedPatch = ArchivePatch & {
+type SubmittedPatch = PlaybackPatch & {
   coordinates: CoordinateFields;
   fieldSize: typeof fieldSizes[number];
 };
@@ -42,6 +49,9 @@ function App() {
   const [{ preset, fields }, setDraft] = useState(restorePreset);
   const [errors, setErrors] = useState<Partial<CoordinateFields>>({});
   const [fieldSizeIndex, setFieldSizeIndex] = useState(1);
+  const [release, setRelease] = useState<ArchiveRelease | null>(null);
+  const [hasFilters, setHasFilters] = useState(false);
+  const [filterError, setFilterError] = useState('');
   const [view, setView] = useState<WorkspaceState | null>(null);
   const [manual, setManual] = useState<ManualState | null>(null);
   const [frameIndex, setFrameIndex] = useState(0);
@@ -53,6 +63,7 @@ function App() {
   const backAction = useRef<HTMLButtonElement>(null);
   const detailsAction = useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
+  const filtersRef = useRef<HTMLDetailsElement>(null);
   const draftPosition = useMemo(() => parsePosition(fields), [fields]);
   const fieldSize = fieldSizes[fieldSizeIndex];
 
@@ -147,10 +158,55 @@ function App() {
     if (!draftPosition) return;
     const submitter = (event.nativeEvent as SubmitEvent).submitter;
     const chooseManually = submitter instanceof HTMLButtonElement && submitter.value === 'manual';
+    const formData = new FormData(event.currentTarget);
+    const filters = { ...emptyFilters };
+    for (const { fields } of filterRanges) {
+      for (const field of fields) filters[field] = String(formData.get(field) ?? '');
+    }
+    const minWavelength = filters.minWavelength ? Number(filters.minWavelength) : null;
+    const maxWavelength = filters.maxWavelength ? Number(filters.maxWavelength) : null;
+    const minGapDays = filters.minGapDays ? Number(filters.minGapDays) : 0;
+    const maxGapDays = filters.maxGapDays ? Number(filters.maxGapDays) : null;
+    let invalidFilter: FilterField | undefined;
+    let message = '';
+    const badNumber = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('.patch-filters input[type="number"]'))
+      .find((input) => input.validity.badInput && (!chooseManually || !input.id.endsWith('GapDays')));
+    if (badNumber) {
+      invalidFilter = badNumber.id as FilterField;
+      message = 'Enter a valid number or leave the field blank.';
+    } else if (filters.startDate && filters.endDate && filters.startDate > filters.endDate) {
+      invalidFilter = 'endDate';
+      message = 'Enter an end date on or after the start date.';
+    } else if (minWavelength !== null && minWavelength <= 0) {
+      invalidFilter = 'minWavelength';
+      message = 'Enter a wavelength greater than zero.';
+    } else if (maxWavelength !== null && (maxWavelength <= 0 || maxWavelength < (minWavelength ?? 0))) {
+      invalidFilter = 'maxWavelength';
+      message = 'Enter a positive maximum wavelength at least as large as the minimum.';
+    } else if (!chooseManually && minGapDays < 0) {
+      invalidFilter = 'minGapDays';
+      message = 'Enter a minimum time gap of zero days or more.';
+    } else if (!chooseManually && maxGapDays !== null && maxGapDays < minGapDays) {
+      invalidFilter = 'maxGapDays';
+      message = 'Enter a maximum time gap at least as large as the minimum.';
+    }
+    setFilterError(message);
+    if (invalidFilter) {
+      if (filtersRef.current) filtersRef.current.open = true;
+      formRef.current?.querySelector<HTMLInputElement>(`#${invalidFilter}`)?.focus();
+      return;
+    }
     const patch: SubmittedPatch = {
       position: draftPosition,
       coordinates: { ra: fields.ra.trim(), dec: fields.dec.trim() },
       fieldSize,
+      release,
+      startDate: filters.startDate || null,
+      endDate: filters.endDate || null,
+      minWavelength,
+      maxWavelength,
+      minGapDays: chooseManually ? 0 : minGapDays,
+      maxGapDays: chooseManually ? null : maxGapDays,
     };
     if (chooseManually) {
       setManual({ patch });
@@ -170,7 +226,7 @@ function App() {
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
-    setView({ patch: manual.patch, result, autoSelectedSources: manual.autoSelectedSources });
+    setView({ patch: { ...manual.patch, minGapDays: 0, maxGapDays: null }, result, autoSelectedSources: manual.autoSelectedSources });
     setManual(null);
     requestAnimationFrame(() => backAction.current?.focus({ preventScroll: true }));
   }
@@ -248,6 +304,44 @@ function App() {
                 value={fieldSizeIndex} disabled={isLoading} aria-valuetext={`${fieldSize} by ${fieldSize} arcminutes`}
                 onChange={(event) => setFieldSizeIndex(event.currentTarget.valueAsNumber)} />
             </div>
+
+            <details className="patch-filters" ref={filtersRef}>
+              <summary className="control details-toggle">
+                {release || hasFilters ? 'Filters (set)' : 'Filters'}
+              </summary>
+              <fieldset disabled={isLoading}>
+                <div className="field">
+                  <label htmlFor="patch-release">Release</label>
+                  <div className="preset-select">
+                    <select id="patch-release" value={release ?? ''} onChange={(event) => {
+                      const value = event.target.value;
+                      setRelease(archiveReleases.find((name) => name === value) ?? null);
+                    }}>
+                      <option value="">All releases</option>
+                      {archiveReleases.map((name) => <option key={name} value={name}>{name.toUpperCase()}</option>)}
+                    </select>
+                  </div>
+                </div>
+                {filterRanges.map(({ label, fields, bounds, type }) => (
+                  <fieldset className="patch-filter-range" key={label}>
+                    <legend>{label}</legend>
+                    {fields.map((field, index) => (
+                      <div className="field" key={field}>
+                        <label htmlFor={field}>{bounds[index]}</label>
+                        <input id={field} name={field} type={type} min={type === 'number' ? 0 : undefined}
+                          step={type === 'number' ? 'any' : undefined}
+                          onInput={(event) => {
+                            const inputs = event.currentTarget.form?.querySelectorAll<HTMLInputElement>('.patch-filters input');
+                            setHasFilters(Array.from(inputs ?? []).some((input) => input.value !== ''));
+                            setFilterError('');
+                          }} />
+                      </div>
+                    ))}
+                  </fieldset>
+                ))}
+                {filterError && <p className="error" role="alert">{filterError}</p>}
+              </fieldset>
+            </details>
 
             <div className="form-actions">
               {result?.message && !workspaceOpen && (
@@ -350,6 +444,13 @@ function App() {
                           <tr><th scope="row">RA</th><td>{view.patch.coordinates.ra}</td></tr>
                           <tr><th scope="row">Dec</th><td>{view.patch.coordinates.dec}</td></tr>
                           <tr><th scope="row">Field size</th><td>{view.patch.fieldSize}′ × {view.patch.fieldSize}′</td></tr>
+                          {view.patch.release && <tr><th scope="row">Release filter</th><td>{view.patch.release.toUpperCase()}</td></tr>}
+                          {view.patch.startDate && <tr><th scope="row">From (UTC)</th><td>{view.patch.startDate}</td></tr>}
+                          {view.patch.endDate && <tr><th scope="row">Through (UTC)</th><td>{view.patch.endDate}</td></tr>}
+                          {view.patch.minWavelength !== null && <tr><th scope="row">Min. wavelength</th><td>{view.patch.minWavelength} µm</td></tr>}
+                          {view.patch.maxWavelength !== null && <tr><th scope="row">Max. wavelength</th><td>{view.patch.maxWavelength} µm</td></tr>}
+                          {view.patch.minGapDays > 0 && <tr><th scope="row">Min. Auto gap</th><td>{view.patch.minGapDays} days</td></tr>}
+                          {view.patch.maxGapDays !== null && <tr><th scope="row">Max. Auto gap</th><td>{view.patch.maxGapDays} days</td></tr>}
                         </tbody>
                       </table>
                       <table>
