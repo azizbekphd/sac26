@@ -121,7 +121,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         job = PlaybackJob("test")
         runner = PlaybackSearch(None, job, 10, 20, 6)
 
-        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
+        async def query(client, corners, limit, *, region=None, **_kwargs):
             if region == runner.circle:
                 return [], False
             raise httpx.ReadTimeout("Slow response")
@@ -264,7 +264,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         job = PlaybackJob("test")
         runner = PlaybackSearch(None, job, 10, 20, 12)
 
-        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
+        async def query(client, corners, limit, *, region=None, **_kwargs):
             if region == runner.point:
                 return [], False
             raise httpx.ReadTimeout("Slow footprint response")
@@ -333,7 +333,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         release_full_query = asyncio.Event()
         values = np.ones((3, 3), dtype=np.float32)
 
-        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
+        async def query(client, corners, limit, *, region=None, compact=False, **_kwargs):
             self.assertTrue(compact)
             if region:
                 return [item], True
@@ -361,16 +361,57 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(job.partial)
         self.assertEqual(job.preview["observationId"], "first")
 
+    async def test_playback_recovers_when_initial_listings_time_out(self):
+        job = PlaybackJob("test")
+        metadata = []
+        def respond(request):
+            self.assertEqual(request.url.host, "irsa.ipac.caltech.edu")
+            self.assertEqual(request.url.path, "/SIA")
+            self.assertEqual(request.extensions["timeout"]["read"], 70)
+            self.assertEqual(request.extensions["timeout"]["connect"], 8)
+            metadata.append(request.url.params)
+            if len(metadata) <= 3:
+                raise httpx.ReadTimeout("Slow listing", request=request)
+            self.assertEqual(job.status, "searching")
+            self.assertIn("Retrying the exposure listing", job.message)
+            return httpx.Response(200, text="obs_id,t_min,access_url\n")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            with patch("server.playback.ARCHIVE_FALLBACK_SECONDS", 0), patch("server.playback.METADATA_RETRY_DELAY", 0):
+                await run_playback(client, job, 10, 20, 6)
+
+        self.assertEqual(len(metadata), 4)
+        fallback = [params for params in metadata if params["MAXREC"] == "128"]
+        self.assertEqual(fallback, [metadata[-1], metadata[-1]])
+        self.assertTrue(metadata[-1]["POS"].startswith("CIRCLE "))
+        self.assertEqual(job.status, "no-match")
+        self.assertFalse(job.partial)
+
     async def test_metadata_timeout_has_specific_retry_message(self):
         job = PlaybackJob("test")
         with (
             patch("server.playback.ARCHIVE_FALLBACK_SECONDS", 0),
-            patch("server.playback.search", AsyncMock(side_effect=httpx.ReadTimeout("Slow response"))),
+            patch("server.playback.METADATA_RETRY_DELAY", 0),
+            patch("server.playback.search", side_effect=[httpx.ReadTimeout("Slow response") for _ in range(4)]) as query,
             self.assertLogs("server.playback", level="WARNING"),
         ):
             await run_playback(None, job, 10, 20, 6)
+        self.assertEqual(query.await_count, 4)
         self.assertEqual(job.status, "error")
-        self.assertEqual(job.message, "IRSA timed out while listing exposures. Try again.")
+        self.assertEqual(job.message, "We stopped waiting for IRSA to list exposures. Try again.")
+
+    async def test_irsa_gateway_timeout_is_distinct_from_local_timeout(self):
+        job = PlaybackJob("test")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda _: httpx.Response(504))) as client:
+            with (
+                patch("server.playback.ARCHIVE_FALLBACK_SECONDS", 0),
+                patch("server.playback.METADATA_RETRY_DELAY", 0),
+                self.assertLogs("server.playback", level="WARNING") as logs,
+            ):
+                await run_playback(client, job, 10, 20, 6)
+        self.assertEqual(job.status, "error")
+        self.assertEqual(job.message, "IRSA returned a gateway timeout while listing exposures. Try again.")
+        self.assertIn("HTTP 504", logs.output[0])
 
     async def test_shared_mask_accepts_masked_center_at_exact_area_threshold(self):
         a = Center(exposure("earlier", 60000), 0, 1, .25)

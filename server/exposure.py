@@ -195,8 +195,9 @@ def archive_key(row, compact):
     return aws["key"]
 
 
-async def sia_response(client, url, params, limit, **connection):
-    async with client.stream("GET", url, params=params, timeout=httpx.Timeout(45, connect=8), **connection) as response:
+async def sia_response(client, url, params, limit, *, read_timeout=45, **connection):
+    async with client.stream("GET", url, params=params,
+                             timeout=httpx.Timeout(45, connect=8, read=read_timeout), **connection) as response:
         response.raise_for_status()
         body = bytearray()
         async for chunk in response.aiter_bytes():
@@ -220,7 +221,8 @@ async def resolve_irsa(client):
     raise ValueError("The DNS resolver did not return a public IRSA address.")
 
 
-async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False, filters=ArchiveFilters()):
+async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False, filters=ArchiveFilters(),
+                 read_timeout=45):
     if region is None:
         region = "POLYGON " + " ".join(f"{value:.9f}" for corner in corners for value in corner)
     releases = RELEASES if filters.release is None else (filters.release,)
@@ -236,7 +238,7 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
     if compact:
         params["RESPONSEFORMAT"] = "CSV"
     try:
-        body = await sia_response(client, SIA, params, limit)
+        body = await sia_response(client, SIA, params, limit, read_timeout=read_timeout)
     except (httpx.ConnectTimeout, httpx.ConnectError) as error:
         try:
             address = await resolve_irsa(client)
@@ -244,7 +246,7 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
             raise error from dns_error
         # Connect to the resolved address and still verify IRSA's TLS certificate by hostname.
         url = httpx.URL(SIA).copy_with(host=address)
-        body = await sia_response(client, url, params, limit, headers={"Host": IRSA_HOST},
+        body = await sia_response(client, url, params, limit, read_timeout=read_timeout, headers={"Host": IRSA_HOST},
                                   extensions={"sni_hostname": IRSA_HOST})
     table, overflow = archive_records(body, compact)
     truncated = overflow or len(table) >= limit

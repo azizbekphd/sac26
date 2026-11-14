@@ -30,7 +30,11 @@ METADATA_LIMIT = 2048
 FALLBACK_METADATA_LIMIT = 128
 JOB_SECONDS = 180
 ARCHIVE_FALLBACK_SECONDS = 8
-METADATA_SECONDS = 75
+METADATA_READ_SECONDS = 70
+METADATA_SECONDS = 80
+METADATA_RETRY_SECONDS = 60
+METADATA_RETRY_DELAY = 1
+TRANSIENT_METADATA_STATUSES = (502, 503, 504)
 log = logging.getLogger(__name__)
 
 
@@ -552,12 +556,13 @@ class PlaybackSearch:
         # Keep wavelength-ineligible exposures in the timeline for visit grouping.
         filters = replace(self.job.filters, min_wavelength=None, max_wavelength=None)
 
-        async def query(corners, limit, region=None, delay=0):
+        async def query(corners, limit, region=None, delay=0, budget=METADATA_SECONDS):
             if delay:
                 await asyncio.sleep(delay)
             try:
-                async with asyncio.timeout(METADATA_SECONDS):
-                    return await search(self.client, corners, limit=limit, region=region, compact=True, filters=filters)
+                async with asyncio.timeout(budget):
+                    return await search(self.client, corners, limit=limit, region=region, compact=True, filters=filters,
+                                        read_timeout=METADATA_READ_SECONDS)
             except TimeoutError as error:
                 raise httpx.ReadTimeout("The exposure list exceeded the metadata budget.") from error
 
@@ -566,10 +571,11 @@ class PlaybackSearch:
         requests = {
             asyncio.create_task(query(self.corners, METADATA_LIMIT)): True,
             asyncio.create_task(query((), METADATA_LIMIT, self.point)): False,
-            asyncio.create_task(query((), FALLBACK_METADATA_LIMIT, self.circle, ARCHIVE_FALLBACK_SECONDS)): True,
         }
+        fallback = asyncio.create_task(query((), FALLBACK_METADATA_LIMIT, self.circle, ARCHIVE_FALLBACK_SECONDS))
+        requests[fallback] = True
         pending = set(requests)
-        errors = []
+        fallback_error = None
         records = {}
         returned = set()
         succeeded = False
@@ -584,7 +590,8 @@ class PlaybackSearch:
                     try:
                         exposures, partial = request.result()
                     except ARCHIVE_ERRORS as error:
-                        errors.append(error)
+                        if request is fallback:
+                            fallback_error = error
                         continue
                     succeeded = True
                     records.update((item.key, item) for item in exposures)
@@ -597,8 +604,24 @@ class PlaybackSearch:
                     yield ordered, truncated, full_field
                     if full_field:
                         return
-            if not succeeded:
-                raise errors[-1] if errors else ArchiveError("The archive did not return an exposure list.")
+            if succeeded:
+                return
+            if fallback_error is None:
+                raise ArchiveError("The archive did not return an exposure list.")
+            retryable = isinstance(fallback_error, (httpx.TimeoutException, httpx.NetworkError)) or (
+                isinstance(fallback_error, httpx.HTTPStatusError)
+                and fallback_error.response.status_code in TRANSIENT_METADATA_STATUSES
+            )
+            if not retryable:
+                raise fallback_error
+            self.job.message = "IRSA is taking longer than usual. Retrying the exposure listing…"
+            try:
+                exposures, truncated = await query((), FALLBACK_METADATA_LIMIT, self.circle,
+                                                   delay=METADATA_RETRY_DELAY, budget=METADATA_RETRY_SECONDS)
+            except ARCHIVE_ERRORS as error:
+                raise error from fallback_error
+            if exposures or not truncated:
+                yield sorted(exposures, key=lambda item: (-item.mjd, item.key)), truncated, not truncated
         finally:
             for request in requests:
                 request.cancel()
@@ -666,10 +689,20 @@ async def run_playback(client, job, ra, dec, field_size):
         job.status = "error"
         job.message = "Could not connect to IRSA to list exposures. Try again."
         log.warning("Playback %s: IRSA metadata connection failed: %s", job.id, type(exc).__name__)
-    except httpx.TimeoutException:
+    except httpx.TimeoutException as exc:
         job.status = "error"
-        job.message = "IRSA timed out while listing exposures. Try again."
-        log.warning("Playback %s: IRSA metadata request timed out", job.id)
+        job.message = "We stopped waiting for IRSA to list exposures. Try again."
+        log.warning("Playback %s: IRSA metadata request timed out: %s", job.id, exc)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        job.status = "error"
+        if status == 504:
+            job.message = "IRSA returned a gateway timeout while listing exposures. Try again."
+        elif status in TRANSIENT_METADATA_STATUSES:
+            job.message = "IRSA is temporarily unavailable. Try again."
+        else:
+            job.message = "Could not complete the archive lookup. Try again."
+        log.warning("Playback %s: IRSA metadata request returned HTTP %s", job.id, status)
     except TimeoutError:
         job.partial = True
         job.status = "ready" if job.has_current_sequences else "no-match"
