@@ -5,6 +5,7 @@ import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, positionInPatch, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
+import { CompareImageControls, CompareMathImage, defaultVisitSelections, retainVisitSelections, type CompareMode } from './CompareImages';
 import { MotionMarkers, MotionReview } from './MotionReview';
 import { Spectrum, spectrumDates } from './Spectrum';
 import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
@@ -98,7 +99,7 @@ function App() {
   const [manualResults, setManualResults] = useState<ManualResult[]>([]);
   const [pendingSequence, setPendingSequence] = useState<string>();
   const [sequenceError, setSequenceError] = useState('');
-  const [failedSequence, setFailedSequence] = useState<string>();
+  const [failedSequence, setFailedSequence] = useState<{ id: string; automatic: boolean }>();
   const [stoppingSearch, setStoppingSearch] = useState(false);
   const [stopError, setStopError] = useState('');
   const [manual, setManual] = useState<ManualState | null>(null);
@@ -107,6 +108,9 @@ function App() {
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState<ComparisonTool>('Compare');
+  const [compareMode, setCompareMode] = useState<CompareMode>('blink');
+  const [visitSelections, setVisitSelections] = useState(defaultVisitSelections);
+  const hasOpenedSequence = useRef(false);
   const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
   const [markedMotion, setMarkedMotion] = useState<Record<string, MotionCandidate | null>>({});
   const [motionResults, setMotionResults] = useState<Record<string, MotionResult>>({});
@@ -137,6 +141,14 @@ function App() {
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
   const exploratory = result?.mode === 'exploratory';
   const withdrawn = result?.jobId && search?.withdrawnSequenceIds?.includes(result.jobId);
+  const activeAutoVisits = (search?.sequenceCandidates ?? search?.sequences)
+    ?.find(({ id }) => id === result?.jobId)?.visits;
+  const imageMathUnavailable = withdrawn
+    ? 'New archive metadata changed the visit grouping. Open a current matched sequence to stack or subtract visits.'
+    : !canPlay || result?.mode !== 'matched' || !result.jobId
+      ? 'Stack and Difference require a matched sequence.' : '';
+  const imageMathMode = activeTool === 'Compare' && compareMode !== 'blink' ? compareMode : null;
+  const imageMathKeys = imageMathMode && visitSelections[imageMathMode];
   const motionJobId = canPlay && result?.motionAvailable && !withdrawn ? result.jobId : undefined;
   const motionUnavailableReason = withdrawn
     ? 'New archive metadata changed the visit grouping. Choose a current sequence to check for motion.'
@@ -194,6 +206,9 @@ function App() {
     setPlaying(false);
     setDetailsOpen(false);
     setActiveTool('Compare');
+    setCompareMode('blink');
+    setVisitSelections(defaultVisitSelections());
+    hasOpenedSequence.current = false;
     setSpectrumPick(null);
     setView({ patch, result: emptySearch });
     setSearch(emptySearch);
@@ -224,14 +239,17 @@ function App() {
     });
   }
 
-  function openSequence(next: WorkspaceState) {
+  function openSequence(next: WorkspaceState, resetVisits = true) {
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
+    if (resetVisits) setVisitSelections(defaultVisitSelections(next.result));
+    if (next.result.mode === 'exploratory') setCompareMode('blink');
+    if (next.result.status === 'ready') hasOpenedSequence.current = true;
     setView(next);
   }
 
-  function selectSequence(patch: SubmittedPatch, id: string, preservePosition = false) {
+  function selectSequence(patch: SubmittedPatch, id: string, automatic = false) {
     selectionRef.current?.abort();
     const controller = new AbortController();
     selectionRef.current = controller;
@@ -243,17 +261,18 @@ function App() {
       patch, result, autoSelectedSources: new Set(result.frames.map((frame) => frame.sourceUrl)),
     }))).then((next) => {
       if (controller.signal.aborted) return;
-      if (preservePosition) {
+      if (automatic && hasOpenedSequence.current) {
         const index = next.result.frames.findIndex((frame) => exposureIdentity(frame) === currentFrame.current);
         setFrameIndex(Math.max(0, index));
         if (index < 0) setPlaying(false);
+        setVisitSelections((current) => retainVisitSelections(current, next.result.frames));
         setView(next);
       } else {
         openSequence(next);
       }
     }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
-        setFailedSequence(id);
+        setFailedSequence({ id, automatic });
         setSequenceError(failure instanceof Error && !(failure instanceof TypeError)
           ? failure.message : 'Could not load the sequence. Try again.');
       }
@@ -274,19 +293,19 @@ function App() {
       setPendingSequence(undefined);
     }
     const active = canPlay ? result?.jobId : undefined;
-    if (failedSequence && !includes(failedSequence)) {
+    if (failedSequence && !includes(failedSequence.id)) {
       setFailedSequence(undefined);
       setSequenceError('');
     }
     if (!sequences.length) {
-      if (active) openSequence({ patch: view.patch, result: emptySearch });
+      if (active) openSequence({ patch: view.patch, result: emptySearch }, false);
       return;
     }
     if (active && includes(active)) return;
     const identities = new Set(canPlay ? result?.frames.map(exposureIdentity) : []);
     const replacement = sequences.find((item) => currentFrame.current && item.exposureIds.includes(currentFrame.current))
       ?? sequences.find((item) => item.exposureIds.some((id) => identities.has(id))) ?? sequences[0];
-    if (replacement.id !== failedSequence) selectSequence(view.patch, replacement.id, Boolean(active));
+    if (replacement.id !== failedSequence?.id) selectSequence(view.patch, replacement.id, true);
   });
 
   useEffect(() => {
@@ -416,7 +435,10 @@ function App() {
       setMotionResults({});
       setManualResults([selection]);
     }
-    openSequence(selection);
+    const previous = manual.seed;
+    const sameInputs = previous && previous.mode === result.mode && previous.frames.length === result.frames.length &&
+      previous.frames.every((frame, index) => frame.key === result.frames[index].key);
+    openSequence(selection, !sameInputs);
     setManual(null);
     requestAnimationFrame(() => backAction.current?.focus({ preventScroll: true }));
   }
@@ -427,6 +449,9 @@ function App() {
     selectionRef.current?.abort();
     selectionRef.current = null;
     setView(null);
+    setCompareMode('blink');
+    setVisitSelections(defaultVisitSelections());
+    hasOpenedSequence.current = false;
     setSpectrumPick(null);
     setSearch(null);
     setManualResults([]);
@@ -477,9 +502,9 @@ function App() {
       )}
       {pendingSequence && <p className="lookup-status" role="status">Loading sequence…</p>}
       {sequenceError && <p className="lookup-status" role="alert">{sequenceError}</p>}
-      {failedSequence && sequences.some((item) => item.id === failedSequence) && (
-        <button type="button" className="control" onClick={() => selectSequence(view.patch, failedSequence,
-          Boolean(canPlay && !sequences.some((item) => item.id === result?.jobId)))}>
+      {failedSequence && sequences.some((item) => item.id === failedSequence.id) && (
+        <button type="button" className="control"
+          onClick={() => selectSequence(view.patch, failedSequence.id, failedSequence.automatic)}>
           Retry loading sequence
         </button>
       )}
@@ -622,8 +647,17 @@ function App() {
               <div className="exposure-layout">
                 <div className="exposure-frame">
                   <div className="exposure-image">
-                    <img className="sky-frame" src={exposure.imageUrl}
-                      alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
+                    {imageMathMode ? (
+                      !imageMathUnavailable && result?.jobId && imageMathKeys && imageMathKeys.length >= 2 && imageMathKeys.every(Boolean)
+                        ? <CompareMathImage key={JSON.stringify([result.jobId, imageMathMode, imageMathKeys])}
+                            jobId={result.jobId} operation={imageMathMode} keys={imageMathKeys} />
+                        : <div className="sky-frame image-math-placeholder" role="status">
+                            {imageMathUnavailable || `Choose ${imageMathMode === 'stack' ? 'at least two visits to stack' : 'two visits to subtract'}.`}
+                          </div>
+                    ) : (
+                      <img className="sky-frame" src={exposure.imageUrl}
+                        alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
+                    )}
                     {activeTool === 'Motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
                     {activeTool === 'Spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
                       aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
@@ -651,7 +685,7 @@ function App() {
                     </button>}
                   </div>
                 </div>
-                {canPlay && (
+                {canPlay && !imageMathMode && (
                   <section className="exposure-toolbar" aria-label="Comparison playback">
                     <div className="playback-controls" role="group" aria-label="Playback controls">
                       <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
@@ -683,7 +717,10 @@ function App() {
                     <div className="comparison-tools" role="group" aria-label="Active tool">
                       {comparisonTools.map((tool) => (
                         <button key={tool} type="button" className="control" aria-pressed={activeTool === tool}
-                          aria-controls={`comparison-tool-${tool.toLowerCase()}`} onClick={() => setActiveTool(tool)}>
+                          aria-controls={`comparison-tool-${tool.toLowerCase()}`} onClick={() => {
+                            if (tool === 'Compare' && compareMode !== 'blink') setPlaying(false);
+                            setActiveTool(tool);
+                          }}>
                           {tool}
                         </button>
                       ))}
@@ -697,13 +734,22 @@ function App() {
                           detailsAction.current?.focus();
                         }
                       }}>
-                      <div className="frame-summary">
+                      <CompareImageControls mode={compareMode} frames={result?.frames ?? []} visits={activeAutoVisits}
+                        selections={visitSelections}
+                        unavailable={imageMathUnavailable} onSelect={setVisitSelections} onMode={(mode) => {
+                          if (mode !== 'blink') {
+                            setPlaying(false);
+                            setDetailsOpen(false);
+                          }
+                          setCompareMode(mode);
+                        }} />
+                      {!imageMathMode && <div className="frame-summary">
                         <time dateTime={exposure.observedAt}>{observationTime} UTC</time>
                         {exposure.wavelength !== null && (
                           <span title="Wavelength at patch center">{exposure.wavelength.toFixed(3)} µm</span>
                         )}
                         {view.autoSelectedSources?.has(exposure.sourceUrl) && <span className="auto-selected">Auto-selected</span>}
-                      </div>
+                      </div>}
                       {exploratory && <strong>Exploratory blink</strong>}
                       {result?.message && (canPlay || sequences.length === 0) && <p className="lookup-status" role="status">
                         {exploratory && 'Matched playback was unavailable. '}{result.message}
@@ -711,12 +757,12 @@ function App() {
                       {sequenceControls}
                       {canRetry && <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>}
                       {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
-                      <button ref={detailsAction} className="control details-toggle" type="button"
+                      {!imageMathMode && <button ref={detailsAction} className="control details-toggle" type="button"
                         aria-expanded={detailsOpen} aria-controls="exposure-details"
                         onClick={() => setDetailsOpen((open) => !open)}>
                         Details <span aria-hidden="true">▸</span>
-                      </button>
-                      <section className="exposure-details" id="exposure-details" hidden={!detailsOpen}
+                      </button>}
+                      <section className="exposure-details" id="exposure-details" hidden={Boolean(imageMathMode) || !detailsOpen}
                         aria-label="Comparison details" tabIndex={0}>
                         <div className="exposure-metadata">
                           <table>

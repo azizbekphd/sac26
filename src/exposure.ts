@@ -51,6 +51,7 @@ export type SequenceSummary = {
   count: number;
   visitCount?: number | null;
   exposureIds: string[];
+  visits?: number[];
   start: string;
   end: string;
   bandpass: [number, number] | null;
@@ -62,6 +63,14 @@ export type SequenceSearch = PlaybackUpdate & {
   withdrawnSequenceIds?: string[];
   reconnecting?: boolean;
 };
+
+export type ImageMathOperation = 'stack' | 'difference';
+
+export async function loadImageMath(jobId: string, operation: ImageMathOperation, keys: string[], signal: AbortSignal) {
+  const response = await post(`/api/playback/${encodeURIComponent(jobId)}/image-math`, { operation, keys }, signal);
+  if (!response.ok) await jsonResponse(response, 'Image comparison is unavailable.', 'Could not calculate the image. Try again.');
+  return response.blob();
+}
 
 export function exposureIdentity(exposure: ArchiveExposure) {
   return `${exposure.observationId}:D${exposure.detector}`;

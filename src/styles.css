@@ -218,10 +218,30 @@ form { display: grid; gap: 10px; }
   gap: 4px;
 }
 .comparison-tools .control { padding-inline: 3px; }
-.comparison-tools .control[aria-pressed='true'] {
+:is(.comparison-tools, .compare-modes) .control[aria-pressed='true'] {
   background: #dedede;
   color: #111;
   border-color: #dedede;
+}
+.compare-modes { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px; }
+.compare-modes .control { padding-inline: 3px; }
+.stack-visits { display: grid; gap: 6px; min-width: 0; margin: 0; border: 1px solid var(--line); }
+.stack-visits label { display: flex; align-items: center; gap: 6px; width: fit-content; }
+.stack-visits input { margin: 0; accent-color: #dedede; }
+.difference-legend { display: flex; flex-wrap: wrap; gap: 4px 8px; }
+.difference-legend span { padding: 2px 4px; color: #111; background: var(--sign); }
+.difference-legend .difference-negative { --sign: #4bafff; }
+.difference-legend .difference-zero { --sign: #181818; color: #eee; outline: 1px solid var(--line); outline-offset: -1px; }
+.difference-legend .difference-positive { --sign: #ffaa4b; }
+.image-math-placeholder {
+  display: grid;
+  align-content: center;
+  justify-items: center;
+  gap: 8px;
+  box-sizing: border-box;
+  padding: 12px;
+  text-align: center;
+  background: #181818;
 }
 .comparison-tool-content { display: grid; grid-template: minmax(0, 1fr) / minmax(0, 1fr); }
 .comparison-tool {
@@ -445,6 +465,7 @@ form { display: grid; gap: 10px; }
   :is(.exposure-panel, .exposure-toolbar) .control { min-height: 42px; }
   :is(.exposure-toolbar, .comparison-header) .symbol-control { min-width: 42px; }
   .frame-slider { height: 28px; }
+  .stack-visits label { min-height: 30px; }
 }
 
 .sky-picker { z-index: 0; background: #090909; }

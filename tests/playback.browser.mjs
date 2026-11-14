@@ -203,6 +203,8 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await button('Apply selection').click();
     await button('Open Exploratory blink').click();
     await visible('1 / 5 frames');
+    assert.equal(await button('Stack').isDisabled(), true);
+    assert.equal(await button('Difference').isDisabled(), true);
     await visible('Searching for more sequences…');
     assert.match(await selector.locator('option:checked').textContent(), /5 exposures across 4 visits.*Manual/);
     assert.deepEqual(await choices(), ['manual', 'lookup.3']);
@@ -240,6 +242,162 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     assert.deepEqual(requests.unexpected, []);
   } finally {
     firstMotion.resolve();
+    await browser.close();
+  }
+});
+
+test('keeps Stack and Difference inputs synchronized with the active sequence', { timeout: 35_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  const late = Promise.withResolvers();
+  const startedLate = Promise.withResolvers();
+  const finishedLate = Promise.withResolvers();
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    page.setDefaultTimeout(6_000);
+    const pairs = {
+      'lookup.a': sequence('lookup.a', [0, 2]),
+      'lookup.b': sequence('lookup.b', [0, 1, 2, 3]),
+      'lookup.c': sequence('lookup.c', [2, 3, 5]),
+      'lookup.d': sequence('lookup.d', [6, 7, 8]),
+    };
+    let current = 'lookup.a';
+    let renumbered = false;
+    let failExplicitLoad = true;
+    let failImageMath = true;
+    const imageRequests = [];
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.origin !== origin) return route.abort();
+      const path = url.pathname;
+      if (path === '/api/playback') return route.fulfill({ json: { id: 'lookup' } });
+      if (path === '/api/playback/lookup') {
+        const active = pairs[current].summary;
+        const sequences = [renumbered && current === 'lookup.a' ? { ...active, visits: [2, 4] } : active,
+          pairs['lookup.d'].summary];
+        return route.fulfill({ json: { ...base, status: 'searching', sequences,
+          withdrawnSequenceIds: current === 'lookup.c' ? ['lookup.b'] : [] } });
+      }
+      const match = path.match(/^\/api\/playback\/([^/]+)(?:\/(.+))?$/);
+      if (match && pairs[match[1]]) {
+        const [, id, action] = match;
+        if (!action) return route.fulfill({ json: pairs[id].result });
+        if (action === 'image-math') {
+          const body = request.postDataJSON();
+          imageRequests.push({ id, ...body });
+          if (id === 'lookup.a' && body.operation === 'difference' && failImageMath) {
+            failImageMath = false;
+            return route.fulfill({ status: 503, json: { detail: 'Comparison image unavailable.' } });
+          }
+          if (id === 'lookup.b' && body.operation === 'difference' && body.keys.includes('e3')) {
+            startedLate.resolve();
+            await late.promise;
+            try {
+              await route.fulfill({ body: png, contentType: 'image/png' });
+            } catch (error) {
+              if (!request.failure()) throw error;
+            } finally {
+              finishedLate.resolve();
+            }
+            return;
+          }
+        } else if (id === 'lookup.d' && failExplicitLoad) {
+          return route.fulfill({ status: 404 });
+        }
+        return route.fulfill({ body: png, contentType: 'image/png' });
+      }
+      return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
+    });
+
+    const button = (name) => page.getByRole('button', { name, exact: true });
+    const earlier = page.getByLabel('Earlier visit', { exact: true });
+    const later = page.getByLabel('Later visit', { exact: true });
+    const sequencePicker = page.getByLabel('Sequence', { exact: true });
+    const stack = page.getByRole('img', { name: /North-up average/ });
+    const difference = page.getByRole('img', { name: /North-up SPHEREx difference/ });
+    const checkedVisits = () => page.getByRole('group', { name: /Stack visits/ }).locator('input:checked')
+      .evaluateAll((inputs) => inputs.map((input) => input.parentElement.textContent.match(/^Visit (\d+)/)[1]));
+
+    await page.goto(origin);
+    await page.getByLabel('Right ascension (RA)').fill('10');
+    await page.getByLabel('Declination (Dec)').fill('20');
+    await button('Compare visits').click();
+    await page.getByText('1 / 2 visits', { exact: true }).waitFor();
+    await button('Next').click();
+    await button('Stack').click();
+    await stack.waitFor();
+    assert.deepEqual(await checkedVisits(), ['1', '3']);
+    const initialStack = await stack.getAttribute('src');
+    renumbered = true;
+    await page.getByRole('checkbox', { name: /^Visit 4 ·/ }).waitFor();
+    assert.deepEqual(await checkedVisits(), ['2', '4']);
+    assert.equal(await stack.getAttribute('src'), initialStack);
+    assert.equal(await button('Next').count(), 0);
+    await button('Difference').click();
+    await page.getByRole('alert').getByText('Comparison image unavailable.').waitFor();
+    await button('Retry image').click();
+    await difference.waitFor();
+    assert.equal(await earlier.inputValue(), 'e0');
+    assert.equal(await later.inputValue(), 'e2');
+    await button('Blink').click();
+    await page.getByText('2 / 2 visits', { exact: true }).waitFor();
+    await button('Stack').click();
+    await stack.waitFor();
+
+    current = 'lookup.b';
+    await page.getByRole('group', { name: /Stack visits/ }).getByRole('checkbox', { name: /2025-01-04 00:00:00 UTC/ }).waitFor();
+    await stack.waitFor();
+    assert.deepEqual(await checkedVisits(), ['1', '3']);
+    assert.deepEqual(imageRequests.at(-1), { id: 'lookup.b', operation: 'stack', keys: ['e0', 'e2'] });
+    await button('Difference').click();
+    await difference.waitFor();
+    assert.equal(await earlier.inputValue(), 'e0');
+    assert.equal(await later.inputValue(), 'e2');
+    await later.selectOption('e3');
+    await startedLate.promise;
+    await later.selectOption('e1');
+    await difference.waitFor();
+    const latestImage = await difference.getAttribute('src');
+    late.resolve();
+    await finishedLate.promise;
+    assert.equal(await difference.getAttribute('src'), latestImage);
+    assert.deepEqual(imageRequests.at(-1), { id: 'lookup.b', operation: 'difference', keys: ['e0', 'e1'] });
+
+    current = 'lookup.c';
+    await page.getByText('Choose two visits to subtract.', { exact: true }).waitFor();
+    assert.equal(await earlier.inputValue(), '');
+    assert.equal(await later.inputValue(), '');
+    assert.equal(await difference.count(), 0);
+    await earlier.selectOption('e2');
+    await later.selectOption('e5');
+    await difference.waitFor();
+    await button('Stack').click();
+    assert.deepEqual(await checkedVisits(), []);
+    await page.getByRole('checkbox', { name: /^Visit [34] ·/ }).first().check();
+    await page.getByRole('checkbox', { name: /^Visit 6 ·/ }).check();
+    await stack.waitFor();
+
+    await sequencePicker.selectOption('lookup.d');
+    await page.getByText('Could not load the comparison images. Try again.', { exact: true }).waitFor();
+    assert.deepEqual(await checkedVisits(), ['3', '6']);
+    await stack.waitFor();
+    failExplicitLoad = false;
+    await button('Retry loading sequence').click();
+    await page.getByRole('checkbox', { name: /^Visit 9 ·/ }).waitFor();
+    await stack.waitFor();
+    assert.deepEqual(await checkedVisits(), ['7', '8', '9']);
+    await button('Difference').click();
+    await difference.waitFor();
+    assert.equal(await earlier.inputValue(), 'e6');
+    assert.equal(await later.inputValue(), 'e8');
+    for (const viewport of [{ width: 390, height: 844 }, { width: 1280, height: 800 }]) {
+      await page.setViewportSize(viewport);
+      const box = await difference.boundingBox();
+      assert.ok(box && box.width > 100 && box.x >= 0 && box.x + box.width <= viewport.width);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
+    }
+  } finally {
+    late.resolve();
     await browser.close();
   }
 });
