@@ -6,7 +6,7 @@ import { formatPosition, parseCoordinate, parsePosition, presets, type Coordinat
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
 import { MotionMarkers, MotionReview } from './MotionReview';
-import { archiveReleases, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
+import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
   type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
 import './styles.css';
 
@@ -50,6 +50,7 @@ type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
     id, count: result.frames.length, exposureIds: result.frames.map(exposureIdentity),
+    visitCount: countVisits(result.frames) ?? (result.mode === 'exploratory' ? null : result.frames.length),
     start: result.frames[0].observedAt, end: result.frames[result.frames.length - 1].observedAt,
     bandpass: result.comparison?.bandpass ?? null,
   };
@@ -68,8 +69,10 @@ function availableSequences(search: SequenceSearch | null, manual: ManualResult[
 }
 
 function describeSequence(sequence: SequenceSummary) {
-  const { count, start, end, bandpass } = sequence;
-  return `${count} visits · ${start.slice(0, 10)}–${end.slice(0, 10)}${bandpass
+  const { count, visitCount = count, start, end, bandpass } = sequence;
+  const visits = `${visitCount} ${visitCount === 1 ? 'visit' : 'visits'}`;
+  const size = visitCount === null ? `${count} exposures` : visitCount === count ? visits : `${count} exposures across ${visits}`;
+  return `${size} · ${start.slice(0, 10)}–${end.slice(0, 10)}${bandpass
     ? ` · ${bandpass[0].toFixed(3)}–${bandpass[1].toFixed(3)} µm` : ''}`;
 }
 
@@ -126,7 +129,11 @@ function App() {
   const workspaceOpen = Boolean(exposure);
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
   const exploratory = result?.mode === 'exploratory';
-  const motionJobId = canPlay && result?.motionAvailable ? result.jobId : undefined;
+  const withdrawn = result?.jobId && search?.withdrawnSequenceIds?.includes(result.jobId);
+  const motionJobId = canPlay && result?.motionAvailable && !withdrawn ? result.jobId : undefined;
+  const motionUnavailableReason = withdrawn
+    ? 'New archive metadata changed the visit grouping. Choose a current sequence to check for motion.'
+    : result?.motionUnavailableReason;
   const inspected = motionJobId ? motionResults[motionJobId] ?? result?.motionResult : undefined;
   const motionMarker = motionJobId && motionJobId in markedMotion
     ? markedMotion[motionJobId] : inspected?.candidates[0];
@@ -653,12 +660,12 @@ function App() {
                         <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
                       </div>
                     )}
-                    {motionJobId && <MotionReview key={motionJobId} jobId={motionJobId} exploratory={exploratory}
+                    {motionJobId && result && <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
                       inspected={inspected} selectedCandidate={motionMarker}
                       onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
                       onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} />}
-                    {canPlay && !motionJobId && result?.motionUnavailableReason && (
-                      <p className="lookup-status">{result.motionUnavailableReason}</p>
+                    {canPlay && !motionJobId && motionUnavailableReason && (
+                      <p className="lookup-status" role="status">{motionUnavailableReason}</p>
                     )}
                     {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
                     <button ref={detailsAction} className="control details-toggle" type="button"
@@ -701,8 +708,10 @@ function App() {
                           {exposure.bandwidth != null && (
                             <tr><th scope="row">Bandwidth</th><td>{exposure.bandwidth.toFixed(4)} µm at center</td></tr>
                           )}
-                          {exposure.visit != null && <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>}
-                          {(!view.result.comparison || exposure.visit != null) && (
+                          {exposure.visit != null && view.result.comparison?.coverageIncludesBandpass !== undefined && (
+                            <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>
+                          )}
+                          {(!view.result.comparison || view.result.comparison.coverageIncludesBandpass !== undefined) && (
                             <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>
                           )}
                         </tbody>

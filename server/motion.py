@@ -74,7 +74,7 @@ def available(frame_count=2):
     return detector_command(frame_count) is not None
 
 
-def format_result(report, patch, frame_count=2):
+def format_result(report, patch, frame_count=2, visit_ids=None):
     visits = report.visits or [None] * frame_count
     if len(visits) != frame_count:
         raise MotionError("The detector returned invalid visit statuses.")
@@ -93,6 +93,7 @@ def format_result(report, patch, frame_count=2):
             "playback_bandpass_or_shared_area_gate": "The detector found too little shared usable area or wavelength overlap.",
             "sequence_bandpass_gate": "The detector found too little wavelength overlap across the visits.",
             "no_comparable_pixels": "The exposures have no shared usable pixels with comparable wavelengths.",
+            "no_comparable_visits": "No three independent visits have shared usable pixels with comparable wavelengths.",
             "insufficient_independent_visits": (
                 f"Motion analysis for this sequence needs {2 if frame_count == 2 else 3} distinct visits."
             ),
@@ -119,6 +120,8 @@ def format_result(report, patch, frame_count=2):
         indices = [index for index, _ in positions]
         if indices != sorted(set(indices)) or any(index >= frame_count or visits[index] for index in indices):
             raise MotionError("The detector returned invalid measurement visits.")
+        if visit_ids is not None and len({visit_ids[index] for index in indices}) != len(indices):
+            raise MotionError("The detector returned more than one measurement from the same visit.")
         measurements = []
         for index, (ra, dec) in positions:
             if not (0 <= ra < 360 and -90 <= dec <= 90):
@@ -135,7 +138,7 @@ def format_result(report, patch, frame_count=2):
                 "uncertainty": detection.displacement_uncertainty_arcsec,
                 "score": detection.score,
             })
-    return {"status": "inspected", "candidates": candidates, "visits": visits}
+    return {"status": "partial" if any(visits) else "inspected", "candidates": candidates, "visits": visits}
 
 
 async def analyze(job):
@@ -153,8 +156,14 @@ async def analyze(job):
             for frame in job.frames
         ],
     }
-    if command[1:] == ("-m", "server.motion_adapter") and all("visit" in frame for frame in job.frames):
-        payload["visits"] = [frame["visit"] for frame in job.frames]
+    visit_ids = [frame.get("visit") for frame in job.frames]
+    if None in visit_ids:
+        visit_ids = None
+    if visit_ids is not None and len(set(visit_ids)) < min(len(visit_ids), 3):
+        return format_result(DetectorResult(status="rejected", reason="insufficient_independent_visits"),
+                             job.patch, len(job.frames), visit_ids)
+    if command[1:] == ("-m", "server.motion_adapter") and visit_ids is not None:
+        payload["visits"] = visit_ids
     try:
         proc = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -179,7 +188,7 @@ async def analyze(job):
             report = DetectorResult.model_validate_json(output)
         except ValidationError as exc:
             raise MotionError("The motion detector returned an invalid result.") from exc
-        return format_result(report, job.patch, len(job.frames))
+        return format_result(report, job.patch, len(job.frames), visit_ids)
     except (BrokenPipeError, ConnectionResetError) as exc:
         raise MotionError("The motion detector stopped before reading the sequence.") from exc
     finally:

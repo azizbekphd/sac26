@@ -105,6 +105,8 @@ class PlaybackJob:
                     used.update(identities)
             snapshot["sequences"] = visible
             snapshot["sequenceCandidates"] = candidates
+            if self.invalid_sequences:
+                snapshot["withdrawnSequenceIds"] = sorted(self.invalid_sequences)
         if self.motion_result is not None:
             snapshot["motionResult"] = self.motion_result
         return snapshot
@@ -388,8 +390,11 @@ class PlaybackSearch:
         return asyncio.shield(self.read(("center", item.key), self.center, item, visit))
 
     async def find_sequences(self, visits):
-        if len(visits) < 2:
+        eligible = [(visit_id, selected) for visit_id, visit in enumerate(visits, 1)
+                    if (selected := [item for item in visit if self.job.filters.includes(item)])]
+        if len(eligible) < 2:
             return
+        visit_ids, visits = zip(*eligible)
         if visits[-1][-1].mjd - visits[0][0].mjd < self.job.min_gap - 1e-10:
             return
         if self.job.max_gap is not None and all(
@@ -480,7 +485,7 @@ class PlaybackSearch:
                 if center is None or not self.job.filters.overlaps_band(*center.band):
                     continue
                 # A later metadata response can change the current visit grouping.
-                center = replace(center, visit=visit)
+                center = replace(center, visit=visit_ids[visit])
                 for other in centers.values():
                     enqueue((center, other))
                 for keys in self.verified:
@@ -505,7 +510,7 @@ class PlaybackSearch:
                             records=records, patch=self.job.patch, filters=self.job.filters)
         publish_frames(child, [
             ({**exposure_metadata(center.exposure, center.wavelength, coverage),
-              "bandwidth": center.bandwidth}, image, valid)
+              "bandwidth": center.bandwidth, "visit": center.visit}, image, valid)
             for center, image in zip(items, images)
         ])
         child.comparison = {
@@ -518,12 +523,15 @@ class PlaybackSearch:
 
     def revalidate_visits(self, visits):
         # A footprint response can connect visits seen in an earlier center query.
-        visit_by_key = {item.key: index for index, visit in enumerate(visits) for item in visit}
+        visit_by_key = {item.key: index for index, visit in enumerate(visits, 1) for item in visit}
         self.job.invalid_sequences.clear()
         for child in self.job.sequences.values():
-            indices = {visit_by_key.get(item.key) for item in child.records}
-            if None in indices or len(indices) != len(child.records):
+            visit_ids = [visit_by_key.get(item.key) for item in child.records]
+            if None in visit_ids or len(set(visit_ids)) != len(child.records):
                 self.job.invalid_sequences.add(child.id)
+                continue
+            for frame, visit_id in zip(child.frames, visit_ids):
+                frame["visit"] = visit_id
 
     async def discover(self):
         # Keep wavelength-ineligible exposures in the timeline for visit grouping.
@@ -590,10 +598,7 @@ class PlaybackSearch:
             previews = []
             async with aclosing(self.discover()) as results:
                 async for exposures, _, full_field in results:
-                    visits = [
-                        eligible for visit in group_visits(exposures)
-                        if (eligible := [item for item in visit if self.job.filters.includes(item)])
-                    ]
+                    visits = group_visits(exposures)
                     self.revalidate_visits(visits)
                     if self.job.preview is None:
                         self.job.message = "Preparing the first exposure…"
@@ -617,7 +622,8 @@ class PlaybackSearch:
             elif not self.job.partial and (self.job.filters != ArchiveFilters() or self.job.min_gap or self.job.max_gap is not None):
                 self.job.message = "No matched sequence meets the selected filters and playback requirements."
             elif not self.job.partial:
-                other_visits = [item for visit in visits if all(item.key != self.preview_key for item in visit) for item in visit]
+                other_visits = (item for visit in visits if all(item.key != self.preview_key for item in visit)
+                                for item in visit)
                 if await self.find_usable(other_visits):
                     self.job.message = "No matched sequence meets the wavelength and coverage requirements."
                 else:

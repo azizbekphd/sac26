@@ -49,6 +49,7 @@ export type PlaybackUpdate = {
 export type SequenceSummary = {
   id: string;
   count: number;
+  visitCount?: number | null;
   exposureIds: string[];
   start: string;
   end: string;
@@ -58,11 +59,17 @@ export type SequenceSummary = {
 export type SequenceSearch = PlaybackUpdate & {
   sequences: SequenceSummary[];
   sequenceCandidates?: SequenceSummary[];
+  withdrawnSequenceIds?: string[];
   reconnecting?: boolean;
 };
 
 export function exposureIdentity(exposure: ArchiveExposure) {
   return `${exposure.observationId}:D${exposure.detector}`;
+}
+
+export function countVisits(frames: Exposure[]) {
+  const visits = frames.map((frame) => frame.visit);
+  return visits.every((visit) => visit != null) ? new Set(visits).size : undefined;
 }
 
 export type InventoryUpdate = PlaybackUpdate & { exposures?: InventoryExposure[] };
@@ -73,7 +80,7 @@ export type MotionCandidate = {
   score: number;
 };
 export type MotionResult =
-  | { status: 'inspected'; candidates: MotionCandidate[]; visits: (string | null)[] }
+  | { status: 'inspected' | 'partial'; candidates: MotionCandidate[]; visits: (string | null)[] }
   | { status: 'rejected' | 'incomplete'; reason: string; candidates: []; visits: (string | null)[] };
 
 export async function inspectMotion(jobId: string, signal: AbortSignal) {

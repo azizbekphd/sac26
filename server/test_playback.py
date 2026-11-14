@@ -178,6 +178,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 first_result = (await client.get(first_path)).json()
                 self.assertEqual(first_result["status"], "ready")
                 self.assertEqual([frame["key"] for frame in first_result["frames"]], ["a", "b"])
+                self.assertEqual([frame["visit"] for frame in first_result["frames"]], [1, 2])
                 self.assertEqual((await client.get(first_result["frames"][0]["imageUrl"])).status_code, 200)
 
                 finish.set()
@@ -189,6 +190,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(snapshot["sequenceCandidates"]), 6)
                 longer = (await client.get(f"/api/playback/{extension['id']}")).json()
                 self.assertEqual([frame["key"] for frame in longer["frames"]], list("abcd"))
+                self.assertEqual([frame["visit"] for frame in longer["frames"]], [1, 2, 3, 4])
                 self.assertEqual(longer["comparison"]["days"], 3)
                 self.assertNotEqual(longer["frames"][0]["imageUrl"], first_result["frames"][0]["imageUrl"])
                 self.assertEqual((await client.get(first_path)).json(), first_result)
@@ -298,6 +300,31 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.snapshot()["sequences"], [])
         self.assertEqual(job.snapshot()["sequenceCandidates"], [])
         self.assertEqual(len(job.sequences), 1)  # Previously published images stay addressable.
+        child, = job.sequences.values()
+        self.assertEqual(job.snapshot()["withdrawnSequenceIds"], [child.id])
+        child.motion_result = {"status": "inspected", "candidates": [], "visits": [None, None]}
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            app.state.playback[job.id] = job
+            path = f"/api/playback/{child.id}"
+            snapshot = (await client.get(path)).json()
+            self.assertFalse(snapshot["motionAvailable"])
+            self.assertNotIn("motionResult", snapshot)
+            self.assertEqual((await client.post(path + "/motion")).status_code, 409)
+            self.assertEqual((await client.get(snapshot["frames"][0]["imageUrl"])).status_code, 200)
+
+    async def test_later_metadata_updates_visit_ids_when_exposures_stay_distinct(self):
+        older, first, last = [exposure(name, 60000 + index) for index, name in enumerate(("older", "first", "last"))]
+        job = PlaybackJob("test", sequences={})
+        runner = PlaybackSearch(None, job, 10, 20, 6)
+        image = np.ones((3, 3))
+        centers = [Center(first, 1, 4.33, .05), Center(last, 2, 4.33, .05)]
+        runner.publish((centers, (image, image), image > 0, 1., 1.))
+        runner.revalidate_visits(group_visits([older, first, last]))
+        child, = job.ranked_sequences()
+        self.assertEqual([frame["visit"] for frame in child.frames], [2, 3])
 
     async def test_bounded_metadata_publishes_preview_before_full_query_times_out(self):
         item = exposure("first", 60000)
@@ -392,7 +419,8 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auto_checks_both_gap_bounds_and_calibrated_wavelength_before_reading_pixels(self):
         days = (0, 1, 4, 7, 10)
-        items = [exposure(str(day), 60000 + day) for day in days]
+        items = [Exposure(str(day), 2, str(day), 60000 + day,
+                          wavelength_bounds=(1.2, 1.3) if day == 0 else None) for day in days]
         # The last exposure would otherwise match the exposure at day 7.
         waves = dict(zip(items, (1.08, 1.08, 1.08, 1.08, 1.14)))
         job = PlaybackJob("test", filters=ArchiveFilters(min_wavelength=1.01, max_wavelength=1.01),
@@ -408,6 +436,8 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         checked = {frozenset(center.exposure for center in centers)
                    for centers, _ in (call.args for call in runner.match.await_args_list)}
         self.assertEqual(checked, {frozenset((items[1], items[2])), frozenset((items[2], items[3]))})
+        visit_ids = {(center.exposure, center.visit) for call in runner.match.await_args_list for center in call.args[0]}
+        self.assertEqual(visit_ids, {(items[1], 2), (items[2], 3), (items[3], 4)})
 
     async def test_preview_remains_when_visits_have_no_matching_bandpass(self):
         newest, oldest = exposure("newest", 60001), exposure("oldest", 60000)

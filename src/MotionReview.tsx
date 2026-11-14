@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { inspectMotion, type MotionCandidate, type MotionResult } from './exposure';
+import { countVisits, inspectMotion, type Exposure, type MotionCandidate, type MotionResult } from './exposure';
 
 export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate; frame: number }) {
   const points = candidate.measurements.map(({ frameIndex, imagePosition: [x, y] }) =>
@@ -17,8 +17,9 @@ export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate
   );
 }
 
-export function MotionReview({ jobId, exploratory, inspected, selectedCandidate, onResult, onCandidate }: {
+export function MotionReview({ jobId, frames, exploratory, inspected, selectedCandidate, onResult, onCandidate }: {
   jobId: string;
+  frames: Exposure[];
   exploratory: boolean;
   inspected?: MotionResult;
   selectedCandidate?: MotionCandidate | null;
@@ -32,9 +33,11 @@ export function MotionReview({ jobId, exploratory, inspected, selectedCandidate,
   const [visible, setVisible] = useState(selectedCandidate !== null);
   const request = useRef<AbortController | null>(null);
   const candidates = state && state !== 'loading' ? state.candidates : [];
-  const visits = state && state !== 'loading' ? state.visits : [];
-  const skipped = visits.flatMap((issue, i) => issue ? [i + 1] : []);
-  const frameLabel = exploratory ? 'exposures' : 'visits';
+  const frameIssues = state && state !== 'loading' ? state.visits : [];
+  const skipped = frameIssues.flatMap((issue, i) => issue ? [i + 1] : []);
+  const motionStatus = state && state !== 'loading' ? state.status : null;
+  const partial = motionStatus === 'partial' || (motionStatus === 'inspected' && skipped.length > 0);
+  const visitCount = countVisits(frames) ?? (exploratory ? undefined : frames.length);
 
   useEffect(() => () => request.current?.abort(), []);
 
@@ -78,15 +81,18 @@ export function MotionReview({ jobId, exploratory, inspected, selectedCandidate,
           <button type="button" className="control" onClick={cancel}>Cancel motion analysis</button>
         </>
       )}
-      {state && state !== 'loading' && state.status !== 'inspected' && (
+      {state && state !== 'loading' && 'reason' in state && (
         <p className="lookup-status" role="status">{state.reason}</p>
       )}
-      {skipped.length > 0 && <p className="lookup-status" role="status">Could not evaluate {frameLabel} {skipped.join(', ')}.</p>}
-      {state && state !== 'loading' && (state.status === 'incomplete' || skipped.length > 0) && (
+      {partial && (
+        <p className="lookup-status" role="status">Motion analysis was partial.{!candidate && ' No candidate was found in the exposures that could be evaluated.'}</p>
+      )}
+      {skipped.length > 0 && <p className="lookup-status" role="status">Could not evaluate {skipped.length === 1 ? 'exposure' : 'exposures'} {skipped.join(', ')}.</p>}
+      {(motionStatus === 'incomplete' || partial) && (
         <button type="button" className="control" onClick={start}>Retry motion analysis</button>
       )}
-      {state && state !== 'loading' && state.status === 'inspected' && !candidate && (
-        <p className="lookup-status" role="status">No motion candidates met the alert threshold in this sequence.</p>
+      {motionStatus === 'inspected' && !partial && !candidate && (
+        <p className="lookup-status" role="status">No motion candidates met the alert threshold in the comparable data.</p>
       )}
       {candidate && (
         <>
@@ -103,7 +109,7 @@ export function MotionReview({ jobId, exploratory, inspected, selectedCandidate,
             </label>
           )}
           <p role="status">Possible motion · {candidate.displacement.toFixed(2)} ± {candidate.uncertainty.toFixed(2)}″</p>
-          <p className="lookup-status">Detected in {candidate.measurements.length} of {visits.length} {frameLabel}</p>
+          <p className="lookup-status">Detected in {candidate.measurements.length} of {visitCount ?? frames.length} {visitCount == null ? 'exposures' : 'visits'}</p>
           <button type="button" className="control" aria-pressed={visible} onClick={() => {
             setVisible(!visible);
             onCandidate(visible ? null : candidate);

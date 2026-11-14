@@ -8,7 +8,7 @@ import argparse
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
 import hashlib
-from itertools import islice, pairwise
+from itertools import combinations, islice, pairwise
 import json
 import math
 from pathlib import Path
@@ -17,6 +17,7 @@ import sys
 from urllib.parse import urlsplit
 
 from .exposure import sky_projection
+from .playback import MIN_OVERLAP, common_overlap
 
 ROOT = Path(sys.prefix) / "share" / "spherex-motion-detector"
 S3_HOST = "nasa-irsa-spherex.s3.us-east-1.amazonaws.com"
@@ -24,7 +25,7 @@ S3_ROOT = "https://" + S3_HOST + "/"
 CAL_VERSION = "cal-swcs-v5-2026-191"
 FIELD_SIZES = (3, 6, 12, 24, 48)
 SCORE_CUT = 30
-MIN_LOCAL_OVERLAP = .75
+MIN_LOCAL_OVERLAP = MIN_OVERLAP
 MIN_SIGNED_CHANGE_SNR = 3
 MIN_RECOVERY_SNR = 10
 MAX_RECOVERY_REDUCED_CHI2 = 10
@@ -219,6 +220,29 @@ def sequence_catalog(exposure, grid, shape, shift, cache):
     return sources
 
 
+def has_comparable_visits(exposures, visits, grid, shape, registrations):
+    from frozen_revised.coverage import SCIENCE_REJECT_MASK, projection_masks
+
+    # For an empty result, look for somewhere that could have supported a
+    # comparison. A measured track is checked separately along its path.
+    planes = {
+        index: projection_masks(exposures[index], grid, shape, SCIENCE_REJECT_MASK, shift)
+        for index, (shift, _) in registrations.items()
+    }
+    for indices in combinations(planes, 3):
+        if len({visits[index] for index in indices}) < 3:
+            continue
+        a, b, c = (planes[index] for index in indices)
+        valid = (a["quality"] & b["quality"] & c["quality"]
+                 & (a["band"] > 0) & (b["band"] > 0) & (c["band"] > 0))
+        if not valid.any():
+            continue
+        bands = [(p["wave"][valid], p["band"][valid]) for p in (a, b, c)]
+        if (common_overlap(bands) >= MIN_LOCAL_OVERLAP - 1e-12).any():
+            return True
+    return False
+
+
 def inspect_tracks(exposures, visits, grid, shape, issues):
     import numpy as np
     from frozen_revised.baseline import local_check, register
@@ -250,6 +274,11 @@ def inspect_tracks(exposures, visits, grid, shape, issues):
     for index, exp in available:
         if index not in best:
             issues[index] = "registration_unconstrained"
+    if best_rank[0] < 3:
+        return dict(status="incomplete", reason="insufficient_usable_visits", candidates=[], visits=issues)
+
+    for index, exp in available:
+        if index not in best:
             continue
         shift, scatter = best[index]
         catalog = sequence_catalog(exp, grid, shape, shift, cache)
@@ -276,8 +305,6 @@ def inspect_tracks(exposures, visits, grid, shape, issues):
         times.append(float(exp.header["MJD-AVG"]))
 
     groups = [visits[index] for index in indices]
-    if len(set(groups)) < 3:
-        return dict(status="incomplete", reason="insufficient_usable_visits", candidates=[], visits=issues)
 
     def corroborates_motion(epochs, sources):
         first, last = indices[epochs[0]], indices[epochs[-1]]
@@ -307,6 +334,9 @@ def inspect_tracks(exposures, visits, grid, shape, issues):
                                      position_icrs=[float(sky.ra.deg), float(sky.dec.deg)]))
         candidates.append(dict(measurements=measurements, displacement_arcsec=displacement * scale,
                                displacement_uncertainty_arcsec=uncertainty * scale, score=score))
+    if not candidates and not has_comparable_visits(exposures, visits, grid, shape, best):
+        return dict(status="incomplete" if any(issues) else "rejected",
+                    reason="no_comparable_visits", candidates=[], visits=issues)
     return dict(status="inspected", candidates=candidates, visits=issues)
 
 
@@ -324,7 +354,7 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
     from requests import RequestException
     from frozen_revised.archive import Archive
     from frozen_revised.calibration import Exposure, SpectralCalibration, band_overlap
-    from frozen_revised.coverage import eligibility
+    from frozen_revised.coverage import SCIENCE_REJECT_MASK, eligibility
     from frozen_revised.baseline import register
     from frozen_revised.proposals import native_candidates, FitCache
 
@@ -448,10 +478,8 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
 
     registration = register(*exposures, grid)
     if not registration["ok"]:
-        return dict(
-            status="rejected", reason="registration_unconstrained", candidates=[]
-        )
-    shared = eligibility(*exposures, grid, shape, shift=registration["shift_pixels"])
+        return dict(status="incomplete", reason="registration_unconstrained", candidates=[])
+    shared = eligibility(*exposures, grid, shape, reject_mask=SCIENCE_REJECT_MASK, shift=registration["shift_pixels"])
     if not shared["shared"].any():
         return dict(status="rejected", reason="no_comparable_pixels", candidates=[])
     raw, trace = native_candidates(*exposures, grid, shape, registration, FitCache())

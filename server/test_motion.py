@@ -14,7 +14,7 @@ import numpy as np
 from .app import app
 from .exposure import Exposure
 from .motion import DetectorResult, MotionError, analyze, format_result
-from .motion_adapter import Rejected, inspect, validate_request
+from .motion_adapter import ROOT, Rejected, inspect, inspect_tracks, validate_request
 from .playback import Center, PlaybackJob, PlaybackSearch
 
 PATCH = (133.759875, -7.24225, 6)
@@ -106,6 +106,10 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
             command.chmod(0o700)
             with patch.dict(os.environ, {"SPHEREX_MOTION_COMMAND": str(command)}):
                 report = await analyze(PlaybackJob("test", patch=PATCH, frames=frames()))
+                same_visit = [{**frame, "visit": 1} for frame in frames()]
+                rejected = await analyze(PlaybackJob("test", patch=PATCH, frames=same_visit))
+                self.assertEqual((rejected["status"], rejected["candidates"]), ("rejected", []))
+                self.assertIn("2 distinct visits", rejected["reason"])
 
         first, second = (item["imagePosition"] for item in report["candidates"][0]["measurements"])
         self.assertEqual(len(report["candidates"]), 1)
@@ -173,8 +177,11 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
             }],
         })
         report = format_result(result, PATCH, 4)
+        self.assertEqual(report["status"], "partial")
         self.assertEqual([item["frameIndex"] for item in report["candidates"][0]["measurements"]], [0, 2, 3])
         self.assertEqual(report["visits"][1], "registration_unconstrained")
+        with self.assertRaisesRegex(MotionError, "same visit"):
+            format_result(result, PATCH, 4, [1, 2, 2, 2])
         result.candidates[0].measurements[1].frame_index = 1
         with self.assertRaises(MotionError):
             format_result(result, PATCH, 4)
@@ -184,6 +191,45 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
         result = format_result(report, PATCH)
         self.assertEqual(result["status"], "incomplete")
         self.assertIn("Try again", result["reason"])
+
+    @unittest.skipUnless((ROOT / "frozen-source-manifest.json").is_file(), "Needs the installed motion bundle")
+    def test_empty_tracks_require_three_comparable_visits(self):
+        from types import SimpleNamespace
+        from .exposure import sky_projection
+
+        grid, size = sky_projection(*PATCH)
+        shape = (size, size)
+        def frame(day, wave, mask=True):
+            return SimpleNamespace(
+                header={"MJD-AVG": 60000 + day}, wcs=grid,
+                image=np.zeros(shape), variance=np.ones(shape),
+                flags=np.full(shape, 0 if mask else 1, dtype=np.uint32),
+                bandpass=lambda x, y: (np.full(x.shape, wave), np.full(y.shape, .05)),
+            )
+
+        a, b, c, d = (frame(i, 4.0) for i in range(4))
+        reg = {"ok": True, "shift_pixels": [0, 0], "scatter_cov_pixels": np.zeros((2, 2))}
+        with (
+            patch.object(sys, "path", [str(ROOT), *sys.path]),
+            patch("frozen_revised.baseline.register", return_value=reg),
+            patch("server.motion_adapter.sequence_catalog", return_value=[]),
+        ):
+            for exposures, groups, expected, reason in (
+                ([a, frame(1, 4.5), c], [1, 2, 3], "rejected", "no_comparable_visits"),
+                ([a, frame(1, 4.0, mask=False), c], [1, 2, 3], "rejected", "no_comparable_visits"),
+                ([a, b, frame(2, 4.5), d], [1, 1, 2, 3], "rejected", "no_comparable_visits"),
+                ([a, b, c, frame(3, 4.5)], [1, 2, 3, 4], "inspected", None),
+            ):
+                with self.subTest(expected=expected, groups=groups):
+                    report = inspect_tracks(exposures, groups, grid, shape, [None] * len(groups))
+                    self.assertEqual((report["status"], report.get("reason"), report["candidates"]),
+                                     (expected, reason, []))
+
+            early_failure = inspect_tracks([a, None, c], [1, 2, 3], grid, shape, [None, "read_failed", None])
+            self.assertEqual((early_failure["status"], early_failure["reason"]),
+                             ("incomplete", "insufficient_usable_visits"))
+            partial = inspect_tracks([a, b, None, d], [1, 2, 3, 4], grid, shape, [None, None, "read_failed", None])
+            self.assertEqual(format_result(DetectorResult.model_validate(partial), PATCH, 4)["status"], "partial")
 
     @unittest.skipUnless(find_spec("scipy"), "Sequence motion needs the installed detector dependencies")
     def test_tracks_use_actual_times_and_skip_a_missing_detection(self):

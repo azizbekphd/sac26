@@ -201,14 +201,26 @@ def supports_motion(job):
     return job.status == "ready" and job.patch is not None and 2 <= len(job.frames) <= MAX_FRAMES
 
 
+def withdrawn_sequence(request, job_id):
+    lookup = request.app.state.playback.get(job_id.partition(".")[0])
+    return lookup is not None and job_id in lookup.invalid_sequences
+
+
+WITHDRAWN_MOTION = "New archive metadata changed the visit grouping. Choose a current sequence to check for motion."
+
+
 @app.get("/api/playback/{job_id}")
 async def playback_status(job_id: str, request: Request, response: Response):
     response.headers["Cache-Control"] = "no-store"
     job = playback_job(request, job_id)
     count = len(job.frames)
     motion = supports_motion(job)
-    result = {**job.snapshot(), "motionAvailable": motion and motion_available(count)}
-    if motion and not result["motionAvailable"]:
+    withdrawn = withdrawn_sequence(request, job_id)
+    result = {**job.snapshot(), "motionAvailable": motion and not withdrawn and motion_available(count)}
+    if withdrawn:
+        result.pop("motionResult", None)
+        result["motionUnavailableReason"] = WITHDRAWN_MOTION
+    elif motion and not result["motionAvailable"]:
         result["motionUnavailableReason"] = "The installed motion detector does not support this sequence length."
     return result
 
@@ -220,8 +232,12 @@ async def playback_motion(job_id: str, request: Request):
         raise HTTPException(409, "Open a playable sequence before checking for motion.")
 
     async def inspect(_deadline):
+        if withdrawn_sequence(request, job_id):
+            raise HTTPException(409, WITHDRAWN_MOTION)
         if job.motion_result is None:
             result = await analyze(job)
+            if withdrawn_sequence(request, job_id):
+                raise HTTPException(409, WITHDRAWN_MOTION)
             if result["status"] != "inspected" or any(result.get("visits", [])):
                 return result
             job.motion_result = result
