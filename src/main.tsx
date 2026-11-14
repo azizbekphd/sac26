@@ -653,7 +653,7 @@ function App() {
                         <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
                       </div>
                     )}
-                    {motionJobId && <MotionReview key={motionJobId} jobId={motionJobId}
+                    {motionJobId && <MotionReview key={motionJobId} jobId={motionJobId} exploratory={exploratory}
                       inspected={inspected} selectedCandidate={motionMarker}
                       onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
                       onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} />}

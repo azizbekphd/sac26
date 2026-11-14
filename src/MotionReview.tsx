@@ -17,8 +17,9 @@ export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate
   );
 }
 
-export function MotionReview({ jobId, inspected, selectedCandidate, onResult, onCandidate }: {
+export function MotionReview({ jobId, exploratory, inspected, selectedCandidate, onResult, onCandidate }: {
   jobId: string;
+  exploratory: boolean;
   inspected?: MotionResult;
   selectedCandidate?: MotionCandidate | null;
   onResult: (result: MotionResult) => void;
@@ -33,6 +34,7 @@ export function MotionReview({ jobId, inspected, selectedCandidate, onResult, on
   const candidates = state && state !== 'loading' ? state.candidates : [];
   const visits = state && state !== 'loading' ? state.visits : [];
   const skipped = visits.flatMap((issue, i) => issue ? [i + 1] : []);
+  const frameLabel = exploratory ? 'exposures' : 'visits';
 
   useEffect(() => () => request.current?.abort(), []);
 
@@ -79,7 +81,7 @@ export function MotionReview({ jobId, inspected, selectedCandidate, onResult, on
       {state && state !== 'loading' && state.status !== 'inspected' && (
         <p className="lookup-status" role="status">{state.reason}</p>
       )}
-      {skipped.length > 0 && <p className="lookup-status" role="status">Could not evaluate visits {skipped.join(', ')}.</p>}
+      {skipped.length > 0 && <p className="lookup-status" role="status">Could not evaluate {frameLabel} {skipped.join(', ')}.</p>}
       {state && state !== 'loading' && (state.status === 'incomplete' || skipped.length > 0) && (
         <button type="button" className="control" onClick={start}>Retry motion analysis</button>
       )}
@@ -101,7 +103,7 @@ export function MotionReview({ jobId, inspected, selectedCandidate, onResult, on
             </label>
           )}
           <p role="status">Possible motion · {candidate.displacement.toFixed(2)} ± {candidate.uncertainty.toFixed(2)}″</p>
-          <p className="lookup-status">Detected in {candidate.measurements.length} of {visits.length} visits</p>
+          <p className="lookup-status">Detected in {candidate.measurements.length} of {visits.length} {frameLabel}</p>
           <button type="button" className="control" aria-pressed={visible} onClick={() => {
             setVisible(!visible);
             onCandidate(visible ? null : candidate);
