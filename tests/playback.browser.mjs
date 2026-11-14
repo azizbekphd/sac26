@@ -349,8 +349,9 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     const expanded = page.getByRole('dialog', { name: 'Expanded spectrum' });
     const measurement = panel.locator('details').getByLabel('Measurement', { exact: true });
     assert.equal(await chart.locator('.spectrum-chart-target').count(), 6);
-    await panel.getByText('Measurement details', { exact: true }).click();
-    await measurement.selectOption('s8');
+    await chart.locator('.spectrum-chart-target').nth(2).tap();
+    assert.equal(await measurement.inputValue(), 's8');
+    assert.equal(await expanded.isVisible(), false);
     interruptPoll = true;
     await panel.getByText(/Reconnecting to the spectrum request/).waitFor();
     assert.equal(await chart.locator('.spectrum-chart-target').count(), 6);
@@ -424,9 +425,18 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     assert.equal(await panel.getByLabel('Through').inputValue(), '2025-03-01');
     assert.equal(await marker.getAttribute('style'), style);
     assert.equal(submitted.length, 1);
-    await expand.click();
+    await expand.click({ position: { x: 10, y: 20 } });
     await expanded.getByText('Masked pixels', { exact: true }).waitFor();
     assert.equal(await expanded.getByRole('link', { name: 'Source FITS · obs-0' }).getAttribute('href'), point.sourceUrl);
+    await expanded.getByRole('button', { name: 'Close' }).click();
+    assert.equal(await expand.evaluate((node) => node === document.activeElement), true);
+    for (const key of ['Enter', 'Space']) {
+      await expand.press(key);
+      await expanded.waitFor();
+      await page.keyboard.press('Escape');
+      await expanded.waitFor({ state: 'hidden' });
+    }
+    await expand.tap({ position: { x: 10, y: 20 } });
     await expanded.getByRole('button', { name: 'Close' }).click();
     await button('Clear source').click();
     await panel.waitFor({ state: 'hidden' });

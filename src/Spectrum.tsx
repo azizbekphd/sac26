@@ -57,13 +57,13 @@ function SpectrumChart({ points, active, onSelect }: {
         const color = colors[(point.visit - 1) % colors.length];
         const selected = active === point.key;
         return (
-          <g key={point.key} opacity={selected ? 1 : .8}>
+          <g className="spectrum-chart-marker" key={point.key} opacity={selected ? 1 : .8}
+            onClick={() => onSelect(point.key)}>
             <title>{`Visit ${point.visit} · ${point.wavelength.toFixed(4)} µm · ${point.observedAt}`}</title>
             <line x1={cx} x2={cx} y1={y(point.flux - point.uncertainty)}
               y2={y(point.flux + point.uncertainty)} stroke={color} />
             <circle cx={cx} cy={cy} r={selected ? 4 : 2.4} fill={color} stroke={selected ? '#fff' : 'none'} />
-            <circle className="spectrum-chart-target" cx={cx} cy={cy} r="7" fill="transparent"
-              onClick={() => onSelect(point.key)} />
+            <circle className="spectrum-chart-target" cx={cx} cy={cy} r="7" fill="transparent" />
           </g>
         );
       })}
@@ -196,8 +196,6 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
       <div className="spectrum-heading">
         <h2 id={titleId}>Spectrum</h2>
         <div className="spectrum-actions">
-          {hasPoints && <button className="control" type="button" aria-label="Expand spectrum"
-            onClick={() => dialog.current?.showModal()}>Expand</button>}
           {busy && <button className="control" type="button" onClick={cancel}>Cancel spectrum</button>}
           <button className="control spectrum-clear" type="button" onClick={onClear}>Clear source</button>
         </div>
@@ -213,10 +211,17 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
       )}
       {selected && (
         <div className="spectrum-results">
-          <SpectrumChart points={points} active={selected.key} onSelect={(key) => {
-            setSelectedKey(key);
-            if (measurementDetails.current) measurementDetails.current.open = true;
-          }} />
+          <div className="spectrum-chart-preview">
+            <button type="button" className="spectrum-chart-expand" aria-label="Expand spectrum" aria-haspopup="dialog"
+              onClick={(event) => {
+                event.currentTarget.focus({ preventScroll: true });
+                dialog.current?.showModal();
+              }} />
+            <SpectrumChart points={points} active={selected.key} onSelect={(key) => {
+              setSelectedKey(key);
+              if (measurementDetails.current) measurementDetails.current.open = true;
+            }} />
+          </div>
           {!scanning && result?.message && <p className="lookup-status">{result.message}</p>}
           {sparse && <p className="lookup-status">Limited wavelength coverage.</p>}
           {submitted && <p className="spectrum-window">Requested {submitted.startDate} to {submitted.endDate} UTC</p>}

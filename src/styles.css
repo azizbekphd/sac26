@@ -326,11 +326,15 @@ form { display: grid; gap: 10px; }
 .spectrum-dates .field { grid-template-columns: 7ch minmax(0, 1fr); align-items: center; }
 .spectrum-dates input, .spectrum-measurement select { width: 100%; min-width: 0; box-sizing: border-box; }
 .spectrum-chart { display: block; width: 100%; height: auto; aspect-ratio: 320 / 190; background: #090909; }
-.spectrum-results > .spectrum-chart { max-height: 180px; }
+.spectrum-chart-preview { position: relative; background: #090909; }
+.spectrum-chart-preview .spectrum-chart { position: relative; max-height: 180px; background: transparent; pointer-events: none; }
+.spectrum-chart-preview .spectrum-chart-marker { pointer-events: visiblePainted; }
+.spectrum-chart-expand { position: absolute; inset: 0; border: 0; padding: 0; background: transparent; cursor: zoom-in; }
+.spectrum-chart-expand:focus-visible { outline-offset: -2px; }
 .spectrum-chart text { fill: #dedede; font-size: 10px; }
 .spectrum-grid { stroke: #373737; stroke-width: .75px; }
 .spectrum-axis { fill: none; stroke: #8e8e8e; stroke-width: .75px; }
-.spectrum-chart-target { cursor: pointer; }
+.spectrum-chart-marker { cursor: pointer; }
 .spectrum-dialog {
   width: min(720px, calc(100% - 24px));
   max-height: calc(100dvh - 24px);
