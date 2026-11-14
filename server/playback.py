@@ -10,6 +10,7 @@ import logging
 from math import ceil, sqrt
 from time import monotonic
 
+from astropy.time import Time
 from astropy.wcs import WCS
 import httpx
 import numpy as np
@@ -128,6 +129,13 @@ def group_visits(exposures):
     return visits
 
 
+def visit_dates_by_key(visits):
+    if not visits:
+        return {}
+    boundaries = Time([(visit[0].mjd, visit[-1].mjd) for visit in visits], format="mjd", scale="utc", precision=9)
+    return {item.key: (first[:10], last[:10]) for visit, (first, last) in zip(visits, boundaries.isot) for item in visit}
+
+
 def visit_order(count):
     if count < 2:
         return list(range(count))
@@ -233,6 +241,7 @@ class PlaybackSearch:
         self.circle = f"CIRCLE {ra:.9f} {dec:.9f} {radius:.6f}"
         self.reads = {}
         self.preview_key = None
+        self.visit_dates = {}
         self.preview_tasks = []
         self.checked = set()
         self.verified = set()
@@ -325,6 +334,7 @@ class PlaybackSearch:
             self.job.preview = {
                 **exposure_metadata(item, center.wavelength if center else None, float(valid.mean())),
                 "bandwidth": center.bandwidth if center else None,
+                "visitDates": self.visit_dates.get(item.key),
                 "imageUrl": self.job.image("preview", render_png(image, valid)),
             }
             self.job.message = "Looking for matched visits…"
@@ -510,7 +520,8 @@ class PlaybackSearch:
                             records=records, patch=self.job.patch, filters=self.job.filters)
         publish_frames(child, [
             ({**exposure_metadata(center.exposure, center.wavelength, coverage),
-              "bandwidth": center.bandwidth, "visit": center.visit}, image, valid)
+              "bandwidth": center.bandwidth, "visit": center.visit,
+              "visitDates": self.visit_dates.get(center.exposure.key)}, image, valid)
             for center, image in zip(items, images)
         ])
         child.comparison = {
@@ -523,6 +534,9 @@ class PlaybackSearch:
 
     def revalidate_visits(self, visits):
         # A footprint response can connect visits seen in an earlier center query.
+        self.visit_dates = visit_dates_by_key(visits)
+        if self.job.preview is not None:
+            self.job.preview["visitDates"] = self.visit_dates.get(self.preview_key)
         visit_by_key = {item.key: index for index, visit in enumerate(visits, 1) for item in visit}
         self.job.invalid_sequences.clear()
         for child in self.job.sequences.values():
@@ -532,6 +546,7 @@ class PlaybackSearch:
                 continue
             for frame, visit_id in zip(child.frames, visit_ids):
                 frame["visit"] = visit_id
+                frame["visitDates"] = self.visit_dates.get(frame["key"])
 
     async def discover(self):
         # Keep wavelength-ineligible exposures in the timeline for visit grouping.

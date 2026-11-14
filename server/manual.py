@@ -67,7 +67,7 @@ async def exposure_preview(client, patch, item):
     return render_png(image, valid)
 
 
-async def render_selection(runner, selected):
+async def render_selection(runner, selected, *, archive_visit_dates=None):
     job = runner.job
     job.records = tuple(item for item, _ in selected)
 
@@ -138,7 +138,8 @@ async def render_selection(runner, selected):
     display_masks = masks if reasons else [shared] * len(masks)
     publish_frames(job, [
         ({**exposure_metadata(item, center.wavelength if center else None, float(mask.mean())),
-          "bandwidth": center.bandwidth if center else None, "visit": visit}, image, display_mask)
+          "bandwidth": center.bandwidth if center else None, "visit": visit,
+          "visitDates": (archive_visit_dates or {}).get(item.key)}, image, display_mask)
         for (item, visit), center, image, mask, display_mask in zip(selected, centers, images, masks, display_masks)
     ])
     job.mode = "exploratory" if reasons else "matched"

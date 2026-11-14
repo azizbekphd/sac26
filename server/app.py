@@ -4,6 +4,7 @@ import asyncio
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import date
+from functools import partial
 from time import monotonic
 from typing import Literal
 from uuid import uuid4
@@ -18,7 +19,8 @@ from .manual import (
     indexed_visits, render_selection, run_manual,
 )
 from .motion import MotionError, analyze, available as motion_available, motion_timeout
-from .playback import MAX_FRAMES, PlaybackJob, run_playback
+from .playback import MAX_FRAMES, PlaybackJob, group_visits, run_playback, visit_dates_by_key
+from .spectrum import SPECTRUM_SECONDS, SpectrumJob, run_spectrum
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
@@ -75,6 +77,20 @@ class ManualSelection(BaseModel):
     keys: list[str] = Field(min_length=2, max_length=MAX_FRAMES)
 
 
+class SpectrumRequest(BaseModel):
+    ra: float = Field(ge=0, lt=360)
+    dec: float = Field(ge=-90, le=90)
+    startDate: date
+    endDate: date
+    release: Release | None = None
+
+    @model_validator(mode="after")
+    def check_dates(self):
+        if self.startDate > self.endDate:
+            raise ValueError("The start date must be on or before the end date.")
+        return self
+
+
 @asynccontextmanager
 async def lifespan(app):
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
@@ -84,16 +100,59 @@ async def lifespan(app):
         app.state.motion = asyncio.Semaphore(1)
         app.state.playback = {}
         app.state.previews = OrderedDict()
+        app.state.spectra = {}
+        app.state.spectrum_slot = asyncio.Semaphore(1)
         try:
             yield
         finally:
-            tasks = [job.task for job in app.state.playback.values() if job.task is not None]
+            tasks = [job.task for jobs in (app.state.playback, app.state.spectra)
+                     for job in jobs.values() if job.task is not None and not job.task.done()]
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/api/spectrum", status_code=202)
+async def start_spectrum(source: SpectrumRequest, request: Request):
+    state = request.app.state
+    jobs = state.spectra
+    cutoff = monotonic() - JOB_RETENTION
+    for job_id, job in list(jobs.items()):
+        if job.task.done() and job.touched < cutoff:
+            del jobs[job_id]
+    if sum(not job.task.done() for job in jobs.values()) >= 4:
+        raise HTTPException(503, "The spectrum service is busy. Try again in a moment.")
+    filters = ArchiveFilters(release=source.release, start_mjd=(source.startDate - MJD_EPOCH).days,
+                             end_mjd=(source.endDate - MJD_EPOCH).days + 1)
+    job_id = uuid4().hex
+    job = SpectrumJob()
+    deadline = asyncio.get_running_loop().time() + SPECTRUM_SECONDS
+    job.task = asyncio.create_task(run_spectrum(state.archive, job, source.ra, source.dec, filters,
+                                                deadline, state.spectrum_slot))
+    jobs[job_id] = job
+    return {"id": job_id}
+
+
+@app.get("/api/spectrum/{job_id}")
+async def spectrum_status(job_id: str, request: Request, response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    job = request.app.state.spectra.get(job_id)
+    if job is None:
+        raise HTTPException(404, "This spectrum request has expired. Try again.")
+    job.touched = monotonic()
+    return job.snapshot()
+
+
+@app.delete("/api/spectrum/{job_id}", status_code=204)
+async def cancel_spectrum(job_id: str, request: Request):
+    job = request.app.state.spectra.pop(job_id, None)
+    if job is not None and not job.task.done():
+        job.task.cancel()
+        await asyncio.gather(job.task, return_exceptions=True)
+    return Response(status_code=204)
 
 
 def find_playback(jobs, job_id):
@@ -170,7 +229,8 @@ async def start_manual_comparison(job_id: str, selection: ManualSelection, reque
     job, records = inventory_selection(request, job_id, selection.keys)
     if len({item.identity for item, _ in records}) != len(records):
         raise HTTPException(422, "Choose one archive product per detector exposure.")
-    return register_job(request, job.patch, run_manual, render_selection, records, filters=job.filters)
+    render = partial(render_selection, archive_visit_dates=visit_dates_by_key(group_visits(job.records)))
+    return register_job(request, job.patch, run_manual, render, records, filters=job.filters)
 
 
 @app.get("/api/manual/{job_id}/preview")
