@@ -17,8 +17,8 @@ from scipy.ndimage import map_coordinates
 from .exposure import ArchiveError, calibration_key, exposure_metadata, fits_range, raster, rows, search
 from .playback import ARCHIVE_ERRORS, METADATA_LIMIT, group_visits, visit_order
 
-SPECTRUM_SECONDS = 60
 EXPOSURES_IN_FLIGHT = 6
+SPECTRUM_IDLE_SECONDS = 120
 EXCLUDED_FLAGS = {
     "TRANSIENT", "OVERFLOW", "SUR_ERROR", "NONFUNC", "DICHROIC", "MISSING_DATA", "HOT",
     "COLD", "NONLINEAR", "CROSSTALK", "GHOST", "GHOST_FPA", "GHOST_EXT", "STREAK",
@@ -37,13 +37,17 @@ class SpectrumJob:
     points: list[dict] = field(default_factory=list)
     task: asyncio.Task | None = None
     touched: float = field(default_factory=monotonic)
+    poll_timeout: asyncio.Timeout | None = field(default=None, repr=False)
+
+    def touch(self):
+        self.touched = monotonic()
+        if self.poll_timeout is not None and not self.poll_timeout.expired():
+            self.poll_timeout.reschedule(asyncio.get_running_loop().time() + SPECTRUM_IDLE_SECONDS)
 
     def snapshot(self):
-        terminal = self.status in ("ready", "partial")
         return {
             "status": self.status, "message": self.message, "processed": self.processed, "total": self.total,
-            "points": sorted(self.points, key=lambda point: (point["visit"], point["wavelength"], point["key"]))
-            if terminal else [],
+            "points": sorted(self.points, key=lambda point: (point["visit"], point["wavelength"], point["key"])),
         }
 
 
@@ -223,7 +227,7 @@ async def discover_spectrum(client, ra, dec, filters):
             await asyncio.sleep(.5)
 
 
-async def run_spectrum(client, job, ra, dec, filters, deadline, slot):
+async def run_spectrum(client, job, ra, dec, filters, slot):
     calibration = {}
     failed = False
 
@@ -242,7 +246,9 @@ async def run_spectrum(client, job, ra, dec, filters, deadline, slot):
             job.processed += 1
 
     try:
-        async with asyncio.timeout_at(deadline):
+        async with asyncio.timeout(None) as poll_timeout:
+            job.poll_timeout = poll_timeout
+            job.touch()
             async with slot:
                 records, truncated = await discover_spectrum(client, ra, dec, filters)
                 selected = list(spectrum_exposures(records))
@@ -260,10 +266,12 @@ async def run_spectrum(client, job, ra, dec, filters, deadline, slot):
         else:
             job.status = "ready" if job.points else "empty"
             job.message = "" if job.points else "No usable measurements at this position in the selected dates."
-    except (TimeoutError, httpx.TimeoutException):
+    except httpx.TimeoutException:
+        job.status = "timeout"
+        job.message = "The SPHEREx archive did not respond in time. Try again."
+    except TimeoutError:
         job.status = "partial" if job.points else "timeout"
-        job.message = ("The request reached the 60-second limit." if job.points else
-                       "The request timed out before a usable measurement was available. Try again.")
+        job.message = "The spectrum request expired after polling stopped. Try again."
     except asyncio.CancelledError:
         job.status = "cancelled"
         raise
@@ -276,6 +284,7 @@ async def run_spectrum(client, job, ra, dec, filters, deadline, slot):
         job.status = "partial" if job.points else "error"
         job.message = "The archive request could not finish. Try again."
     finally:
+        job.poll_timeout = None
         for task in calibration.values():
             task.cancel()
         await asyncio.gather(*calibration.values(), return_exceptions=True)

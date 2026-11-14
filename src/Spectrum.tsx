@@ -18,11 +18,10 @@ const colors = ['#7de0ef', '#ffbd82', '#d1b0ff', '#a5e69b', '#fca8c8', '#fff296'
 
 function SpectrumChart({ points, active, onSelect }: {
   points: SpectrumPoint[];
-  active: number;
-  onSelect: (index: number) => void;
+  active: string;
+  onSelect: (key: string) => void;
 }) {
   const titleId = useId();
-  const visits = [...new Set(points.map((point) => point.visit))];
   const [first, last] = [Math.min(...points.map((point) => point.wavelength)),
     Math.max(...points.map((point) => point.wavelength))];
   const wavelengthSpread = Math.max(last - first, .04);
@@ -52,18 +51,19 @@ function SpectrumChart({ points, active, onSelect }: {
       ))}
       <text x="67" y="11">Flux density (µJy)</text>
       <text x="188" y="185" textAnchor="middle">Wavelength (µm)</text>
-      {points.map((point, index) => {
+      {points.map((point) => {
         const cx = x(point.wavelength);
         const cy = y(point.flux);
-        const color = colors[visits.indexOf(point.visit) % colors.length];
+        const color = colors[(point.visit - 1) % colors.length];
+        const selected = active === point.key;
         return (
-          <g key={point.key} opacity={active === index ? 1 : .8}>
+          <g key={point.key} opacity={selected ? 1 : .8}>
             <title>{`Visit ${point.visit} · ${point.wavelength.toFixed(4)} µm · ${point.observedAt}`}</title>
             <line x1={cx} x2={cx} y1={y(point.flux - point.uncertainty)}
               y2={y(point.flux + point.uncertainty)} stroke={color} />
-            <circle cx={cx} cy={cy} r={active === index ? 4 : 2.4} fill={color}
-              stroke={active === index ? '#fff' : 'none'} />
-            <circle className="spectrum-chart-target" cx={cx} cy={cy} r="7" fill="transparent" onClick={() => onSelect(index)} />
+            <circle cx={cx} cy={cy} r={selected ? 4 : 2.4} fill={color} stroke={selected ? '#fff' : 'none'} />
+            <circle className="spectrum-chart-target" cx={cx} cy={cy} r="7" fill="transparent"
+              onClick={() => onSelect(point.key)} />
           </g>
         );
       })}
@@ -71,19 +71,18 @@ function SpectrumChart({ points, active, onSelect }: {
   );
 }
 
-function SpectrumMeasurement({ points, active, onSelect }: {
+function SpectrumMeasurement({ points, point, onSelect }: {
   points: SpectrumPoint[];
-  active: number;
-  onSelect: (index: number) => void;
+  point: SpectrumPoint;
+  onSelect: (key: string) => void;
 }) {
-  const point = points[active];
   return (
     <>
       <label className="field spectrum-measurement">
         Measurement
-        <select aria-label="Measurement" value={active} onChange={(event) => onSelect(Number(event.currentTarget.value))}>
-          {points.map((item, index) => (
-            <option key={item.key} value={index}>Visit {item.visit} · {item.wavelength.toFixed(4)} µm · D{item.detector}</option>
+        <select aria-label="Measurement" value={point.key} onChange={(event) => onSelect(event.currentTarget.value)}>
+          {points.map((item) => (
+            <option key={item.key} value={item.key}>Visit {item.visit} · {item.wavelength.toFixed(4)} µm · D{item.detector}</option>
           ))}
         </select>
       </label>
@@ -113,10 +112,11 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
   const [result, setResult] = useState<SpectrumUpdate | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
-  const [active, setActive] = useState(0);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const request = useRef<AbortController | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const measurementDetails = useRef<HTMLDetailsElement>(null);
+  const sourceDetails = useRef<HTMLDetailsElement>(null);
   const panel = useRef<HTMLElement>(null);
   const scrolledToResults = useRef(false);
   const titleId = useId();
@@ -136,13 +136,18 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
     setBusy(true);
     setError('');
     setResult(null);
-    setActive(0);
+    setSelectedKey(null);
     setSubmitted(dates);
-    void watchSpectrum({ ...position, ...dates, release }, controller.signal, setResult).catch((failure: unknown) => {
+    void watchSpectrum({ ...position, ...dates, release }, controller.signal, (update) => {
+      setResult(update);
+      const firstPoint = update.points[0];
+      if (firstPoint) setSelectedKey((key) => key ?? firstPoint.key);
+    }).catch((failure: unknown) => {
       if (!controller.signal.aborted) {
-        setResult(null);
-        setError(failure instanceof Error && !(failure instanceof TypeError) ? failure.message :
-          'The spectrum service could not complete the request. Try again.');
+        const message = failure instanceof Error && !(failure instanceof TypeError) ? failure.message :
+          'The spectrum service could not complete the request. Try again.';
+        setResult((previous) => ({ processed: 0, total: null, points: [], ...previous,
+          status: previous?.points.length ? 'partial' : 'error', message, reconnecting: false }));
       }
     }).finally(() => {
       if (request.current === controller) {
@@ -159,12 +164,18 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
     setResult(null);
     setSubmitted(null);
     setError('');
+    if (sourceDetails.current) sourceDetails.current.open = true;
   }
 
   const edited = submitted && (dates.startDate !== submitted.startDate || dates.endDate !== submitted.endDate);
   const points = result?.points ?? [];
-  const hasPoints = points.length > 0;
-  const retry = !edited && (result?.status === 'error' || result?.status === 'timeout' || (error && !result));
+  const selected = points.find((point) => point.key === selectedKey) ?? points[0];
+  const hasPoints = Boolean(selected);
+  const retry = !edited && (result?.status === 'error' || result?.status === 'timeout' || result?.status === 'partial');
+  const scanning = busy && (!result || result.status === 'searching');
+  const progress = result?.total == null ? '' : `${result.processed} / ${result.total} exposures checked.`;
+  const status = result?.reconnecting ? 'Reconnecting to the spectrum request…' :
+    scanning ? (hasPoints ? '' : result?.message || 'Searching the SPHEREx archive…') : (hasPoints ? '' : result?.message);
   const sparse = points.length > 0 && Math.max(...points.map((p) => p.wavelength)) -
     Math.min(...points.map((p) => p.wavelength)) < Math.min(...points.map((p) => p.bandwidth));
 
@@ -172,7 +183,10 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
     if (!hasPoints) {
       scrolledToResults.current = false;
     } else if (visible && !scrolledToResults.current) {
-      panel.current?.scrollTo({ top: 0 });
+      if (!sourceDetails.current?.contains(document.activeElement)) {
+        if (sourceDetails.current) sourceDetails.current.open = false;
+        panel.current?.scrollTo({ top: 0 });
+      }
       scrolledToResults.current = true;
     }
   }, [hasPoints, visible]);
@@ -184,35 +198,32 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
         <div className="spectrum-actions">
           {hasPoints && <button className="control" type="button" aria-label="Expand spectrum"
             onClick={() => dialog.current?.showModal()}>Expand</button>}
+          {busy && <button className="control" type="button" onClick={cancel}>Cancel spectrum</button>}
           <button className="control spectrum-clear" type="button" onClick={onClear}>Clear source</button>
         </div>
       </div>
       {!hasPoints && submitted && <p className="spectrum-window">Requested {submitted.startDate} to {submitted.endDate} UTC</p>}
-      {!hasPoints && (busy || result?.message) && (
-        <p role="status" className="lookup-status">
-          {result?.status === 'partial' && <strong>Partial. </strong>}
-          {result?.reconnecting ? 'Reconnecting to the spectrum request…' :
-            result?.message || (busy ? 'Searching the SPHEREx archive…' : '')}
-          {busy && result?.total != null && ` ${result.processed} / ${result.total} exposures checked.`}
+      {(hasPoints || scanning || status) && (
+        <p role="status" className="spectrum-caption">
+          {result?.status === 'partial' && <strong>Partial · </strong>}
+          {hasPoints && <span>{points.length} {points.length === 1 ? 'measurement' : 'measurements'}</span>}
+          {hasPoints && scanning && (status || progress) && ' · '}
+          {status}{status && scanning && progress && ' '}{scanning && progress}
         </p>
       )}
-      {hasPoints && (
+      {selected && (
         <div className="spectrum-results">
-          <p className="spectrum-caption" role="status">
-            {result?.status === 'partial' && <strong>Partial · </strong>}
-            {points.length} {points.length === 1 ? 'measurement' : 'measurements'}
-          </p>
-          <SpectrumChart points={points} active={active} onSelect={(index) => {
-            setActive(index);
+          <SpectrumChart points={points} active={selected.key} onSelect={(key) => {
+            setSelectedKey(key);
             if (measurementDetails.current) measurementDetails.current.open = true;
           }} />
-          {result?.message && <p className="lookup-status">{result.message}</p>}
+          {!scanning && result?.message && <p className="lookup-status">{result.message}</p>}
           {sparse && <p className="lookup-status">Limited wavelength coverage.</p>}
           {submitted && <p className="spectrum-window">Requested {submitted.startDate} to {submitted.endDate} UTC</p>}
           <details className="spectrum-disclosure" ref={measurementDetails}>
             <summary>Measurement details</summary>
             <p className="spectrum-caption">Aperture photometry</p>
-            <SpectrumMeasurement points={points} active={active} onSelect={setActive} />
+            <SpectrumMeasurement points={points} point={selected} onSelect={setSelectedKey} />
           </details>
           <dialog className="spectrum-dialog" ref={dialog} aria-label="Expanded spectrum"
             onKeyDown={(event) => event.stopPropagation()}>
@@ -220,12 +231,12 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
               <h2>Spectrum</h2>
               <form method="dialog"><button className="control" type="submit">Close</button></form>
             </div>
-            <SpectrumChart points={points} active={active} onSelect={setActive} />
-            <SpectrumMeasurement points={points} active={active} onSelect={setActive} />
+            <SpectrumChart points={points} active={selected.key} onSelect={setSelectedKey} />
+            <SpectrumMeasurement points={points} point={selected} onSelect={setSelectedKey} />
           </dialog>
         </div>
       )}
-      <details className="spectrum-disclosure" open={!hasPoints}>
+      <details className="spectrum-disclosure" ref={sourceDetails} open>
         <summary>Source and dates</summary>
         <p className="spectrum-position" aria-live="polite">RA {positionLabel.ra}° · Dec {positionLabel.dec}°</p>
         <form onSubmit={submit}>
@@ -242,12 +253,9 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
                 onChange={(event) => setDates({ ...dates, endDate: event.currentTarget.value })} />
             </label>
           </fieldset>
-          <div className="spectrum-actions">
-            <button type="submit" className="control" disabled={busy && !edited}>
-              {retry ? 'Retry spectrum' : 'Show spectrum'}
-            </button>
-            {busy && <button className="control" type="button" onClick={cancel}>Cancel spectrum</button>}
-          </div>
+          <button type="submit" className="control" disabled={busy && !edited}>
+            {retry ? 'Retry spectrum' : 'Show spectrum'}
+          </button>
         </form>
         {error && <p className="error" role="alert">{error}</p>}
       </details>

@@ -20,7 +20,7 @@ from .manual import (
 )
 from .motion import MotionError, analyze, available as motion_available, motion_timeout
 from .playback import MAX_FRAMES, PlaybackJob, group_visits, run_playback, visit_dates_by_key
-from .spectrum import SPECTRUM_SECONDS, SpectrumJob, run_spectrum
+from .spectrum import SpectrumJob, run_spectrum
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
@@ -129,9 +129,8 @@ async def start_spectrum(source: SpectrumRequest, request: Request):
                              end_mjd=(source.endDate - MJD_EPOCH).days + 1)
     job_id = uuid4().hex
     job = SpectrumJob()
-    deadline = asyncio.get_running_loop().time() + SPECTRUM_SECONDS
     job.task = asyncio.create_task(run_spectrum(state.archive, job, source.ra, source.dec, filters,
-                                                deadline, state.spectrum_slot))
+                                                state.spectrum_slot))
     jobs[job_id] = job
     return {"id": job_id}
 
@@ -142,7 +141,7 @@ async def spectrum_status(job_id: str, request: Request, response: Response):
     job = request.app.state.spectra.get(job_id)
     if job is None:
         raise HTTPException(404, "This spectrum request has expired. Try again.")
-    job.touched = monotonic()
+    job.touch()
     return job.snapshot()
 
 

@@ -244,7 +244,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
   }
 });
 
-test('requests a sidebar spectrum at the picked sky position and keeps partial results', { timeout: 30_000 }, async () => {
+test('updates the spectrum chart while measurements arrive and keeps partial results', { timeout: 30_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   try {
     const page = await browser.newPage({ viewport: { width: 390, height: 650 }, isMobile: true, hasTouch: true });
@@ -253,6 +253,7 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     result.frames[0].visitDates = ['2024-12-31', '2025-01-01'];
     const submitted = [];
     const removed = [];
+    let measurements = [];
     let finish = false;
     let interruptPoll = false;
     const point = { ...exposure(0), wavelength: 1.5, bandwidth: .03, flux: 80, uncertainty: 6, flags: ['Masked pixels'] };
@@ -260,7 +261,6 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
       wavelength: .82 + i * .09, flux: 1500 / (i + 1) + 25 * Math.sin(i), uncertainty: 8 + i,
       visit: Math.floor(i / 4) + 1,
     }));
-    const reply = (status, points, message) => ({ status, points, message, processed: points.length || 1, total: 60 });
     await page.route('**/*', async (route) => {
       const request = route.request();
       const url = new URL(request.url());
@@ -284,8 +284,10 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
           interruptPoll = false;
           return route.abort('failed');
         }
-        return send(finish ? reply('partial', points, 'The request reached the 60-second limit.')
-          : reply('searching', [], 'Measuring the spectrum…'));
+        return send(finish
+          ? { status: 'partial', points, message: 'Some archive exposures could not be checked.', processed: 60, total: 60 }
+          : { status: 'searching', points: measurements, message: 'Measuring the spectrum…',
+            processed: measurements.length + 1, total: 60 });
       }
       return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
     });
@@ -336,17 +338,33 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await panel.waitFor({ state: 'hidden' });
     await marker.waitFor({ state: 'hidden' });
     const hiddenPanel = page.getByRole('region', { name: 'Spectrum', exact: true, includeHidden: true });
-    interruptPoll = true;
-    await hiddenPanel.getByText(/Reconnecting to the spectrum request/).waitFor({ state: 'attached' });
-    finish = true;
-    await hiddenPanel.getByText(/42 measurements/).waitFor({ state: 'attached' });
+    measurements = points.slice(6, 12);
+    await hiddenPanel.getByText('6 measurements', { exact: true }).waitFor({ state: 'attached' });
     await button('Spectrum').click();
-    await panel.getByText('The request reached the 60-second limit.', { exact: false }).waitFor();
-    assert.equal(await panel.evaluate((node) => node.scrollTop), 0, 'New results start at the top of the panel');
+    await panel.getByText(/7 \/ 60 exposures checked/).waitFor();
+    assert.equal(await panel.evaluate((node) => node.scrollTop), 0, 'The first results start at the top of the panel');
     await page.setViewportSize({ width: 390, height: 844 });
     const chart = panel.getByRole('img', { name: /Flux density by wavelength/i });
-    const expand = button('Expand spectrum');
+    const expand = panel.getByRole('button', { name: 'Expand spectrum' });
+    const expanded = page.getByRole('dialog', { name: 'Expanded spectrum' });
     const measurement = panel.locator('details').getByLabel('Measurement', { exact: true });
+    assert.equal(await chart.locator('.spectrum-chart-target').count(), 6);
+    await panel.getByText('Measurement details', { exact: true }).click();
+    await measurement.selectOption('s8');
+    interruptPoll = true;
+    await panel.getByText(/Reconnecting to the spectrum request/).waitFor();
+    assert.equal(await chart.locator('.spectrum-chart-target').count(), 6);
+    measurements = points.slice(3, 16);
+    await panel.getByText(/14 \/ 60 exposures checked/).waitFor();
+    assert.equal(await chart.locator('.spectrum-chart-target').count(), 13);
+    assert.equal(await measurement.inputValue(), 's8');
+    await button('Cancel spectrum').waitFor();
+    await panel.getByText('Measurement details', { exact: true }).click();
+    await panel.evaluate((node) => { node.scrollTop = 0; });
+    finish = true;
+    await panel.getByText('Some archive exposures could not be checked.', { exact: true }).waitFor();
+    await panel.getByText('42 measurements', { exact: true }).waitFor();
+    await button('Cancel spectrum').waitFor({ state: 'hidden' });
     async function checkPlayback() {
       const playback = page.getByRole('region', { name: 'Comparison playback' });
       const strip = await playback.boundingBox();
@@ -397,17 +415,16 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await checkChartFits();
     await page.setViewportSize({ width: 390, height: 844 });
     await panel.getByText('Measurement details', { exact: true }).click();
-    await measurement.selectOption('5');
+    assert.equal(await measurement.inputValue(), 's8');
     await checkLayout();
     await panel.getByText('Source and dates', { exact: true }).click();
     await button('Motion').click();
     await button('Spectrum').click();
-    assert.equal(await measurement.inputValue(), '5');
+    assert.equal(await measurement.inputValue(), 's8');
     assert.equal(await panel.getByLabel('Through').inputValue(), '2025-03-01');
     assert.equal(await marker.getAttribute('style'), style);
     assert.equal(submitted.length, 1);
     await expand.click();
-    const expanded = page.getByRole('dialog', { name: 'Expanded spectrum' });
     await expanded.getByText('Masked pixels', { exact: true }).waitFor();
     assert.equal(await expanded.getByRole('link', { name: 'Source FITS · obs-0' }).getAttribute('href'), point.sourceUrl);
     await expanded.getByRole('button', { name: 'Close' }).click();
@@ -418,14 +435,17 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await button('Show spectrum').waitFor();
 
     finish = false;
+    measurements = [];
     await button('Show spectrum').click();
     await panel.getByText(/Measuring the spectrum/).waitFor();
     await target.press('ArrowDown');
     await panel.getByText(/Measuring the spectrum/).waitFor({ state: 'hidden' });
     await button('Show spectrum').click();
-    await panel.getByText(/Measuring the spectrum/).waitFor();
+    measurements = points.slice(0, 1);
+    await chart.waitFor();
     await button('Cancel spectrum').click();
-    await panel.getByText(/Measuring the spectrum/).waitFor({ state: 'hidden' });
+    await chart.waitFor({ state: 'hidden' });
+    await button('Show spectrum').waitFor();
     assert.deepEqual(removed.sort(), ['/api/spectrum/1', '/api/spectrum/2', '/api/spectrum/3']);
   } finally {
     await browser.close();
