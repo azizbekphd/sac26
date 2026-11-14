@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
 import { formatPosition, type SkyPosition } from './coordinates';
 import { watchSpectrum, type ArchiveRelease, type Exposure, type SpectrumPoint, type SpectrumUpdate } from './exposure';
 
@@ -101,10 +101,11 @@ function SpectrumMeasurement({ points, active, onSelect }: {
   );
 }
 
-export function Spectrum({ position, initialDates, release, onClear }: {
+export function Spectrum({ position, initialDates, release, visible, onClear }: {
   position: SkyPosition;
   initialDates: DateRange;
   release: ArchiveRelease | null;
+  visible: boolean;
   onClear: () => void;
 }) {
   const [dates, setDates] = useState(initialDates);
@@ -117,6 +118,7 @@ export function Spectrum({ position, initialDates, release, onClear }: {
   const dialog = useRef<HTMLDialogElement>(null);
   const measurementDetails = useRef<HTMLDetailsElement>(null);
   const panel = useRef<HTMLElement>(null);
+  const scrolledToResults = useRef(false);
   const titleId = useId();
   const positionLabel = formatPosition(position);
 
@@ -166,9 +168,14 @@ export function Spectrum({ position, initialDates, release, onClear }: {
   const sparse = points.length > 0 && Math.max(...points.map((p) => p.wavelength)) -
     Math.min(...points.map((p) => p.wavelength)) < Math.min(...points.map((p) => p.bandwidth));
 
-  useEffect(() => {
-    if (hasPoints) panel.current?.scrollTo({ top: 0 });
-  }, [hasPoints]);
+  useLayoutEffect(() => {
+    if (!hasPoints) {
+      scrolledToResults.current = false;
+    } else if (visible && !scrolledToResults.current) {
+      panel.current?.scrollTo({ top: 0 });
+      scrolledToResults.current = true;
+    }
+  }, [hasPoints, visible]);
 
   return (
     <section className="spectrum-panel" ref={panel} aria-labelledby={titleId}>

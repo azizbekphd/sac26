@@ -790,7 +790,7 @@ function App() {
                         Select a source on the image. Use arrow keys to move the marker with the keyboard.
                       </p>
                       {spectrumPick && <Spectrum key={spectrumPick.id} position={spectrumPick.position}
-                        initialDates={spectrumPick.dates} release={view.patch.release} onClear={() => {
+                        initialDates={spectrumPick.dates} release={view.patch.release} visible={activeTool === 'Spectrum'} onClear={() => {
                           setSpectrumPick(null);
                           spectrumTarget.current?.focus({ preventScroll: true });
                         }} />}

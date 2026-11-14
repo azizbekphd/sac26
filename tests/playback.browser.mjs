@@ -247,7 +247,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
 test('requests a sidebar spectrum at the picked sky position and keeps partial results', { timeout: 30_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   try {
-    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const page = await browser.newPage({ viewport: { width: 390, height: 650 }, isMobile: true, hasTouch: true });
     page.setDefaultTimeout(6_000);
     const { result, summary } = sequence('lookup.2', [0, 1, 2, 3]);
     result.frames[0].visitDates = ['2024-12-31', '2025-01-01'];
@@ -327,6 +327,11 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     assert.equal(await marker.getAttribute('style'), style);
     await panel.getByLabel('Through').fill('2025-03-01');
     await panel.getByText('Requested 2024-12-31 to 2025-02-01 UTC').waitFor();
+    const pendingScroll = await panel.evaluate((node) => {
+      node.scrollTop = node.scrollHeight;
+      return node.scrollTop;
+    });
+    assert.ok(pendingScroll > 0, 'The pending spectrum form can be scrolled');
     await button('Compare').click();
     await panel.waitFor({ state: 'hidden' });
     await marker.waitFor({ state: 'hidden' });
@@ -337,6 +342,8 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await hiddenPanel.getByText(/42 measurements/).waitFor({ state: 'attached' });
     await button('Spectrum').click();
     await panel.getByText('The request reached the 60-second limit.', { exact: false }).waitFor();
+    assert.equal(await panel.evaluate((node) => node.scrollTop), 0, 'New results start at the top of the panel');
+    await page.setViewportSize({ width: 390, height: 844 });
     const chart = panel.getByRole('img', { name: /Flux density by wavelength/i });
     const expand = button('Expand spectrum');
     const measurement = panel.locator('details').getByLabel('Measurement', { exact: true });
