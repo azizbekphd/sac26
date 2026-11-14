@@ -48,6 +48,8 @@ type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelec
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string } };
 type SpectrumPick = { id: number; x: number; y: number; position: SkyPosition; dates: ReturnType<typeof spectrumDates> };
+const comparisonTools = ['Compare', 'Motion', 'Spectrum'] as const;
+type ComparisonTool = typeof comparisonTools[number];
 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
@@ -104,6 +106,7 @@ function App() {
   const currentFrame = useRef<string | undefined>(undefined);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [activeTool, setActiveTool] = useState<ComparisonTool>('Compare');
   const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
   const [markedMotion, setMarkedMotion] = useState<Record<string, MotionCandidate | null>>({});
   const [motionResults, setMotionResults] = useState<Record<string, MotionResult>>({});
@@ -137,7 +140,8 @@ function App() {
   const motionJobId = canPlay && result?.motionAvailable && !withdrawn ? result.jobId : undefined;
   const motionUnavailableReason = withdrawn
     ? 'New archive metadata changed the visit grouping. Choose a current sequence to check for motion.'
-    : result?.motionUnavailableReason;
+    : result?.motionUnavailableReason ?? (canPlay ? 'Motion analysis is unavailable for this sequence.' :
+      'Open a playable sequence to check for motion.');
   const inspected = motionJobId ? motionResults[motionJobId] ?? result?.motionResult : undefined;
   const motionMarker = motionJobId && motionJobId in markedMotion
     ? markedMotion[motionJobId] : inspected?.candidates[0];
@@ -189,6 +193,7 @@ function App() {
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
+    setActiveTool('Compare');
     setSpectrumPick(null);
     setView({ patch, result: emptySearch });
     setSearch(emptySearch);
@@ -404,6 +409,7 @@ function App() {
         result.frames.every((frame) => !identities.has(exposureIdentity(frame))))]);
     } else {
       setSearch(null);
+      setActiveTool('Compare');
       setSpectrumPick(null);
       setStopError('');
       setMarkedMotion({});
@@ -442,9 +448,8 @@ function App() {
   }
 
   function pickSpectrum(x: number, y: number) {
-    if (!view || !exposure) return;
+    if (activeTool !== 'Spectrum' || !view || !exposure) return;
     setPlaying(false);
-    setDetailsOpen(false);
     const position = positionInPatch(view.patch.position, view.patch.fieldSize, x, y);
     const dates = spectrumDates(result?.frames.length ? result.frames : [exposure]);
     setSpectrumPick((current) => current?.x === x && current.y === y ? current :
@@ -619,8 +624,8 @@ function App() {
                   <div className="exposure-image">
                     <img className="sky-frame" src={exposure.imageUrl}
                       alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
-                    {motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
-                    <button className="spectrum-target" type="button" ref={spectrumTarget}
+                    {activeTool === 'Motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
+                    {activeTool === 'Spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
                       aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
                       onClick={(event) => {
                         if (event.detail === 0) {
@@ -643,21 +648,55 @@ function App() {
                       }}>
                       {spectrumPick && <span className="spectrum-marker" aria-hidden="true"
                         style={{ left: `${spectrumPick.x * 100}%`, top: `${spectrumPick.y * 100}%` }} />}
-                    </button>
+                    </button>}
                   </div>
                 </div>
-                <aside className="exposure-panel" aria-label="Comparison controls" onKeyDown={(event) => {
-                  if (event.key === 'Escape' && detailsOpen) {
-                    setDetailsOpen(false);
-                    detailsAction.current?.focus();
-                  }
-                }}>
-                  <div className="exposure-toolbar">
-                    <div className="exposure-heading">
-                      <button ref={backAction} type="button" className="control symbol-control"
-                        aria-label={backLabel} title={backLabel} onClick={backToSky}>
-                        <span aria-hidden="true">←</span>
+                {canPlay && (
+                  <section className="exposure-toolbar" aria-label="Comparison playback">
+                    <div className="playback-controls" role="group" aria-label="Playback controls">
+                      <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
+                        <span aria-hidden="true">⏮︎</span>
                       </button>
+                      <button className="control symbol-control" type="button" aria-label={playbackLabel} title={playbackLabel}
+                        onClick={() => setPlaying((active) => !active)}>
+                        <span aria-hidden="true">{playing ? '⏸︎' : '▶︎'}</span>
+                      </button>
+                      <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={() => stepFrame(1)}>
+                        <span aria-hidden="true">⏭︎</span>
+                      </button>
+                    </div>
+                    <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
+                      value={frameIndex} aria-label="Playback position" aria-valuetext={`Frame ${frameIndex + 1} of ${frameCount}`}
+                      onChange={(event) => {
+                        setPlaying(false);
+                        setFrameIndex(event.currentTarget.valueAsNumber);
+                      }} />
+                    <span className="frame-count">{frameIndex + 1} / {frameCount} {exploratory ? 'frames' : 'visits'}</span>
+                  </section>
+                )}
+                <aside className="exposure-panel" aria-label="Comparison tools">
+                  <div className="comparison-header">
+                    <button ref={backAction} type="button" className="control symbol-control"
+                      aria-label={backLabel} title={backLabel} onClick={backToSky}>
+                      <span aria-hidden="true">←</span>
+                    </button>
+                    <div className="comparison-tools" role="group" aria-label="Active tool">
+                      {comparisonTools.map((tool) => (
+                        <button key={tool} type="button" className="control" aria-pressed={activeTool === tool}
+                          aria-controls={`comparison-tool-${tool.toLowerCase()}`} onClick={() => setActiveTool(tool)}>
+                          {tool}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="comparison-tool-content">
+                    <section id="comparison-tool-compare" className="comparison-tool" aria-label="Compare"
+                      hidden={activeTool !== 'Compare'} onKeyDown={(event) => {
+                        if (event.key === 'Escape' && detailsOpen) {
+                          setDetailsOpen(false);
+                          detailsAction.current?.focus();
+                        }
+                      }}>
                       <div className="frame-summary">
                         <time dateTime={exposure.observedAt}>{observationTime} UTC</time>
                         {exposure.wavelength !== null && (
@@ -665,124 +704,98 @@ function App() {
                         )}
                         {view.autoSelectedSources?.has(exposure.sourceUrl) && <span className="auto-selected">Auto-selected</span>}
                       </div>
-                    </div>
-                    {exploratory && <strong>Exploratory blink</strong>}
-                    {result?.message && (canPlay || sequences.length === 0) && <p className="lookup-status" role="status">
-                      {exploratory && 'Matched playback was unavailable. '}{result.message}
-                    </p>}
-                    {sequenceControls}
-                    {canPlay && (
-                      <>
-                        <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
-                          value={frameIndex} aria-label="Playback position" aria-valuetext={`Frame ${frameIndex + 1} of ${frameCount}`}
-                          onChange={(event) => {
-                            setPlaying(false);
-                            setFrameIndex(event.currentTarget.valueAsNumber);
-                          }} />
-                        <div className="exposure-control-row">
-                          <div className="playback-controls" role="group" aria-label="Playback controls">
-                            <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
-                              <span aria-hidden="true">⏮︎</span>
-                            </button>
-                            <button className="control symbol-control" type="button" aria-label={playbackLabel} title={playbackLabel}
-                              onClick={() => setPlaying((active) => !active)}>
-                              <span aria-hidden="true">{playing ? '⏸︎' : '▶︎'}</span>
-                            </button>
-                            <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={() => stepFrame(1)}>
-                              <span aria-hidden="true">⏭︎</span>
-                            </button>
-                          </div>
-                          <span className="frame-count">{frameIndex + 1} / {frameCount} {exploratory ? 'frames' : 'visits'}</span>
+                      {exploratory && <strong>Exploratory blink</strong>}
+                      {result?.message && (canPlay || sequences.length === 0) && <p className="lookup-status" role="status">
+                        {exploratory && 'Matched playback was unavailable. '}{result.message}
+                      </p>}
+                      {sequenceControls}
+                      {canRetry && <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>}
+                      {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
+                      <button ref={detailsAction} className="control details-toggle" type="button"
+                        aria-expanded={detailsOpen} aria-controls="exposure-details"
+                        onClick={() => setDetailsOpen((open) => !open)}>
+                        Details <span aria-hidden="true">▸</span>
+                      </button>
+                      <section className="exposure-details" id="exposure-details" hidden={!detailsOpen}
+                        aria-label="Comparison details" tabIndex={0}>
+                        <div className="exposure-metadata">
+                          <table>
+                            <caption>Sky patch</caption>
+                            <tbody>
+                              <tr><th scope="row">RA</th><td>{view.patch.coordinates.ra}</td></tr>
+                              <tr><th scope="row">Dec</th><td>{view.patch.coordinates.dec}</td></tr>
+                              <tr><th scope="row">Field size</th><td>{view.patch.fieldSize}′ × {view.patch.fieldSize}′</td></tr>
+                              {view.patch.release && <tr><th scope="row">Release filter</th><td>{view.patch.release.toUpperCase()}</td></tr>}
+                              {view.patch.startDate && <tr><th scope="row">From (UTC)</th><td>{view.patch.startDate}</td></tr>}
+                              {view.patch.endDate && <tr><th scope="row">Through (UTC)</th><td>{view.patch.endDate}</td></tr>}
+                              {view.patch.minWavelength !== null && <tr><th scope="row">Min. wavelength</th><td>{view.patch.minWavelength} µm</td></tr>}
+                              {view.patch.maxWavelength !== null && <tr><th scope="row">Max. wavelength</th><td>{view.patch.maxWavelength} µm</td></tr>}
+                              {view.patch.minGapDays > 0 && <tr><th scope="row">Min. Auto gap</th><td>{view.patch.minGapDays} days</td></tr>}
+                              {view.patch.maxGapDays !== null && <tr><th scope="row">Max. Auto gap</th><td>{view.patch.maxGapDays} days</td></tr>}
+                            </tbody>
+                          </table>
+                          <table>
+                            <caption>Observation</caption>
+                            <tbody>
+                              <tr>
+                                <th scope="row">Time (UTC)</th>
+                                <td><time dateTime={exposure.observedAt}>{observationTime}</time></td>
+                              </tr>
+                              <tr><th scope="row">Release</th><td>{exposure.release}</td></tr>
+                              <tr><th scope="row">Detector</th><td>D{exposure.detector}</td></tr>
+                              <tr><th scope="row">ID</th><td>{exposure.observationId}</td></tr>
+                              {exposure.wavelength !== null && (
+                                <tr><th scope="row">Wavelength</th><td>{exposure.wavelength.toFixed(3)} µm at center</td></tr>
+                              )}
+                              {exposure.bandwidth != null && (
+                                <tr><th scope="row">Bandwidth</th><td>{exposure.bandwidth.toFixed(4)} µm at center</td></tr>
+                              )}
+                              {exposure.visit != null && view.result.comparison?.coverageIncludesBandpass !== undefined && (
+                                <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>
+                              )}
+                              {(!view.result.comparison || view.result.comparison.coverageIncludesBandpass !== undefined) && (
+                                <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>
+                              )}
+                            </tbody>
+                          </table>
+                          {view.result.comparison && (
+                            <table>
+                              <caption>{exploratory ? 'Comparison' : 'Match'}</caption>
+                              <tbody>
+                                <tr><th scope="row">Time span</th><td>{view.result.comparison.days < 1
+                                  ? `${(view.result.comparison.days * 1440).toFixed(1)} minutes`
+                                  : `${view.result.comparison.days.toFixed(2)} days`}</td></tr>
+                                {view.result.comparison.overlap !== null && (
+                                  <tr><th scope="row">Center overlap</th><td>{(100 * view.result.comparison.overlap).toFixed(1)}%</td></tr>
+                                )}
+                                <tr><th scope="row">{view.result.comparison.coverageIncludesBandpass === false
+                                  ? 'Shared valid area' : 'Shared matched area'}</th><td>{(100 * view.result.comparison.coverage).toFixed(1)}%</td></tr>
+                              </tbody>
+                            </table>
+                          )}
                         </div>
-                      </>
-                    )}
-                    {canRetry && (
-                      <div className="exposure-control-row">
-                        <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
-                      </div>
-                    )}
-                    {motionJobId && result && <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
-                      inspected={inspected} selectedCandidate={motionMarker}
-                      onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
-                      onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} />}
-                    {canPlay && !motionJobId && motionUnavailableReason && (
-                      <p className="lookup-status" role="status">{motionUnavailableReason}</p>
-                    )}
-                    {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
-                    <p id="spectrum-pick-help" className="lookup-status" hidden={Boolean(spectrumPick)}>
-                      Select a source on the image for a spectrum. Use arrow keys to move the marker with the keyboard.
-                    </p>
-                    <button ref={detailsAction} className="control details-toggle" type="button"
-                      aria-expanded={detailsOpen} aria-controls="exposure-details"
-                      onClick={() => setDetailsOpen((open) => !open)}>
-                      Details <span aria-hidden="true">▸</span>
-                    </button>
+                        <a className="control source-fits" href={exposure.sourceUrl} target="_blank" rel="noreferrer">Source FITS</a>
+                      </section>
+                    </section>
+                    <section id="comparison-tool-motion" className="comparison-tool" aria-label="Motion" hidden={activeTool !== 'Motion'}>
+                      {motionJobId && result ? <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
+                        inspected={inspected} selectedCandidate={motionMarker}
+                        onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
+                        onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} /> :
+                        <p className="lookup-status" role="status">{motionUnavailableReason}</p>}
+                    </section>
+                    <section id="comparison-tool-spectrum" className="comparison-tool" aria-label="Spectrum controls"
+                      hidden={activeTool !== 'Spectrum'}>
+                      <p id="spectrum-pick-help" className="lookup-status" hidden={Boolean(spectrumPick)}>
+                        Select a source on the image. Use arrow keys to move the marker with the keyboard.
+                      </p>
+                      {spectrumPick && <Spectrum key={spectrumPick.id} position={spectrumPick.position}
+                        initialDates={spectrumPick.dates} release={view.patch.release} onClear={() => {
+                          setSpectrumPick(null);
+                          spectrumTarget.current?.focus({ preventScroll: true });
+                        }} />}
+                    </section>
                   </div>
-                  <section className="exposure-details" id="exposure-details" hidden={!detailsOpen}
-                    aria-label="Comparison details" tabIndex={0}>
-                    <div className="exposure-metadata">
-                      <table>
-                        <caption>Sky patch</caption>
-                        <tbody>
-                          <tr><th scope="row">RA</th><td>{view.patch.coordinates.ra}</td></tr>
-                          <tr><th scope="row">Dec</th><td>{view.patch.coordinates.dec}</td></tr>
-                          <tr><th scope="row">Field size</th><td>{view.patch.fieldSize}′ × {view.patch.fieldSize}′</td></tr>
-                          {view.patch.release && <tr><th scope="row">Release filter</th><td>{view.patch.release.toUpperCase()}</td></tr>}
-                          {view.patch.startDate && <tr><th scope="row">From (UTC)</th><td>{view.patch.startDate}</td></tr>}
-                          {view.patch.endDate && <tr><th scope="row">Through (UTC)</th><td>{view.patch.endDate}</td></tr>}
-                          {view.patch.minWavelength !== null && <tr><th scope="row">Min. wavelength</th><td>{view.patch.minWavelength} µm</td></tr>}
-                          {view.patch.maxWavelength !== null && <tr><th scope="row">Max. wavelength</th><td>{view.patch.maxWavelength} µm</td></tr>}
-                          {view.patch.minGapDays > 0 && <tr><th scope="row">Min. Auto gap</th><td>{view.patch.minGapDays} days</td></tr>}
-                          {view.patch.maxGapDays !== null && <tr><th scope="row">Max. Auto gap</th><td>{view.patch.maxGapDays} days</td></tr>}
-                        </tbody>
-                      </table>
-                      <table>
-                        <caption>Observation</caption>
-                        <tbody>
-                          <tr>
-                            <th scope="row">Time (UTC)</th>
-                            <td><time dateTime={exposure.observedAt}>{observationTime}</time></td>
-                          </tr>
-                          <tr><th scope="row">Release</th><td>{exposure.release}</td></tr>
-                          <tr><th scope="row">Detector</th><td>D{exposure.detector}</td></tr>
-                          <tr><th scope="row">ID</th><td>{exposure.observationId}</td></tr>
-                          {exposure.wavelength !== null && (
-                            <tr><th scope="row">Wavelength</th><td>{exposure.wavelength.toFixed(3)} µm at center</td></tr>
-                          )}
-                          {exposure.bandwidth != null && (
-                            <tr><th scope="row">Bandwidth</th><td>{exposure.bandwidth.toFixed(4)} µm at center</td></tr>
-                          )}
-                          {exposure.visit != null && view.result.comparison?.coverageIncludesBandpass !== undefined && (
-                            <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>
-                          )}
-                          {(!view.result.comparison || view.result.comparison.coverageIncludesBandpass !== undefined) && (
-                            <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>
-                          )}
-                        </tbody>
-                      </table>
-                      {view.result.comparison && (
-                        <table>
-                          <caption>{exploratory ? 'Comparison' : 'Match'}</caption>
-                          <tbody>
-                            <tr><th scope="row">Time span</th><td>{view.result.comparison.days < 1
-                              ? `${(view.result.comparison.days * 1440).toFixed(1)} minutes`
-                              : `${view.result.comparison.days.toFixed(2)} days`}</td></tr>
-                            {view.result.comparison.overlap !== null && (
-                              <tr><th scope="row">Center overlap</th><td>{(100 * view.result.comparison.overlap).toFixed(1)}%</td></tr>
-                            )}
-                            <tr><th scope="row">{view.result.comparison.coverageIncludesBandpass === false
-                              ? 'Shared valid area' : 'Shared matched area'}</th><td>{(100 * view.result.comparison.coverage).toFixed(1)}%</td></tr>
-                          </tbody>
-                        </table>
-                      )}
-                    </div>
-                    <a className="control source-fits" href={exposure.sourceUrl} target="_blank" rel="noreferrer">Source FITS</a>
-                  </section>
-                  {spectrumPick && <Spectrum key={spectrumPick.id} position={spectrumPick.position}
-                    initialDates={spectrumPick.dates} release={view.patch.release} onClear={() => {
-                      setSpectrumPick(null);
-                      spectrumTarget.current?.focus({ preventScroll: true });
-                    }} />}
                 </aside>
               </div>
             </div>

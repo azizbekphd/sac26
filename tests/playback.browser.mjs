@@ -39,6 +39,7 @@ function sequence(id, indices) {
 test('keeps playback, details and motion scoped while Auto and Manual overlap', { timeout: 35_000 }, async () => {
   const channel = process.env.SAC26_BROWSER_CHANNEL;
   const browser = await chromium.launch({ channel, chromiumSandbox: true });
+  const firstMotion = Promise.withResolvers();
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(6_000);
@@ -103,14 +104,19 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
         if (action === 'motion') {
           const retry = requests.motion.includes(id);
           requests.motion.push(id);
+          if (id === 'lookup.1') await firstMotion.promise;
           const [status, displacement, frames, issues] = {
             'lookup.1': ['inspected', 2.1, [0, 1], [null, null]],
             'lookup.2': ['inspected', 3.7, [0, 2, 3], [null, null, null, null]],
             manual: [retry ? 'partial' : 'inspected', 4.2, [0, 2, 4], [null, null, null, 'registration_unconstrained', null]],
           }[id];
-          return send({ status, visits: issues, candidates: [{ displacement, uncertainty: .4, score: 40,
+          const candidate = { displacement, uncertainty: .4, score: 40,
             measurements: frames.map((frameIndex) => ({ frameIndex, imagePosition: [.3 + .1 * frameIndex, .5] })),
-          }] });
+          };
+          return send({ status, visits: issues, candidates: id === 'lookup.1'
+            ? [candidate, { ...candidate, displacement: 4.6, measurements: candidate.measurements.map((measurement) => ({
+              ...measurement, imagePosition: [measurement.imagePosition[0], .6],
+            })) }] : [candidate] });
         }
       }
       if (path.startsWith('/api/')) {
@@ -130,6 +136,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     const details = page.getByRole('region', { name: 'Comparison details' });
     async function checkFrame(id, frameIndex, exposureIndex) {
       assert.equal(await image.getAttribute('src'), `/api/playback/${id}/images/frame-${frameIndex}.png`);
+      if (await button('Details').getAttribute('aria-expanded') === 'false') await button('Details').click();
       await details.getByRole('cell', { name: `obs-${exposureIndex}`, exact: true }).waitFor();
       assert.equal(await source.getAttribute('href'), exposure(exposureIndex).sourceUrl);
     }
@@ -139,31 +146,56 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await page.getByLabel('Declination (Dec)').fill('20');
     await button('Compare visits').click();
     await visible('1 / 2 visits');
+    assert.equal(await button('Compare').getAttribute('aria-pressed'), 'true');
     await button('Next').click();
-    await button('Details').click();
     await checkFrame('lookup.1', 1, 2);
+    await button('Motion').click();
     await button('Check for motion').click();
+    await visible('Checking the sequence for motion…');
+    await button('Spectrum').click();
+    await visible('2 / 2 visits');
+    firstMotion.resolve();
+    await page.locator('#comparison-tool-motion').getByText('Detected in 2 of 2 visits', { exact: true })
+      .waitFor({ state: 'attached' });
+    await button('Motion').click();
     await visible('Detected in 2 of 2 visits');
     await markers.locator('.marker-outline').waitFor();
+    const candidate = page.getByRole('combobox', { name: /Motion candidate/ });
+    await candidate.selectOption('1');
+    assert.equal(await markers.locator('circle.current').getAttribute('cy'), '60');
+    await button('Hide motion markers').click();
+    await button('Compare').click();
+    await markers.waitFor({ state: 'hidden' });
+    await button('Motion').click();
+    assert.equal(await candidate.inputValue(), '1');
+    await button('Show motion markers').click();
+    assert.equal(await markers.locator('circle.current').getAttribute('cy'), '60');
+    await button('Compare').click();
+    await markers.waitFor({ state: 'hidden' });
 
     extend = true;
     await visible('Reconnecting to the archive search…');
     await visible('Could not load the comparison images. Try again.');
     await checkFrame('lookup.1', 1, 2);
     assert.deepEqual(await choices(), ['lookup.2', 'lookup.3']);
+    await button('Motion').click();
     await visible('Detected in 2 of 2 visits');
     withdrawFirst = true;
     await visible('New archive metadata changed the visit grouping. Choose a current sequence to check for motion.');
     await markers.waitFor({ state: 'hidden' });
     failExtensionImage = false;
+    await button('Compare').click();
     await button('Retry loading sequence').click();
     await visible('3 / 4 visits');
+    await button('Compare').click();
     await checkFrame('lookup.2', 2, 2);
     await markers.waitFor({ state: 'hidden' });
+    await button('Motion').click();
     await button('Check for motion').click();
     await visible('Detected in 3 of 4 visits');
     assert.equal(await markers.locator('circle.current').getAttribute('cx'), '50');
 
+    await button('Compare').click();
     await button('Edit exposures').click();
     const manual = page.getByRole('dialog');
     await manual.getByRole('heading', { name: 'Selected exposures (4)' }).waitFor();
@@ -176,9 +208,9 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     assert.deepEqual(await choices(), ['manual', 'lookup.3']);
     assert.equal(requests.inventorySeed, 'lookup.2');
     assert.deepEqual(requests.manualKeys, ['e0', 'e1', 'e2', 'e3', 'e4']);
-    await button('Details').click();
     await checkFrame('manual', 0, 0);
     await markers.waitFor({ state: 'hidden' });
+    await button('Motion').click();
     await button('Check for motion').click();
     await visible('Motion analysis was partial.');
     await visible('Could not evaluate exposure 4.');
@@ -187,6 +219,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await visible('Motion analysis was partial.');
     await markers.locator('.marker-outline').waitFor();
 
+    await button('Compare').click();
     later = true;
     await selector.locator('option[value="lookup.4"]').waitFor({ state: 'attached' });
     await checkFrame('manual', 0, 0);
@@ -196,16 +229,17 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await selector.selectOption('lookup.3');
     await visible('1 / 2 visits');
     await markers.waitFor({ state: 'hidden' });
-    await button('Details').click();
     await checkFrame('lookup.3', 0, 5);
     await selector.selectOption('manual');
     await visible('1 / 5 frames');
+    await button('Motion').click();
     await visible('Detected in 3 of 4 visits');
     await markers.locator('.marker-outline').waitFor();
     assert.equal(requests.lookups, 1);
     assert.deepEqual(requests.motion, ['lookup.1', 'lookup.2', 'manual', 'manual']);
     assert.deepEqual(requests.unexpected, []);
   } finally {
+    firstMotion.resolve();
     await browser.close();
   }
 });
@@ -220,7 +254,7 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     const submitted = [];
     const removed = [];
     let finish = false;
-    let pollInterrupted = false;
+    let interruptPoll = false;
     const point = { ...exposure(0), wavelength: 1.5, bandwidth: .03, flux: 80, uncertainty: 6, flags: ['Masked pixels'] };
     const points = Array.from({ length: 42 }, (_, i) => ({ ...point, key: `s${i}`,
       wavelength: .82 + i * .09, flux: 1500 / (i + 1) + 25 * Math.sin(i), uncertainty: 8 + i,
@@ -246,8 +280,8 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
           removed.push(path);
           return route.fulfill({ status: 204 });
         }
-        if (finish && !pollInterrupted) {
-          pollInterrupted = true;
+        if (interruptPoll) {
+          interruptPoll = false;
           return route.abort('failed');
         }
         return send(finish ? reply('partial', points, 'The request reached the 60-second limit.')
@@ -263,7 +297,16 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await page.getByLabel('Declination (Dec)').fill('20');
     await button('Compare visits').click();
     await page.getByText('1 / 4 visits', { exact: true }).waitFor();
+    const image = page.getByRole('img', { name: /North-up SPHEREx detector/ });
+    await image.click();
+    assert.equal(await target.count(), 0);
     await button('Play').click();
+    await button('Motion').click();
+    await button('Pause').waitFor();
+    await image.click();
+    assert.equal(await target.count(), 0);
+    await button('Spectrum').click();
+    await button('Pause').waitFor();
     const box = await target.boundingBox();
     assert.ok(box.width > 100);
     await page.touchscreen.tap(box.x + .25 * box.width, box.y + .25 * box.height);
@@ -284,29 +327,65 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     assert.equal(await marker.getAttribute('style'), style);
     await panel.getByLabel('Through').fill('2025-03-01');
     await panel.getByText('Requested 2024-12-31 to 2025-02-01 UTC').waitFor();
+    await button('Compare').click();
+    await panel.waitFor({ state: 'hidden' });
+    await marker.waitFor({ state: 'hidden' });
+    const hiddenPanel = page.getByRole('region', { name: 'Spectrum', exact: true, includeHidden: true });
+    interruptPoll = true;
+    await hiddenPanel.getByText(/Reconnecting to the spectrum request/).waitFor({ state: 'attached' });
     finish = true;
-    await panel.getByText('Reconnecting to the spectrum request…', { exact: false }).waitFor();
+    await hiddenPanel.getByText(/42 measurements/).waitFor({ state: 'attached' });
+    await button('Spectrum').click();
     await panel.getByText('The request reached the 60-second limit.', { exact: false }).waitFor();
-    await panel.getByText(/42 measurements/).waitFor();
     const chart = panel.getByRole('img', { name: /Flux density by wavelength/i });
     const expand = button('Expand spectrum');
     const measurement = panel.locator('details').getByLabel('Measurement', { exact: true });
+    async function checkPlayback() {
+      const playback = page.getByRole('region', { name: 'Comparison playback' });
+      const strip = await playback.boundingBox();
+      const frame = await image.boundingBox();
+      const tools = await page.getByRole('complementary', { name: 'Comparison tools' }).boundingBox();
+      assert.ok(strip.y >= frame.y + frame.height - 1);
+      assert.ok(strip.y + strip.height <= page.viewportSize().height + 1);
+      if (page.viewportSize().width < 600) assert.ok(tools.y >= strip.y + strip.height - 1);
+      else assert.ok(tools.x >= strip.x + strip.width - 1);
+      await playback.getByRole('slider', { name: 'Playback position' }).waitFor();
+      assert.deepEqual(await playback.getByRole('button').evaluateAll((buttons) =>
+        buttons.map((button) => button.getAttribute('aria-label'))), ['Previous', 'Play', 'Next']);
+      await playback.getByRole('button', { name: 'Next' }).click();
+    }
+    async function checkTools() {
+      for (const tool of ['Compare', 'Motion', 'Spectrum']) {
+        await button(tool).click();
+        assert.equal(await button(tool).getAttribute('aria-pressed'), 'true');
+        await page.getByRole('complementary', { name: 'Comparison tools' })
+          .getByRole('button', { name: 'Back to sky' }).waitFor();
+        if (tool === 'Compare') {
+          const compare = page.getByRole('region', { name: 'Compare', exact: true });
+          await compare.getByRole('combobox', { name: 'Sequence' }).waitFor();
+          await compare.getByText('4.200 µm', { exact: true }).waitFor();
+        }
+        await checkPlayback();
+      }
+    }
     async function checkLayout() {
       const chartBox = await chart.boundingBox();
       const next = await measurement.isVisible() ? await measurement.boundingBox() :
         await panel.getByText('Measurement details', { exact: true }).boundingBox();
       assert.ok(chartBox.height > 100, 'The chart has enough height to read its axes');
       assert.ok(chartBox.y + chartBox.height <= next.y, 'The chart stays above the controls');
-      await button('Next').click();
+      await checkPlayback();
     }
     async function checkChartFits() {
       const chartBox = await chart.boundingBox();
       const panelBox = await panel.boundingBox();
       assert.ok(chartBox.y + chartBox.height <= panelBox.y + panelBox.height, 'The chart fits in the visible sidebar');
     }
+    await checkTools();
     await checkLayout();
     await checkChartFits();
     await page.setViewportSize({ width: 1150, height: 620 });
+    await checkTools();
     await checkLayout();
     await checkChartFits();
     await page.setViewportSize({ width: 390, height: 844 });
@@ -314,7 +393,12 @@ test('requests a sidebar spectrum at the picked sky position and keeps partial r
     await measurement.selectOption('5');
     await checkLayout();
     await panel.getByText('Source and dates', { exact: true }).click();
+    await button('Motion').click();
+    await button('Spectrum').click();
+    assert.equal(await measurement.inputValue(), '5');
     assert.equal(await panel.getByLabel('Through').inputValue(), '2025-03-01');
+    assert.equal(await marker.getAttribute('style'), style);
+    assert.equal(submitted.length, 1);
     await expand.click();
     const expanded = page.getByRole('dialog', { name: 'Expanded spectrum' });
     await expanded.getByText('Masked pixels', { exact: true }).waitFor();
