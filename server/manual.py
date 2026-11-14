@@ -10,12 +10,11 @@ import numpy as np
 
 from .exposure import NoExposure, exposure_metadata, exposure_pixels, render_png, sky_grid
 from .playback import (
-    ARCHIVE_ERRORS, JOB_SECONDS, MIN_AREA, MIN_OVERLAP, PlaybackSearch, bandpass_overlap, batches,
+    ARCHIVE_ERRORS, JOB_SECONDS, MIN_AREA, MIN_OVERLAP, PlaybackSearch, batches, common_overlap,
     group_visits, publish_frames,
 )
 
 log = logging.getLogger(__name__)
-MAX_FRAMES = 12
 CALIBRATION_BATCH = 12
 PREVIEW_CACHE_SIZE = 64
 
@@ -23,15 +22,6 @@ PREVIEW_CACHE_SIZE = 64
 def indexed_visits(records, filters):
     return [(item, index) for index, visit in enumerate(group_visits(records), 1)
             for item in visit if filters.includes(item)]
-
-
-def common_overlap(bands):
-    if len(bands) == 2:
-        return bandpass_overlap(*bands[0], *bands[1])
-    waves, widths = np.asarray(bands, dtype=np.float64).swapaxes(0, 1)
-    lower = (waves - widths / 2).max(axis=0)
-    upper = (waves + widths / 2).min(axis=0)
-    return np.maximum(upper - lower, 0) / widths.max(axis=0)
 
 
 async def discover_inventory(runner, seeds):
@@ -118,11 +108,14 @@ async def render_selection(runner, selected):
         reasons.append(f"All frames share usable pixels across {coverage:.1%} of the patch. At least {MIN_AREA:.0%} is required.")
 
     overlap = None
+    bandpass = None
     matched_coverage = None
     if any(center is None for center in centers):
         reasons.append("Matched playback needs a wavelength measurement at the patch center for every frame. At least one is unavailable.")
     else:
         overlap = float(common_overlap([(center.wavelength, center.bandwidth) for center in centers]))
+        if overlap > 0:
+            bandpass = [max(center.band[0] for center in centers), min(center.band[1] for center in centers)]
         if overlap < MIN_OVERLAP - 1e-12:
             reasons.append(f"Wavelength bands overlap by {overlap:.1%} at the patch center. At least {MIN_OVERLAP:.0%} is required.")
         elif coverage >= MIN_AREA:
@@ -154,6 +147,8 @@ async def render_selection(runner, selected):
         "overlap": overlap, "coverage": matched_coverage if matched_coverage is not None else coverage,
         "coverageIncludesBandpass": matched_coverage is not None,
     }
+    if bandpass is not None:
+        job.comparison["bandpass"] = bandpass
     if job.partial:
         reasons.append("Some archive records could not be checked.")
     job.message = " ".join(reasons)

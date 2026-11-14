@@ -1,9 +1,10 @@
-"""Find and publish the first verified pair of SPHEREx visits."""
+"""Find and progressively publish matched sequences of SPHEREx visits."""
 
 import asyncio
 from collections import deque
 from contextlib import aclosing
 from dataclasses import dataclass, field, replace
+from heapq import heappop, heappush
 from itertools import chain, combinations, islice, pairwise, zip_longest
 import logging
 from math import ceil, sqrt
@@ -22,6 +23,8 @@ ARCHIVE_ERRORS = (ArchiveError, httpx.HTTPError, OSError, ValueError, KeyError)
 VISIT_GAP = 10 / (24 * 60)
 MIN_OVERLAP = .75
 MIN_AREA = .80
+MAX_FRAMES = 12
+MAX_SEQUENCE_CHECKS = 128
 METADATA_LIMIT = 2048
 FALLBACK_METADATA_LIMIT = 128
 JOB_SECONDS = 180
@@ -34,6 +37,10 @@ def batches(items, size):
     remaining = iter(items)
     while batch := tuple(islice(remaining, size)):
         yield batch
+
+
+def sequence_rank(records, overlap):
+    return -len(records), records[0].mjd - records[-1].mjd, -overlap, tuple(item.key for item in records)
 
 
 @dataclass
@@ -56,9 +63,19 @@ class PlaybackJob:
     filters: ArchiveFilters = ArchiveFilters()
     min_gap: float = 0
     max_gap: float | None = None
+    sequences: dict[str, "PlaybackJob"] | None = None
+    invalid_sequences: set[str] = field(default_factory=set)
 
     def accepts_gap(self, days):
         return days >= self.min_gap - 1e-10 and (self.max_gap is None or days <= self.max_gap + 1e-10)
+
+    @property
+    def has_current_sequences(self):
+        return len(self.sequences or ()) > len(self.invalid_sequences)
+
+    def ranked_sequences(self):
+        current = (child for child in (self.sequences or {}).values() if child.id not in self.invalid_sequences)
+        return sorted(current, key=lambda child: sequence_rank(child.records, child.comparison["overlap"]))
 
     def snapshot(self):
         snapshot = {
@@ -69,6 +86,24 @@ class PlaybackJob:
             snapshot["exposures"] = self.inventory
         if self.exposure_issues:
             snapshot["exposureIssues"] = self.exposure_issues
+        if self.sequences is not None:
+            candidates = []
+            visible = []
+            used = set()
+            for child in self.ranked_sequences():
+                identities = [item.identity for item in child.records]
+                summary = {
+                    "id": child.id, "count": len(child.frames), "exposureIds": identities,
+                    "keys": [item.key for item in child.records],
+                    "start": child.frames[0]["observedAt"], "end": child.frames[-1]["observedAt"],
+                    "bandpass": child.comparison["bandpass"],
+                }
+                candidates.append(summary)
+                if used.isdisjoint(identities):
+                    visible.append(summary)
+                    used.update(identities)
+            snapshot["sequences"] = visible
+            snapshot["sequenceCandidates"] = candidates
         return snapshot
 
     def image(self, name, png):
@@ -152,11 +187,14 @@ def bandpass_overlap(wave_a, width_a, wave_b, width_b):
         return np.maximum(shared, 0) / np.maximum(width_a, width_b)
 
 
-def shared_mask(valid_a, band_a, valid_b, band_b):
-    wave_a, width_a = band_a
-    wave_b, width_b = band_b
-    overlap = bandpass_overlap(wave_a, width_a, wave_b, width_b)
-    return valid_a & valid_b & (overlap >= MIN_OVERLAP - 1e-12)
+def common_overlap(bands):
+    if len(bands) == 2:
+        return bandpass_overlap(*bands[0], *bands[1])
+    waves, widths = np.asarray(bands, dtype=np.float64).swapaxes(0, 1)
+    lower = (waves - widths / 2).max(axis=0)
+    upper = (waves + widths / 2).min(axis=0)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        return np.maximum(upper - lower, 0) / widths.max(axis=0)
 
 
 def publish_frames(job, frames):
@@ -191,6 +229,8 @@ class PlaybackSearch:
         self.reads = {}
         self.preview_key = None
         self.preview_tasks = []
+        self.checked = set()
+        self.verified = set()
 
     def read(self, key, function, *args, **kwargs):
         if key not in self.reads:
@@ -282,7 +322,7 @@ class PlaybackSearch:
                 "bandwidth": center.bandwidth if center else None,
                 "imageUrl": self.job.image("preview", render_png(image, valid)),
             }
-            self.job.message = "Looking for a matching visit…"
+            self.job.message = "Looking for matched visits…"
         return pixels
 
     async def field_bandpass(self, exposure, wcs, shape):
@@ -302,15 +342,15 @@ class PlaybackSearch:
             maps.append(mapped)
         return maps
 
-    async def pair(self, a, b, overlap):
-        items = sorted((a, b), key=lambda center: center.exposure.mjd)
+    async def match(self, items, overlap):
         pixels = await asyncio.gather(*(
             self.read(("image", center.exposure.key), self.image, center.exposure) for center in items
         ))
         if any(result is None for result in pixels):
             return None
-        (image_a, valid_a, _, _), (image_b, valid_b, _, _) = pixels
-        if (valid_a & valid_b).mean() < MIN_AREA:
+        images, masks, _, _ = zip(*pixels)
+        valid = np.logical_and.reduce(masks)
+        if valid.mean() < MIN_AREA:
             return None
         bands = await asyncio.gather(*(
             self.read(("field bandpass", center.exposure.key), self.field_bandpass, center.exposure, wcs, shape)
@@ -318,11 +358,11 @@ class PlaybackSearch:
         ))
         if any(band is None for band in bands):
             return None
-        valid = shared_mask(valid_a, bands[0], valid_b, bands[1])
+        valid &= common_overlap(bands) >= MIN_OVERLAP - 1e-12
         coverage = float(valid.mean())
         if coverage < MIN_AREA:
             return None
-        return items, (image_a, image_b), valid, overlap, coverage
+        return items, images, valid, overlap, coverage
 
     async def find_usable(self, exposures):
         async def candidate(item):
@@ -344,15 +384,18 @@ class PlaybackSearch:
             return asyncio.shield(self.read(("center", item.key), self.center, item, visit, minimum_area=0))
         return asyncio.shield(self.read(("center", item.key), self.center, item, visit))
 
-    async def find_pair(self, visits):
+    async def find_sequences(self, visits):
         if len(visits) < 2:
-            return None
+            return
         if visits[-1][-1].mjd - visits[0][0].mjd < self.job.min_gap - 1e-10:
-            return None
+            return
         if self.job.max_gap is not None and all(
             later[0].mjd - earlier[-1].mjd > self.job.max_gap + 1e-10 for earlier, later in pairwise(visits)
         ):
-            return None
+            return
+        if len(self.checked) >= MAX_SEQUENCE_CHECKS:
+            self.job.partial = True
+            return
         order = visit_order(len(visits))
         remaining_visits = (
             item for group in batches(order, 8)
@@ -360,61 +403,124 @@ class PlaybackSearch:
             for item in round_ if item is not None
         )
         promising = promising_candidates(visits, self.ra, self.dec, self.job.accepts_gap)
-        candidates = chain(promising, (item for item in remaining_visits if item not in promising))
-        remaining = iter(batches(candidates, 8))
+        prioritized = set(promising)
+        candidates = chain(promising, (item for item in remaining_visits if item not in prioritized))
+        centers = {}
+        queue = []
+        deferred = []
+        queued = set()
 
-        def next_centers():
-            return [(self.auto_center(item, visit), visit) for item, visit in next(remaining, ())]
+        def enqueue(items):
+            items = tuple(sorted(items, key=lambda item: (item.exposure.mjd, item.exposure.key)))
+            keys = tuple(item.exposure.key for item in items)
+            if keys in self.checked or keys in queued:
+                return
+            if len({item.exposure.identity for item in items}) != len(items):
+                return
+            if len({item.visit for item in items}) != len(items) or any(
+                not self.job.accepts_gap(b.exposure.mjd - a.exposure.mjd) for a, b in pairwise(items)
+            ):
+                return
+            overlap = float(common_overlap([(item.wavelength, item.bandwidth) for item in items]))
+            if overlap >= MIN_OVERLAP - 1e-12:
+                heappush(queue, (*sequence_rank(tuple(item.exposure for item in items), overlap), items))
+                queued.add(keys)
 
-        centers = []
-        pending = next_centers()
-        while pending:
-            found = await asyncio.gather(*(task for task, _ in pending))
-            visits_for_batch = [visit for _, visit in pending]
-            pending = next_centers()
-            pairs = []
-            for center, visit in zip(found, visits_for_batch):
-                if center is None:
+        async def check_batch():
+            # Spend the budget on entries that could change the listed results
+            # before checking overlapping alternatives for the manual picker.
+            claimed = {}
+            for sequence in self.job.ranked_sequences():
+                identities = {exposure.identity for exposure in sequence.records}
+                if identities.isdisjoint(claimed):
+                    rank = sequence_rank(sequence.records, sequence.comparison["overlap"])
+                    claimed.update(dict.fromkeys(identities, rank))
+            checks = []
+            capacity = min(4, MAX_SEQUENCE_CHECKS - len(self.checked))
+            while queue and len(checks) < capacity:
+                candidate = heappop(queue)
+                rank = candidate[:4]
+                _, _, negative_overlap, keys, items = candidate
+                if any(claimed.get(item.exposure.identity, rank) < rank for item in items):
+                    heappush(deferred, candidate)
                     continue
-                if self.job.filters.limits_wavelength and not self.job.filters.overlaps_band(*center.band):
-                    continue
-                # Additional footprint records can change the visit grouping.
-                center = replace(center, visit=visit)
-                for other in centers:
-                    baseline = abs(center.exposure.mjd - other.exposure.mjd)
-                    if center.visit == other.visit or not self.job.accepts_gap(baseline):
+                self.checked.add(keys)
+                checks.append(asyncio.create_task(self.match(items, -negative_overlap)))
+            if not checks and not reading_centers:
+                for _ in range(min(capacity, len(deferred))):
+                    _, _, negative_overlap, keys, items = heappop(deferred)
+                    self.checked.add(keys)
+                    checks.append(asyncio.create_task(self.match(items, -negative_overlap)))
+            try:
+                for check in asyncio.as_completed(checks):
+                    result = await check
+                    if result is None:
                         continue
-                    overlap = float(bandpass_overlap(center.wavelength, center.bandwidth, other.wavelength, other.bandwidth))
-                    if overlap >= MIN_OVERLAP - 1e-12:
-                        pairs.append((baseline, overlap, center, other))
-                centers.append(center)
-            pairs.sort(key=lambda pair: pair[:2], reverse=True)
-            for options in batches(pairs, 4):
-                checks = [asyncio.create_task(self.pair(a, b, overlap)) for _, overlap, a, b in options]
-                try:
-                    for check in asyncio.as_completed(checks):
-                        if (result := await check) is not None:
-                            return result
-                finally:
-                    for check in checks:
+                    self.publish(result)
+                    items = result[0]
+                    if len(items) < MAX_FRAMES:
+                        for center in centers.values():
+                            enqueue((*items, center))
+            finally:
+                for check in checks:
+                    if not check.done():
                         check.cancel()
-                    await asyncio.gather(*checks, return_exceptions=True)
-        return None
+                await asyncio.gather(*checks, return_exceptions=True)
+
+        reading_centers = True
+        for batch in batches(candidates, 8):
+            if len(self.checked) >= MAX_SEQUENCE_CHECKS:
+                self.job.partial = True
+                return
+            found = await asyncio.gather(*(self.auto_center(item, visit) for item, visit in batch))
+            for center, (_, visit) in zip(found, batch):
+                if center is None or not self.job.filters.overlaps_band(*center.band):
+                    continue
+                # A later metadata response can change the current visit grouping.
+                center = replace(center, visit=visit)
+                for other in centers.values():
+                    enqueue((center, other))
+                for keys in self.verified:
+                    if len(keys) < MAX_FRAMES and all(key in centers for key in keys):
+                        enqueue((*[centers[key] for key in keys], center))
+                centers[center.exposure.key] = center
+            await check_batch()
+        reading_centers = False
+        while (queue or deferred) and len(self.checked) < MAX_SEQUENCE_CHECKS:
+            await check_batch()
+        if queue or deferred:
+            self.job.partial = True
 
     def publish(self, result):
         items, images, valid, overlap, coverage = result
-        self.job.records = tuple(center.exposure for center in items)
-        publish_frames(self.job, [
+        records = tuple(center.exposure for center in items)
+        keys = tuple(item.key for item in records)
+        if keys in self.verified:
+            return
+        sequences = self.job.sequences
+        child = PlaybackJob(f"{self.job.id}.{len(sequences) + 1}", status="ready", message="",
+                            records=records, patch=self.job.patch, filters=self.job.filters)
+        publish_frames(child, [
             ({**exposure_metadata(center.exposure, center.wavelength, coverage),
               "bandwidth": center.bandwidth}, image, valid)
             for center, image in zip(items, images)
         ])
-        self.job.comparison = {
-            "days": items[1].exposure.mjd - items[0].exposure.mjd,
+        child.comparison = {
+            "days": items[-1].exposure.mjd - items[0].exposure.mjd,
             "overlap": overlap, "coverage": coverage,
+            "bandpass": [max(item.band[0] for item in items), min(item.band[1] for item in items)],
         }
-        self.job.message = "Some archive records could not be checked." if self.job.partial else ""
-        self.job.status = "ready"
+        self.verified.add(keys)
+        sequences[child.id] = child
+
+    def revalidate_visits(self, visits):
+        # A footprint response can connect visits seen in an earlier center query.
+        visit_by_key = {item.key: index for index, visit in enumerate(visits) for item in visit}
+        self.job.invalid_sequences.clear()
+        for child in self.job.sequences.values():
+            indices = {visit_by_key.get(item.key) for item in child.records}
+            if None in indices or len(indices) != len(child.records):
+                self.job.invalid_sequences.add(child.id)
 
     async def discover(self):
         # Keep wavelength-ineligible exposures in the timeline for visit grouping.
@@ -445,6 +551,7 @@ class PlaybackSearch:
             while pending:
                 done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
                 truncated = True
+                full_field = False
                 for request, covers_field in requests.items():
                     if request not in done:
                         continue
@@ -457,13 +564,13 @@ class PlaybackSearch:
                     records.update((item.key, item) for item in exposures)
                     if not partial:
                         truncated = False
-                        if covers_field:
-                            yield exposures, False, True
-                            return
-                if records.keys() != returned:
+                        full_field |= covers_field
+                if full_field or records.keys() != returned:
                     returned = set(records)
                     ordered = sorted(records.values(), key=lambda item: (-item.mjd, item.key))
-                    yield ordered, truncated, False
+                    yield ordered, truncated, full_field
+                    if full_field:
+                        return
             if not succeeded:
                 raise errors[-1] if errors else ArchiveError("The archive did not return an exposure list.")
         finally:
@@ -472,16 +579,19 @@ class PlaybackSearch:
             await asyncio.gather(*requests, return_exceptions=True)
 
     async def run(self):
+        if self.job.sequences is None:
+            self.job.sequences = {}
         try:
             visits = []
             full_field = False
             previews = []
             async with aclosing(self.discover()) as results:
-                async for exposures, truncated, full_field in results:
+                async for exposures, _, full_field in results:
                     visits = [
                         eligible for visit in group_visits(exposures)
                         if (eligible := [item for item in visit if self.job.filters.includes(item)])
                     ]
+                    self.revalidate_visits(visits)
                     if self.job.preview is None:
                         self.job.message = "Preparing the first exposure…"
                         preview = asyncio.create_task(self.find_usable(
@@ -489,11 +599,12 @@ class PlaybackSearch:
                         ))
                         previews.append(preview)
                         self.preview_tasks.append(preview)
-                    if (result := await self.find_pair(visits)) is not None:
-                        self.job.partial |= truncated
-                        self.publish(result)
-                        return
+                    await self.find_sequences(visits)
             self.job.partial |= not full_field
+            if self.job.has_current_sequences:
+                self.job.status = "ready"
+                self.job.message = "The search was partial. More sequences may be available." if self.job.partial else ""
+                return
             if self.job.preview is None:
                 await asyncio.gather(*previews)
             if self.job.preview is None:
@@ -501,15 +612,15 @@ class PlaybackSearch:
                 if self.job.filters != ArchiveFilters():
                     self.job.message = "No usable exposures found for this patch with the selected filters."
             elif not self.job.partial and (self.job.filters != ArchiveFilters() or self.job.min_gap or self.job.max_gap is not None):
-                self.job.message = "No matched pair meets the selected filters and playback requirements."
+                self.job.message = "No matched sequence meets the selected filters and playback requirements."
             elif not self.job.partial:
                 other_visits = [item for visit in visits if all(item.key != self.preview_key for item in visit) for item in visit]
                 if await self.find_usable(other_visits):
-                    self.job.message = "No pair meets the wavelength and coverage requirements."
+                    self.job.message = "No matched sequence meets the wavelength and coverage requirements."
                 else:
                     self.job.message = "Only one visit has usable image data for this patch."
             if self.job.partial:
-                self.job.message = "The partial archive search could not verify a matching pair."
+                self.job.message = "The partial archive search could not verify a matched sequence."
             self.job.status = "no-match"
         finally:
             for task in self.preview_tasks:
@@ -537,13 +648,16 @@ async def run_playback(client, job, ra, dec, field_size):
         log.warning("Playback %s: IRSA metadata request timed out", job.id)
     except TimeoutError:
         job.partial = True
-        job.status = "no-match"
-        job.message = "The search timed out before verifying a matching pair."
+        job.status = "ready" if job.has_current_sequences else "no-match"
+        job.message = ("The search timed out. More sequences may be available." if job.has_current_sequences
+                       else "The search timed out before verifying a matched sequence.")
     except asyncio.CancelledError:
         job.status = "cancelled"
-        job.message = "Lookup cancelled."
+        job.message = "Search stopped." if job.has_current_sequences else "Lookup cancelled."
         raise
     except Exception:
         log.exception("Playback %s failed", job.id)
-        job.status = "error"
-        job.message = "Could not complete the archive lookup. Try again."
+        job.partial = job.has_current_sequences
+        job.status = "ready" if job.has_current_sequences else "error"
+        job.message = ("The search ended early. More sequences may be available." if job.has_current_sequences
+                       else "Could not complete the archive lookup. Try again.")

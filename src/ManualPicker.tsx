@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import {
-  loadBandpasses, loadExposurePreview, maxManualFrames, watchInventory, watchSelection,
+  exposureIdentity, loadBandpasses, loadExposurePreview, maxManualFrames, watchInventory, watchSelection,
   type ArchiveExposure, type ArchivePatch, type Bandpass, type ExposureIssue, type InventoryUpdate, type PlaybackUpdate,
 } from './exposure';
 
@@ -212,7 +212,8 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
 
   function toggle(exposure: ArchiveExposure) {
     setSelected((current) => current.some(({ sourceUrl }) => sourceUrl === exposure.sourceUrl)
-      ? current.filter(({ sourceUrl }) => sourceUrl !== exposure.sourceUrl) : [...current, exposure]);
+      ? current.filter(({ sourceUrl }) => sourceUrl !== exposure.sourceUrl)
+      : [...current.filter((item) => exposureIdentity(item) !== exposureIdentity(exposure)), exposure]);
     setExploratory(null);
     setFailure('');
   }
@@ -330,7 +331,8 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
                   <label>
                     <input type="checkbox" checked={selectedSources.has(item.sourceUrl)} onChange={() => toggle(item)}
                       ref={listJump?.key === item.key ? revealedExposure : undefined}
-                      disabled={Boolean(status) || (selected.length >= maxManualFrames && !selectedSources.has(item.sourceUrl))} />
+                      disabled={Boolean(status) || (selected.length >= maxManualFrames &&
+                        !selected.some((selectedItem) => exposureIdentity(selectedItem) === exposureIdentity(item)))} />
                     <span>
                       <span className="manual-exposure-title">
                         <strong>{observationTime(item)} · {item.release} · D{item.detector}</strong>

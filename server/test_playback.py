@@ -10,7 +10,7 @@ from PIL import Image
 
 from .app import app
 from .exposure import ArchiveFilters, QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, rows, search
-from .playback import Center, PlaybackJob, PlaybackSearch, bandpass_overlap, group_visits, run_playback, shared_mask
+from .playback import Center, PlaybackJob, PlaybackSearch, bandpass_overlap, group_visits, run_playback
 
 
 def exposure(name, mjd):
@@ -135,32 +135,128 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.status, "no-match")
         self.assertFalse(job.partial)
 
-    async def test_center_query_can_verify_pair_before_footprint_times_out(self):
-        job = PlaybackJob("test")
-        runner = PlaybackSearch(None, job, 10, 20, 12)
-        items = [exposure("earlier", 60000), exposure("later", 60001)]
-        stopped = asyncio.Event()
+    async def test_status_exposes_first_result_while_another_sequence_is_pending(self):
+        items = [exposure(name, 60000 + index) for index, name in enumerate("abcd")]
+        waiting = asyncio.Event()
+        finish = asyncio.Event()
+        image = np.ones((3, 3), dtype=np.float32)
 
-        async def query(client, corners, limit, *, region=None, compact=False, filters=None):
-            if region == "CIRCLE 10.000000000 20.000000000 0":
-                return items[::-1], False
-            try:
-                await asyncio.Future()
-            finally:
-                stopped.set()
+        async def discover(runner):
+            yield items, False, True
 
-        runner.find_usable = AsyncMock(return_value=True)
-        runner.find_pair = AsyncMock(return_value="verified")
+        async def match(runner, centers, overlap):
+            if tuple(center.exposure for center in centers) != tuple(items[:2]):
+                waiting.set()
+                await finish.wait()
+            return centers, tuple(image for _ in centers), image > 0, overlap, 1.
+
         with (
-            patch("server.playback.search", query),
-            patch.object(runner, "publish") as publish,
+            patch.object(PlaybackSearch, "discover", discover),
+            patch.object(PlaybackSearch, "center", AsyncMock(
+                side_effect=lambda item, visit: Center(item, visit, 1, .25))),
+            patch.object(PlaybackSearch, "find_usable", AsyncMock(return_value=True)),
+            patch.object(PlaybackSearch, "match", match),
         ):
-            async with asyncio.timeout(2):
-                await runner.run()
-        runner.find_pair.assert_awaited_once_with([[items[0]], [items[1]]])
-        publish.assert_called_once_with("verified")
-        self.assertFalse(job.partial)
-        self.assertTrue(stopped.is_set())
+            async with (
+                app.router.lifespan_context(app),
+                httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+                asyncio.timeout(2),
+            ):
+                lookup = await client.post("/api/playback", json={
+                    "ra": 10, "dec": 20, "fieldSize": 6, "maxGapDays": 1,
+                })
+                lookup_id = lookup.json()["id"]
+                job = app.state.playback[lookup_id]
+                path = f"/api/playback/{lookup_id}"
+                await waiting.wait()
+                while not job.sequences:
+                    await asyncio.sleep(0)
+                first_snapshot = (await client.get(path)).json()
+                self.assertEqual(first_snapshot["status"], "searching")
+                first, = first_snapshot["sequences"]
+                first_path = f"/api/playback/{first['id']}"
+                first_result = (await client.get(first_path)).json()
+                self.assertEqual(first_result["status"], "ready")
+                self.assertEqual([frame["key"] for frame in first_result["frames"]], ["a", "b"])
+                self.assertEqual((await client.get(first_result["frames"][0]["imageUrl"])).status_code, 200)
+
+                finish.set()
+                await job.task
+                snapshot = (await client.get(path)).json()
+                self.assertEqual(snapshot["status"], "ready")
+                extension, = snapshot["sequences"]
+                self.assertEqual(extension["count"], 4)
+                self.assertEqual(len(snapshot["sequenceCandidates"]), 6)
+                longer = (await client.get(f"/api/playback/{extension['id']}")).json()
+                self.assertEqual([frame["key"] for frame in longer["frames"]], list("abcd"))
+                self.assertEqual(longer["comparison"]["days"], 3)
+                self.assertNotEqual(longer["frames"][0]["imageUrl"], first_result["frames"][0]["imageUrl"])
+                self.assertEqual((await client.get(first_path)).json(), first_result)
+
+    async def test_search_continues_after_reaching_the_visit_limit(self):
+        items = [exposure(str(index), 60000 + index) for index in range(13)]
+        job = PlaybackJob("test", sequences={}, min_gap=1, max_gap=1)
+        runner = PlaybackSearch(None, job, 0, 0, 6)
+        runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 1, .25))
+        image = np.ones((3, 3), dtype=np.float32)
+        runner.match = AsyncMock(side_effect=lambda items, overlap: (
+            items, tuple(image for _ in items), image > 0, overlap, 1.,
+        ))
+        try:
+            await runner.find_sequences(group_visits(items))
+        finally:
+            await runner.close_reads()
+        snapshot = job.snapshot()
+        largest = [item["exposureIds"] for item in snapshot["sequenceCandidates"] if item["count"] == 12]
+        self.assertCountEqual(largest, [[item.identity for item in items[:12]], [item.identity for item in items[1:]]])
+        winner, = snapshot["sequences"]
+        self.assertEqual(winner["exposureIds"], [item.identity for item in items[:12]])
+        self.assertTrue(all(len(sequence.frames) <= 12 for sequence in job.sequences.values()))
+
+    async def test_overlapping_alternatives_do_not_use_all_checks_before_disjoint_sequences(self):
+        items = [exposure(str(index), 60000 + index) for index in range(25)]
+        job = PlaybackJob("test", sequences={})
+        runner = PlaybackSearch(None, job, 0, 0, 6)
+        runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 1, .25))
+        image = np.ones((3, 3))
+        runner.match = AsyncMock(side_effect=lambda items, overlap: (
+            items, (image,) * len(items), image > 0, overlap, 1.,
+        ))
+        try:
+            await runner.find_sequences(group_visits(items))
+        finally:
+            await runner.close_reads()
+
+        visible = job.snapshot()["sequences"]
+        self.assertEqual([item["count"] for item in visible], [12, 12])
+        self.assertTrue(set(visible[0]["exposureIds"]).isdisjoint(visible[1]["exposureIds"]))
+
+    def test_overlaps_use_exposure_identity_and_reconsider_displaced_results(self):
+        a, b, c, d, e, f, g = [exposure(name, 60000 + index) for index, name in enumerate("abcdefg")]
+        b_reprocessed = Exposure("qr3/b", b.detector, b.observation_id, b.mjd)
+        b_other_detector = Exposure("dr1/b-d3", 3, b.observation_id, b.mjd)
+        job = PlaybackJob("test", sequences={})
+        runner = PlaybackSearch(None, job, 0, 0, 6)
+        image = np.ones((3, 3), dtype=np.float32)
+
+        def publish(*items):
+            centers = tuple(Center(item, index, 1, .25) for index, item in enumerate(items))
+            runner.publish((centers, (image,) * len(items), image > 0, 1., 1.))
+
+        def visible():
+            return [item["exposureIds"] for item in job.snapshot()["sequences"]]
+
+        publish(a, b)
+        publish(b_reprocessed, c, d)
+        publish(b_other_detector, e)
+        self.assertEqual(visible(), [[b.identity, c.identity, d.identity], [b_other_detector.identity, e.identity]])
+        publish(c, d, f, g)
+        self.assertEqual(visible(), [[c.identity, d.identity, f.identity, g.identity],
+                                     [b_other_detector.identity, e.identity], [a.identity, b.identity]])
+        publish(a, b, c, d, e, f, g)
+        publish(a, b, c, d, e, f, g)
+        self.assertEqual(visible(), [[item.identity for item in (a, b, c, d, e, f, g)]])
+        self.assertEqual(len(job.snapshot()["sequenceCandidates"]), 5)
 
     async def test_empty_center_response_does_not_establish_no_field_coverage(self):
         job = PlaybackJob("test")
@@ -179,6 +275,29 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job.status, "no-match")
         self.assertTrue(job.partial)
         self.assertIn("partial archive search", job.message)
+
+    async def test_later_metadata_withdraws_sequence_whose_visits_merge(self):
+        first, bridge, last = [exposure(name, 60000 + minutes / 1440)
+                               for name, minutes in (("first", 0), ("bridge", 7), ("last", 14))]
+        job = PlaybackJob("test", sequences={})
+        runner = PlaybackSearch(None, job, 10, 20, 6)
+        image = np.ones((3, 3))
+
+        async def discover():
+            yield [first, last], False, False
+            self.assertEqual(len(job.snapshot()["sequences"]), 1)
+            yield [first, bridge, last], False, True
+
+        runner.discover = discover
+        runner.find_usable = AsyncMock(return_value=None)
+        runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 4.33, .05))
+        runner.match = AsyncMock(side_effect=lambda items, overlap: (items, (image,) * len(items), image > 0, overlap, 1.))
+        await runner.run()
+
+        self.assertEqual(job.status, "no-match")
+        self.assertEqual(job.snapshot()["sequences"], [])
+        self.assertEqual(job.snapshot()["sequenceCandidates"], [])
+        self.assertEqual(len(job.sequences), 1)  # Previously published images stay addressable.
 
     async def test_bounded_metadata_publishes_preview_before_full_query_times_out(self):
         item = exposure("first", 60000)
@@ -237,48 +356,39 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             a.exposure.key: (np.full(image.shape, a.wavelength), np.full(image.shape, a.bandwidth)),
             b.exposure.key: (np.full(image.shape, b.wavelength), np.full(image.shape, b.bandwidth)),
         }
-        runner = PlaybackSearch(None, PlaybackJob("test"), 0, 0, 6)
+        runner = PlaybackSearch(None, PlaybackJob("test", sequences={}), 0, 0, 6)
         runner.image = AsyncMock(side_effect=lambda item: (
             image if item == a.exposure else image + 10,
             center_masked if item == a.exposure else all_valid, item.key, image.shape,
         ))
         runner.field_bandpass = AsyncMock(side_effect=lambda _, key, shape: matching_bands[key])
-        result = await runner.pair(a, b, .75)
+        result = await runner.match((a, b), .75)
         self.assertIsNotNone(result)
         runner.publish(result)
-        masks = [np.array(Image.open(BytesIO(runner.job.images[f"frame-{index}"]))) for index in range(2)]
+        sequence, = runner.job.sequences.values()
+        masks = [np.array(Image.open(BytesIO(sequence.images[f"frame-{index}"]))) for index in range(2)]
         np.testing.assert_array_equal(masks[0][..., 1], masks[1][..., 1])
         self.assertEqual(masks[0][0, 2, 1], 0)
         # The later frame is brighter at every valid pixel. Independent stretches would hide that difference.
         self.assertTrue((masks[1][center_masked, 0] > masks[0][center_masked, 0]).all())
-        self.assertEqual(runner.job.comparison["coverage"], .8)
+        self.assertEqual(sequence.comparison["coverage"], .8)
 
         matching_bands[b.exposure.key][0][0, 0] = 1.0626
-        mask = shared_mask(center_masked, matching_bands[a.exposure.key], all_valid, matching_bands[b.exposure.key])
-        self.assertEqual(mask.mean(), .6)
-        self.assertIsNone(await runner.pair(a, b, .75))
+        self.assertIsNone(await runner.match((a, b), .75))
 
-    async def test_first_verified_pair_cancels_longer_check(self):
-        a, b, c = [exposure(name, 60000 + index) for index, name in enumerate("abc")]
+    async def test_sequence_requires_joint_coverage_even_when_each_two_visits_match(self):
+        items = tuple(Center(exposure(name, 60000 + index), index, 1, .25) for index, name in enumerate("abc"))
+        image = np.ones((2, 5), dtype=np.float32)
+        masks = np.ones((3, *image.shape), dtype=bool)
+        for index, mask in enumerate(masks):
+            mask[0, index] = False
         runner = PlaybackSearch(None, PlaybackJob("test"), 0, 0, 6)
-        runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 1, .25))
-        waiting = asyncio.Event()
-        stopped = asyncio.Event()
-
-        async def check(first, second, overlap):
-            if {first.exposure, second.exposure} == {a, c}:
-                try:
-                    waiting.set()
-                    await asyncio.Future()
-                finally:
-                    stopped.set()
-            await waiting.wait()
-            return "verified"
-
-        runner.pair = check
-        async with asyncio.timeout(2):
-            self.assertEqual(await runner.find_pair([[a], [b], [c]]), "verified")
-        self.assertTrue(stopped.is_set())
+        runner.image = AsyncMock(side_effect=lambda item: (image, masks["abc".index(item.key)], None, image.shape))
+        runner.field_bandpass = AsyncMock(return_value=(image, image * .25))
+        self.assertIsNotNone(await runner.match(items[:2], 1))
+        self.assertIsNotNone(await runner.match(items[1:], 1))
+        self.assertIsNotNone(await runner.match(items[::2], 1))
+        self.assertIsNone(await runner.match(items, 1))
 
     async def test_auto_checks_both_gap_bounds_and_calibrated_wavelength_before_reading_pixels(self):
         days = (0, 1, 4, 7, 10)
@@ -289,14 +399,14 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                           min_gap=3, max_gap=3)
         runner = PlaybackSearch(None, job, 10, 20, 6)
         runner.center = AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, waves[item], .25))
-        runner.pair = AsyncMock(return_value=None)
+        runner.match = AsyncMock(return_value=None)
         try:
-            await runner.find_pair(group_visits(items))
+            await runner.find_sequences(group_visits(items))
         finally:
             await runner.close_reads()
 
-        checked = {frozenset((a.exposure, b.exposure)) for a, b, _ in
-                   (call.args for call in runner.pair.await_args_list)}
+        checked = {frozenset(center.exposure for center in centers)
+                   for centers, _ in (call.args for call in runner.match.await_args_list)}
         self.assertEqual(checked, {frozenset((items[1], items[2])), frozenset((items[2], items[3]))})
 
     async def test_preview_remains_when_visits_have_no_matching_bandpass(self):
@@ -330,7 +440,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
         self.assertEqual(job.status, "no-match")
-        self.assertIn("No pair", job.message)
+        self.assertIn("No matched sequence", job.message)
         self.assertIsNotNone(job.preview)
         self.assertEqual(job.frames, [])
 

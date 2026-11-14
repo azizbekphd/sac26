@@ -1,11 +1,12 @@
 import '@fontsource/ibm-plex-mono/latin-400.css';
 import '@fontsource/ibm-plex-mono/latin-600.css';
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
-import { archiveReleases, watchPlayback, type ArchiveRelease, type PlaybackPatch, type PlaybackUpdate } from './exposure';
+import { archiveReleases, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease,
+  type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
 import './styles.css';
 
 const fieldSizes = [3, 6, 12, 24, 48] as const;
@@ -18,7 +19,7 @@ const axes = [
 const filterRanges = [
   { label: 'Observation dates (UTC)', fields: ['startDate', 'endDate'], bounds: ['From', 'Through'], type: 'date' },
   { label: 'Wavelength (µm)', fields: ['minWavelength', 'maxWavelength'], bounds: ['Minimum', 'Maximum'], type: 'number' },
-  { label: 'Time between exposures (days, Auto)', fields: ['minGapDays', 'maxGapDays'], bounds: ['Minimum', 'Maximum'], type: 'number' },
+  { label: 'Time between consecutive selected visits (days, Auto)', fields: ['minGapDays', 'maxGapDays'], bounds: ['Minimum', 'Maximum'], type: 'number' },
 ] as const;
 const emptyFilters = { startDate: '', endDate: '', minWavelength: '', maxWavelength: '', minGapDays: '', maxGapDays: '' };
 type FilterField = keyof typeof emptyFilters;
@@ -43,6 +44,38 @@ type SubmittedPatch = PlaybackPatch & {
 
 type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
+type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string } };
+
+function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
+  return {
+    id, count: result.frames.length, exposureIds: result.frames.map(exposureIdentity),
+    start: result.frames[0].observedAt, end: result.frames[result.frames.length - 1].observedAt,
+    bandpass: result.comparison?.bandpass ?? null,
+  };
+}
+
+function availableSequences(search: SequenceSearch | null, manual: ManualResult[]) {
+  if (!manual.length) return search?.sequences ?? [];
+  const selected = manual.map(({ result }) => summarizeSelection(result, result.jobId));
+  const used = new Set(selected.flatMap((sequence) => sequence.exposureIds));
+  const auto = (search?.sequenceCandidates ?? search?.sequences ?? []).filter((sequence) => {
+    if (sequence.exposureIds.some((id) => used.has(id))) return false;
+    sequence.exposureIds.forEach((id) => used.add(id));
+    return true;
+  });
+  return [...selected, ...auto];
+}
+
+function describeSequence(sequence: SequenceSummary) {
+  const { count, start, end, bandpass } = sequence;
+  return `${count} visits · ${start.slice(0, 10)}–${end.slice(0, 10)}${bandpass
+    ? ` · ${bandpass[0].toFixed(3)}–${bandpass[1].toFixed(3)} µm` : ''}`;
+}
+
+const emptySearch: SequenceSearch = {
+  status: 'searching', message: 'Searching the SPHEREx archive…', preview: null,
+  frames: [], comparison: null, partial: false, sequences: [],
+};
 
 function App() {
   const [drawerOpen, setDrawerOpen] = useState(true);
@@ -53,11 +86,20 @@ function App() {
   const [hasFilters, setHasFilters] = useState(false);
   const [filterError, setFilterError] = useState('');
   const [view, setView] = useState<WorkspaceState | null>(null);
+  const [search, setSearch] = useState<SequenceSearch | null>(null);
+  const [manualResults, setManualResults] = useState<ManualResult[]>([]);
+  const [pendingSequence, setPendingSequence] = useState<string>();
+  const [sequenceError, setSequenceError] = useState('');
+  const [failedSequence, setFailedSequence] = useState<string>();
+  const [stoppingSearch, setStoppingSearch] = useState(false);
+  const [stopError, setStopError] = useState('');
   const [manual, setManual] = useState<ManualState | null>(null);
   const [frameIndex, setFrameIndex] = useState(0);
+  const currentFrame = useRef<string | undefined>(undefined);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const requestRef = useRef<AbortController | null>(null);
+  const selectionRef = useRef<AbortController | null>(null);
   const drawerToggle = useRef<HTMLButtonElement>(null);
   const submitAction = useRef<HTMLButtonElement>(null);
   const backAction = useRef<HTMLButtonElement>(null);
@@ -66,12 +108,17 @@ function App() {
   const filtersRef = useRef<HTMLDetailsElement>(null);
   const draftPosition = useMemo(() => parsePosition(fields), [fields]);
   const fieldSize = fieldSizes[fieldSizeIndex];
+  const sequences = useMemo(() => availableSequences(search, manualResults), [search, manualResults]);
 
-  const result = view?.result;
+  const result = view?.result.status === 'ready' ? view.result : search;
   const isLoading = result?.status === 'searching';
-  const canPlay = result?.status === 'ready';
+  const isSearching = search?.status === 'searching';
+  const canPlay = view?.result.status === 'ready';
   const frameCount = result?.frames.length ?? 0;
   const exposure = result?.frames[frameIndex] ?? result?.preview;
+  useEffect(() => {
+    currentFrame.current = exposure ? exposureIdentity(exposure) : undefined;
+  }, [exposure]);
   const observationTime = exposure?.observedAt.replace('T', ' ').slice(0, 19);
   const workspaceOpen = Boolean(exposure);
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
@@ -96,7 +143,10 @@ function App() {
     return () => window.clearInterval(timer);
   }, [canPlay, frameCount, playing]);
 
-  useEffect(() => () => requestRef.current?.abort(), []);
+  useEffect(() => () => {
+    requestRef.current?.abort();
+    selectionRef.current?.abort();
+  }, []);
 
   const pickPosition = useCallback((position: SkyPosition) => {
     if (requestRef.current) return;
@@ -113,29 +163,119 @@ function App() {
 
   function loadComparison(patch: SubmittedPatch) {
     requestRef.current?.abort();
+    selectionRef.current?.abort();
+    selectionRef.current = null;
     const controller = new AbortController();
     requestRef.current = controller;
     setDrawerOpen(true);
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
-    setView({ patch, result: {
-      status: 'searching', message: 'Searching the SPHEREx archive…', preview: null,
-      frames: [], comparison: null, partial: false,
-    } });
-    void watchPlayback(patch, controller.signal, (result) => {
+    setView({ patch, result: emptySearch });
+    setSearch(emptySearch);
+    setPendingSequence(undefined);
+    setSequenceError('');
+    setFailedSequence(undefined);
+    setStoppingSearch(false);
+    setStopError('');
+    setManualResults([]);
+    const update = (result: SequenceSearch) => {
       if (controller.signal.aborted) return;
-      if (result.status !== 'searching') requestRef.current = null;
-      const autoSelectedSources = result.status === 'ready' ? new Set(result.frames.map((frame) => frame.sourceUrl)) : undefined;
-      setView({ patch, result, autoSelectedSources });
-    }).catch((error: unknown) => {
+      if (result.status !== 'searching') {
+        requestRef.current = null;
+        setStoppingSearch(false);
+        setStopError('');
+      }
+      setSearch(result);
+    };
+    void watchPlayback(patch, controller.signal, update).catch((error: unknown) => {
       if (controller.signal.aborted) return;
       requestRef.current = null;
+      setStoppingSearch(false);
       const message = error instanceof Error && !(error instanceof TypeError)
         ? error.message : 'The playback service is unavailable. Try again.';
-      setView((current) => current && ({
-        ...current, result: { ...current.result, status: 'error', message },
-      }));
+      setSearch((current) => current && { ...current, status: 'error', message, reconnecting: false });
+    });
+  }
+
+  function openSequence(next: WorkspaceState) {
+    setFrameIndex(0);
+    setPlaying(false);
+    setDetailsOpen(false);
+    setView(next);
+  }
+
+  function selectSequence(patch: SubmittedPatch, id: string, preservePosition = false) {
+    selectionRef.current?.abort();
+    const controller = new AbortController();
+    selectionRef.current = controller;
+    setPendingSequence(id);
+    setSequenceError('');
+    setFailedSequence(undefined);
+    const existing = manualResults.find((item) => item.result.jobId === id);
+    void (existing ? Promise.resolve(existing) : loadSequence(id, controller.signal).then((result) => ({
+      patch, result, autoSelectedSources: new Set(result.frames.map((frame) => frame.sourceUrl)),
+    }))).then((next) => {
+      if (controller.signal.aborted) return;
+      if (preservePosition) {
+        const index = next.result.frames.findIndex((frame) => exposureIdentity(frame) === currentFrame.current);
+        setFrameIndex(Math.max(0, index));
+        if (index < 0) setPlaying(false);
+        setView(next);
+      } else {
+        openSequence(next);
+      }
+    }).catch((failure: unknown) => {
+      if (!controller.signal.aborted) {
+        setFailedSequence(id);
+        setSequenceError(failure instanceof Error && !(failure instanceof TypeError)
+          ? failure.message : 'Could not load the sequence. Try again.');
+      }
+    }).finally(() => {
+      if (selectionRef.current !== controller) return;
+      selectionRef.current = null;
+      setPendingSequence(undefined);
+    });
+  }
+
+  const refreshActiveSequence = useEffectEvent(() => {
+    if (!view || manual) return;
+    const includes = (id: string) => sequences.some((entry) => entry.id === id);
+    if (pendingSequence) {
+      if (includes(pendingSequence)) return;
+      selectionRef.current?.abort();
+      selectionRef.current = null;
+      setPendingSequence(undefined);
+    }
+    const active = canPlay ? result?.jobId : undefined;
+    if (failedSequence && !includes(failedSequence)) {
+      setFailedSequence(undefined);
+      setSequenceError('');
+    }
+    if (!sequences.length) {
+      if (active) openSequence({ patch: view.patch, result: emptySearch });
+      return;
+    }
+    if (active && includes(active)) return;
+    const identities = new Set(canPlay ? result?.frames.map(exposureIdentity) : []);
+    const replacement = sequences.find((item) => currentFrame.current && item.exposureIds.includes(currentFrame.current))
+      ?? sequences.find((item) => item.exposureIds.some((id) => identities.has(id))) ?? sequences[0];
+    if (replacement.id !== failedSequence) selectSequence(view.patch, replacement.id, Boolean(active));
+  });
+
+  useEffect(() => {
+    refreshActiveSequence();
+  }, [sequences, view?.result.jobId, pendingSequence, failedSequence, manual]);
+
+  function stopSearch() {
+    const controller = requestRef.current;
+    if (!controller || !search?.jobId) return;
+    setStoppingSearch(true);
+    setStopError('');
+    void stopPlayback(search.jobId).catch(() => {
+      if (requestRef.current !== controller) return;
+      setStoppingSearch(false);
+      setStopError('Could not stop the search. Try again.');
     });
   }
 
@@ -216,17 +356,37 @@ function App() {
   }
 
   function editComparison() {
-    if (!view) return;
+    if (!view || !result) return;
+    selectionRef.current?.abort();
+    selectionRef.current = null;
+    setPendingSequence(undefined);
     setPlaying(false);
-    setManual({ patch: view.patch, seed: view.result, autoSelectedSources: view.autoSelectedSources });
+    setManual({ patch: view.patch, seed: result, autoSelectedSources: view.autoSelectedSources });
   }
 
   function applySelection(result: PlaybackUpdate) {
-    if (!manual) return;
-    setFrameIndex(0);
-    setPlaying(false);
-    setDetailsOpen(false);
-    setView({ patch: { ...manual.patch, minGapDays: 0, maxGapDays: null }, result, autoSelectedSources: manual.autoSelectedSources });
+    if (!manual || !result.jobId) return;
+    selectionRef.current?.abort();
+    selectionRef.current = null;
+    setPendingSequence(undefined);
+    setSequenceError('');
+    setFailedSequence(undefined);
+    const existing = manual.seed && manualResults.find((item) => item.result.mode === result.mode &&
+      item.result.frames.length === result.frames.length &&
+      item.result.frames.every((frame, index) => frame.key === result.frames[index].key));
+    const selection = existing ?? {
+      patch: manual.patch, result: { ...result, jobId: result.jobId }, autoSelectedSources: manual.autoSelectedSources,
+    };
+    const identities = new Set(result.frames.map(exposureIdentity));
+    if (manual.seed) {
+      setManualResults((items) => [selection, ...items.filter(({ result }) =>
+        result.frames.every((frame) => !identities.has(exposureIdentity(frame))))]);
+    } else {
+      setSearch(null);
+      setStopError('');
+      setManualResults([selection]);
+    }
+    openSequence(selection);
     setManual(null);
     requestAnimationFrame(() => backAction.current?.focus({ preventScroll: true }));
   }
@@ -234,7 +394,16 @@ function App() {
   function backToSky() {
     requestRef.current?.abort();
     requestRef.current = null;
+    selectionRef.current?.abort();
+    selectionRef.current = null;
     setView(null);
+    setSearch(null);
+    setManualResults([]);
+    setPendingSequence(undefined);
+    setSequenceError('');
+    setFailedSequence(undefined);
+    setStoppingSearch(false);
+    setStopError('');
     setPlaying(false);
     setDrawerOpen(true);
     requestAnimationFrame(() => submitAction.current?.focus({ preventScroll: true }));
@@ -248,6 +417,44 @@ function App() {
   const drawerAction = drawerOpen ? 'Hide patch' : 'Choose patch';
   const backLabel = isLoading ? 'Cancel lookup' : 'Back to sky';
   const playbackLabel = playing ? 'Pause' : 'Play';
+  const selectedSequenceId = pendingSequence ?? (canPlay ? result?.jobId : undefined);
+  const sequenceControls = view && (
+    <>
+      {sequences.length > 0 && (
+        <div className="sequence-choice">
+          <label htmlFor="sequence-choice">Sequence</label>
+          <select id="sequence-choice" value={sequences.some((item) => item.id === selectedSequenceId) ? selectedSequenceId : ''} onChange={(event) => {
+            if (event.currentTarget.value) selectSequence(view.patch, event.currentTarget.value);
+          }}>
+            <option value="" disabled>Choose a sequence</option>
+            {sequences.map((item, index) => <option key={item.id} value={item.id}>
+              {index + 1}. {describeSequence(item)}{manualResults.some(({ result }) => result.jobId === item.id) ? ' · Manual' : ''}
+            </option>)}
+          </select>
+        </div>
+      )}
+      {pendingSequence && <p className="lookup-status" role="status">Loading sequence…</p>}
+      {sequenceError && <p className="lookup-status" role="alert">{sequenceError}</p>}
+      {failedSequence && sequences.some((item) => item.id === failedSequence) && (
+        <button type="button" className="control" onClick={() => selectSequence(view.patch, failedSequence,
+          Boolean(canPlay && !sequences.some((item) => item.id === result?.jobId)))}>
+          Retry loading sequence
+        </button>
+      )}
+      {(canPlay || sequences.length > 0 || (workspaceOpen && isSearching)) && search && (
+        <>
+          {(canPlay || sequences.length > 0) && (search.reconnecting || isSearching || search.message) && <p className="lookup-status" role="status">
+            {search.reconnecting ? 'Reconnecting to the archive search…'
+              : isSearching ? 'Searching for more sequences…' : search.message}
+          </p>}
+          {isSearching && <button type="button" className="control" disabled={stoppingSearch} onClick={stopSearch}>
+            {stoppingSearch ? 'Stopping search…' : 'Stop search'}
+          </button>}
+          {stopError && <p className="lookup-status" role="alert">{stopError}</p>}
+        </>
+      )}
+    </>
+  );
 
   return (
     <div className="app">
@@ -344,7 +551,7 @@ function App() {
             </details>
 
             <div className="form-actions">
-              {result?.message && !workspaceOpen && (
+              {result?.message && !workspaceOpen && sequences.length === 0 && (
                 <p className={result.status === 'error' ? 'error' : 'lookup-status'}
                   role={result.status === 'error' ? 'alert' : 'status'}>{result.message}</p>
               )}
@@ -360,6 +567,7 @@ function App() {
                 <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
               )}
             </div>
+            {!workspaceOpen && sequenceControls}
           </form>
         </aside>
 
@@ -395,9 +603,10 @@ function App() {
                       </div>
                     </div>
                     {exploratory && <strong>Exploratory blink</strong>}
-                    {view.result.message && <p className="lookup-status" role="status">
-                      {exploratory && 'Matched playback was unavailable. '}{view.result.message}
+                    {result?.message && (canPlay || sequences.length === 0) && <p className="lookup-status" role="status">
+                      {exploratory && 'Matched playback was unavailable. '}{result.message}
                     </p>}
+                    {sequenceControls}
                     {canPlay && (
                       <>
                         <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
@@ -419,7 +628,7 @@ function App() {
                               <span aria-hidden="true">⏭︎</span>
                             </button>
                           </div>
-                          <span className="frame-count">{frameIndex + 1} / {frameCount}</span>
+                          <span className="frame-count">{frameIndex + 1} / {frameCount} {exploratory ? 'frames' : 'visits'}</span>
                         </div>
                       </>
                     )}

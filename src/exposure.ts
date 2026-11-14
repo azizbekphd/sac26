@@ -35,14 +35,35 @@ export type PlaybackUpdate = {
   message: string;
   preview: Exposure | null;
   frames: Exposure[];
-  comparison: { days: number; overlap: number | null; coverage: number; coverageIncludesBandpass?: boolean } | null;
+  comparison: { days: number; overlap: number | null; coverage: number; coverageIncludesBandpass?: boolean;
+    bandpass?: [number, number] } | null;
   partial: boolean;
   mode?: 'matched' | 'exploratory';
   exposureIssues?: Record<string, ExposureIssue>;
   jobId?: string;
 };
 
+export type SequenceSummary = {
+  id: string;
+  count: number;
+  exposureIds: string[];
+  start: string;
+  end: string;
+  bandpass: [number, number] | null;
+};
+
+export type SequenceSearch = PlaybackUpdate & {
+  sequences: SequenceSummary[];
+  sequenceCandidates?: SequenceSummary[];
+  reconnecting?: boolean;
+};
+
+export function exposureIdentity(exposure: ArchiveExposure) {
+  return `${exposure.observationId}:D${exposure.detector}`;
+}
+
 export type InventoryUpdate = PlaybackUpdate & { exposures?: InventoryExposure[] };
+
 export const maxManualFrames = 12;
 
 async function jsonResponse<T>(response: Response, missingEndpoint?: string): Promise<T> {
@@ -77,6 +98,26 @@ function post(path: string, body: object, signal?: AbortSignal) {
   });
 }
 
+async function decodeFrames(result: PlaybackUpdate, signal: AbortSignal) {
+  await Promise.all(result.frames.map(async (frame) => {
+    const image = new Image();
+    image.src = frame.imageUrl;
+    await image.decode();
+  })).catch(() => { throw new Error('Could not load the comparison images. Try again.'); });
+  signal.throwIfAborted();
+}
+
+export async function loadSequence(id: string, signal: AbortSignal) {
+  const result = await jsonResponse<PlaybackUpdate>(await fetch(`/api/playback/${encodeURIComponent(id)}`, { signal }));
+  await decodeFrames(result, signal);
+  return { ...result, jobId: id };
+}
+
+export async function stopPlayback(id: string) {
+  const response = await fetch(`/api/playback/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  if (!response.ok) await jsonResponse(response);
+}
+
 async function watchJob<T extends PlaybackUpdate>(
   start: string, body: object, signal: AbortSignal, update: (result: T) => void, missingEndpoint?: string,
 ) {
@@ -87,13 +128,7 @@ async function watchJob<T extends PlaybackUpdate>(
   try {
     for (;;) {
       const result = await jsonResponse<T>(await fetch(path, { signal }));
-      if (result.status === 'ready') {
-        await Promise.all(result.frames.map(async (frame) => {
-          const image = new Image();
-          image.src = frame.imageUrl;
-          await image.decode();
-        })).catch(() => { throw new Error('Could not load the comparison images. Try again.'); });
-      }
+      if (result.status === 'ready') await decodeFrames(result, signal);
       signal.throwIfAborted();
       update({ ...result, jobId: id });
       if (result.status !== 'searching') {
@@ -107,13 +142,40 @@ async function watchJob<T extends PlaybackUpdate>(
   }
 }
 
-export function watchPlayback(
+export async function watchPlayback(
   { position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, minGapDays, maxGapDays }: PlaybackPatch,
-  signal: AbortSignal, update: (result: PlaybackUpdate) => void,
+  signal: AbortSignal, update: (result: SequenceSearch) => void,
 ) {
-  return watchJob('/api/playback', {
+  const { id } = await jsonResponse<{ id: string }>(await post('/api/playback', {
     ...position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, minGapDays, maxGapDays,
-  }, signal, update);
+  }));
+  const path = `/api/playback/${encodeURIComponent(id)}`;
+  let previous: SequenceSearch | undefined;
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const response = await fetch(path, { signal }).catch((error: unknown) => {
+        signal.throwIfAborted();
+        if (!(error instanceof TypeError)) throw error;
+        return null;
+      });
+      if (!response || response.status >= 500) {
+        update(previous ? { ...previous, reconnecting: true } : {
+          status: 'searching', message: 'Reconnecting to the archive search…', preview: null,
+          frames: [], comparison: null, partial: false, sequences: [], reconnecting: true, jobId: id,
+        });
+      } else {
+        const result = await jsonResponse<SequenceSearch>(response);
+        signal.throwIfAborted();
+        previous = { ...result, jobId: id };
+        update(previous);
+        if (result.status !== 'searching') return;
+      }
+      await nextPoll(signal);
+    }
+  } finally {
+    if (signal.aborted) void fetch(path, { method: 'DELETE', keepalive: true }).catch(() => {});
+  }
 }
 
 export function watchInventory(

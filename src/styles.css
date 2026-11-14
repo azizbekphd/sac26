@@ -159,6 +159,8 @@ form { display: grid; gap: 10px; }
   object-fit: contain;
   background: repeating-conic-gradient(#171717 0% 25%, #242424 0% 50%) 0 0 / 12px 12px;
 }
+.sequence-choice { display: grid; gap: 4px; min-width: 0; }
+.sequence-choice select { width: 100%; min-height: 32px; }
 .exposure-panel {
   display: grid;
   grid-template-areas: "details" "toolbar";

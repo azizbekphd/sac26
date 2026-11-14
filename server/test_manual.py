@@ -87,7 +87,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(PlaybackSearch, "field_bandpass", AsyncMock(return_value=(
                     np.full((3, 3), 1.5), np.full((3, 3), .25),
                 ))),
-                patch.object(PlaybackSearch, "pair", AsyncMock()) as pair,
+                patch.object(PlaybackSearch, "match", AsyncMock()) as match,
             ):
                 async def submit(path, payload):
                     response = await client.post(path, json=payload)
@@ -100,7 +100,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                 auto = await submit("/api/playback", patch_data)
                 self.assertEqual(auto.status, "no-match")
                 self.assertIsNotNone(auto.preview)
-                pair.assert_not_awaited()
+                match.assert_not_awaited()
 
                 inventory = await submit("/api/manual/inventory", patch_data)
                 self.assertEqual([(item["key"], item["visit"]) for item in inventory.inventory],

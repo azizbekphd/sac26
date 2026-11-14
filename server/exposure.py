@@ -83,6 +83,11 @@ class Exposure:
     wavelength_bounds: tuple[float, float] | None = None
 
     @property
+    def identity(self):
+        # Reprocessed archive products can refer to the same detector exposure.
+        return f"{self.observation_id}:D{self.detector}"
+
+    @property
     def release(self):
         return self.key.split("/", 1)[0]
 

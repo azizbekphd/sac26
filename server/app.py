@@ -14,10 +14,10 @@ from pydantic import BaseModel, Field, model_validator
 
 from .exposure import ArchiveError, ArchiveFilters, NoExposure, Release, find_exposure
 from .manual import (
-    CALIBRATION_BATCH, MAX_FRAMES, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
+    CALIBRATION_BATCH, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
     indexed_visits, render_selection, run_manual,
 )
-from .playback import PlaybackJob, run_playback
+from .playback import MAX_FRAMES, PlaybackJob, run_playback
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
@@ -94,21 +94,32 @@ async def lifespan(app):
 app = FastAPI(lifespan=lifespan)
 
 
-def playback_job(request: Request, job_id: str):
-    job = request.app.state.playback.get(job_id)
-    if job is None:
-        raise HTTPException(404, "This lookup has expired. Submit the patch again.")
-    job.touched = monotonic()
+def find_playback(jobs, job_id):
+    lookup_id, nested, _ = job_id.partition(".")
+    lookup = jobs.get(lookup_id)
+    if lookup is None:
+        return None
+    job = (lookup.sequences or {}).get(job_id) if nested else lookup
+    if job is not None:
+        lookup.touched = monotonic()
     return job
 
 
-def register_job(request, coordinates, run, *args, filters, min_gap=0, max_gap=None):
+def playback_job(request: Request, job_id: str):
+    job = find_playback(request.app.state.playback, job_id)
+    if job is None:
+        raise HTTPException(404, "This lookup has expired. Submit the patch again.")
+    return job
+
+
+def register_job(request, coordinates, run, *args, filters, min_gap=0, max_gap=None, sequences=None):
     jobs = request.app.state.playback
     cutoff = monotonic() - JOB_RETENTION
     for job_id in list(jobs):
         if jobs[job_id].task.done() and jobs[job_id].touched < cutoff:
             del jobs[job_id]
-    job = PlaybackJob(uuid4().hex, patch=coordinates, filters=filters, min_gap=min_gap, max_gap=max_gap)
+    job = PlaybackJob(uuid4().hex, patch=coordinates, filters=filters, min_gap=min_gap, max_gap=max_gap,
+                      sequences=sequences)
     job.task = asyncio.create_task(run(request.app.state.archive, job, *args))
     jobs[job.id] = job
     return {"id": job.id}
@@ -119,7 +130,7 @@ async def start_playback(patch: PlaybackPatch, request: Request):
     coordinates = patch.ra, patch.dec, patch.fieldSize
     return register_job(
         request, coordinates, run_playback, *coordinates,
-        filters=patch.archive_filters(), min_gap=patch.minGapDays, max_gap=patch.maxGapDays,
+        filters=patch.archive_filters(), min_gap=patch.minGapDays, max_gap=patch.maxGapDays, sequences={},
     )
 
 
@@ -127,10 +138,8 @@ async def start_playback(patch: PlaybackPatch, request: Request):
 async def start_inventory(patch: InventoryPatch, request: Request):
     coordinates = patch.ra, patch.dec, patch.fieldSize
     filters = patch.archive_filters()
-    source = request.app.state.playback.get(patch.fromPlayback)
-    seeds = ()
-    if source and source.patch == coordinates:
-        seeds = tuple(item for item in source.records if filters.includes(item))
+    source = find_playback(request.app.state.playback, patch.fromPlayback) if patch.fromPlayback else None
+    seeds = tuple(item for item in source.records if filters.includes(item)) if source and source.patch == coordinates else ()
     return register_job(request, coordinates, run_manual, discover_inventory, seeds, filters=filters)
 
 
@@ -157,6 +166,8 @@ async def manual_calibration(job_id: str, selection: CalibrationRequest, request
 @app.post("/api/manual/{job_id}/comparison", status_code=202)
 async def start_manual_comparison(job_id: str, selection: ManualSelection, request: Request):
     job, records = inventory_selection(request, job_id, selection.keys)
+    if len({item.identity for item, _ in records}) != len(records):
+        raise HTTPException(422, "Choose one archive product per detector exposure.")
     return register_job(request, job.patch, run_manual, render_selection, records, filters=job.filters)
 
 
@@ -203,7 +214,7 @@ async def cancel_playback(job_id: str, request: Request):
     job = request.app.state.playback.get(job_id)
     if job is not None and job.status == "searching":
         job.status = "cancelled"
-        job.message = "Lookup cancelled."
+        job.message = "Search stopped." if job.has_current_sequences else "Lookup cancelled."
         job.task.cancel()
         await asyncio.gather(job.task, return_exceptions=True)
     return Response(status_code=204)
