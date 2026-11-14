@@ -159,8 +159,22 @@ form { display: grid; gap: 10px; }
   object-fit: contain;
   background: repeating-conic-gradient(#171717 0% 25%, #242424 0% 50%) 0 0 / 12px 12px;
 }
-.sequence-choice { display: grid; gap: 4px; min-width: 0; }
-.sequence-choice select { width: 100%; min-height: 32px; }
+.exposure-image { position: relative; }
+.motion-markers {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  pointer-events: none;
+  fill: none;
+  stroke: #ffd38c;
+}
+.motion-markers > * { vector-effect: non-scaling-stroke; stroke-width: 1.5px; }
+.motion-markers .current { stroke: #fff; }
+.motion-markers .marker-outline { stroke: #090909; }
+.motion-review, .motion-choice, .sequence-choice { display: grid; gap: 4px; min-width: 0; }
+.motion-choice select, .sequence-choice select { width: 100%; min-height: 32px; }
 .exposure-panel {
   display: grid;
   grid-template-areas: "details" "toolbar";

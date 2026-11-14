@@ -5,7 +5,8 @@ import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
-import { archiveReleases, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease,
+import { MotionMarkers, MotionReview } from './MotionReview';
+import { archiveReleases, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
   type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
 import './styles.css';
 
@@ -98,6 +99,8 @@ function App() {
   const currentFrame = useRef<string | undefined>(undefined);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [markedMotion, setMarkedMotion] = useState<Record<string, MotionCandidate | null>>({});
+  const [motionResults, setMotionResults] = useState<Record<string, MotionResult>>({});
   const requestRef = useRef<AbortController | null>(null);
   const selectionRef = useRef<AbortController | null>(null);
   const drawerToggle = useRef<HTMLButtonElement>(null);
@@ -123,6 +126,10 @@ function App() {
   const workspaceOpen = Boolean(exposure);
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
   const exploratory = result?.mode === 'exploratory';
+  const motionJobId = canPlay && result?.motionAvailable ? result.jobId : undefined;
+  const inspected = motionJobId ? motionResults[motionJobId] ?? result?.motionResult : undefined;
+  const motionMarker = motionJobId && motionJobId in markedMotion
+    ? markedMotion[motionJobId] : inspected?.candidates[0];
 
   useEffect(() => {
     try {
@@ -179,6 +186,8 @@ function App() {
     setStoppingSearch(false);
     setStopError('');
     setManualResults([]);
+    setMarkedMotion({});
+    setMotionResults({});
     const update = (result: SequenceSearch) => {
       if (controller.signal.aborted) return;
       if (result.status !== 'searching') {
@@ -384,6 +393,8 @@ function App() {
     } else {
       setSearch(null);
       setStopError('');
+      setMarkedMotion({});
+      setMotionResults({});
       setManualResults([selection]);
     }
     openSequence(selection);
@@ -404,6 +415,8 @@ function App() {
     setFailedSequence(undefined);
     setStoppingSearch(false);
     setStopError('');
+    setMarkedMotion({});
+    setMotionResults({});
     setPlaying(false);
     setDrawerOpen(true);
     requestAnimationFrame(() => submitAction.current?.focus({ preventScroll: true }));
@@ -579,8 +592,11 @@ function App() {
             <div className="image-stage">
               <div className="exposure-layout">
                 <div className="exposure-frame">
-                  <img className="sky-frame" src={exposure.imageUrl}
-                    alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
+                  <div className="exposure-image">
+                    <img className="sky-frame" src={exposure.imageUrl}
+                      alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
+                    {motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
+                  </div>
                 </div>
                 <aside className="exposure-panel" aria-label="Comparison controls" onKeyDown={(event) => {
                   if (event.key === 'Escape' && detailsOpen) {
@@ -636,6 +652,13 @@ function App() {
                       <div className="exposure-control-row">
                         <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
                       </div>
+                    )}
+                    {motionJobId && <MotionReview key={motionJobId} jobId={motionJobId}
+                      inspected={inspected} selectedCandidate={motionMarker}
+                      onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
+                      onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} />}
+                    {canPlay && !motionJobId && result?.motionUnavailableReason && (
+                      <p className="lookup-status">{result.motionUnavailableReason}</p>
                     )}
                     {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
                     <button ref={detailsAction} className="control details-toggle" type="button"

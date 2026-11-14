@@ -40,6 +40,9 @@ export type PlaybackUpdate = {
   partial: boolean;
   mode?: 'matched' | 'exploratory';
   exposureIssues?: Record<string, ExposureIssue>;
+  motionAvailable?: boolean;
+  motionUnavailableReason?: string;
+  motionResult?: MotionResult;
   jobId?: string;
 };
 
@@ -63,6 +66,22 @@ export function exposureIdentity(exposure: ArchiveExposure) {
 }
 
 export type InventoryUpdate = PlaybackUpdate & { exposures?: InventoryExposure[] };
+export type MotionCandidate = {
+  measurements: { frameIndex: number; skyPosition: [number, number]; imagePosition: [number, number] }[];
+  displacement: number;
+  uncertainty: number;
+  score: number;
+};
+export type MotionResult =
+  | { status: 'inspected'; candidates: MotionCandidate[]; visits: (string | null)[] }
+  | { status: 'rejected' | 'incomplete'; reason: string; candidates: []; visits: (string | null)[] };
+
+export async function inspectMotion(jobId: string, signal: AbortSignal) {
+  return jsonResponse<MotionResult>(
+    await post(`/api/playback/${encodeURIComponent(jobId)}/motion`, {}, signal),
+    'Motion analysis is unavailable for this comparison.',
+  );
+}
 
 export const maxManualFrames = 12;
 

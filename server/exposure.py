@@ -109,7 +109,7 @@ class Raster:
         return self.offset + ((size + 2879) // 2880) * 2880
 
 
-def sky_grid(ra, dec, field_size):
+def sky_projection(ra, dec, field_size):
     degrees = field_size / 60
     count = round(field_size * 60 / 6.15)
     wcs = WCS(naxis=2)
@@ -117,6 +117,11 @@ def sky_grid(ra, dec, field_size):
     wcs.wcs.cdelt = [-degrees / count, degrees / count]
     wcs.wcs.crval = [ra, dec]
     wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    return wcs, count
+
+
+def sky_grid(ra, dec, field_size):
+    wcs, count = sky_projection(ra, dec, field_size)
     rows, columns = np.indices((count, count))
     corners = wcs.all_pix2world(
         [count - .5, -.5, -.5, count - .5], [-.5, -.5, count - .5, count - .5], 0,

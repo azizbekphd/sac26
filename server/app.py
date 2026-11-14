@@ -17,7 +17,8 @@ from .manual import (
     CALIBRATION_BATCH, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
     indexed_visits, render_selection, run_manual,
 )
-from .playback import MAX_FRAMES, PlaybackJob, run_playback
+from .motion import MotionError, analyze, available as motion_available, motion_timeout
+from .playback import MAX_FRAMES, MIN_OVERLAP, PlaybackJob, run_playback
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
@@ -80,6 +81,7 @@ async def lifespan(app):
     async with httpx.AsyncClient(timeout=httpx.Timeout(12, connect=8), limits=limits) as client:
         app.state.archive = client
         app.state.lookups = asyncio.Semaphore(4)
+        app.state.motion = asyncio.Semaphore(1)
         app.state.playback = {}
         app.state.previews = OrderedDict()
         try:
@@ -195,10 +197,60 @@ async def manual_preview(job_id: str, key: str, request: Request):
     return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=1800"})
 
 
+def supports_motion(job):
+    count = len(job.frames)
+    if job.status != "ready" or job.patch is None or not 2 <= count <= MAX_FRAMES:
+        return False
+    if job.mode == "matched":
+        return True
+    overlap = (job.comparison or {}).get("overlap")
+    visits = {frame.get("visit") for frame in job.frames}
+    return (
+        count >= 3 and overlap is not None and overlap >= MIN_OVERLAP - 1e-12
+        and None not in visits and len(visits) == count
+    )
+
+
 @app.get("/api/playback/{job_id}")
 async def playback_status(job_id: str, request: Request, response: Response):
     response.headers["Cache-Control"] = "no-store"
-    return playback_job(request, job_id).snapshot()
+    job = playback_job(request, job_id)
+    count = len(job.frames)
+    motion = supports_motion(job)
+    same_detector = len({frame["detector"] for frame in job.frames}) == 1
+    result = {**job.snapshot(), "motionAvailable": motion and same_detector and motion_available(count)}
+    if motion and not same_detector:
+        result["motionUnavailableReason"] = "Motion analysis needs every exposure to use the same detector."
+    elif motion and not result["motionAvailable"]:
+        result["motionUnavailableReason"] = "The installed motion detector does not support this sequence length."
+    return result
+
+
+@app.post("/api/playback/{job_id}/motion")
+async def playback_motion(job_id: str, request: Request):
+    job = playback_job(request, job_id)
+    if not supports_motion(job):
+        raise HTTPException(409, "Motion analysis needs distinct visits with overlapping wavelength bands.")
+    if len({frame["detector"] for frame in job.frames}) != 1:
+        raise HTTPException(409, "Motion analysis needs every exposure to use the same detector.")
+
+    async def inspect(_deadline):
+        if job.motion_result is None:
+            result = await analyze(job)
+            if result["status"] != "inspected" or any(result.get("visits", [])):
+                return result
+            job.motion_result = result
+        return job.motion_result
+
+    try:
+        return await read_exposure(request, inspect, "This sequence could not be analyzed.",
+                                   timeout=motion_timeout(len(job.frames)) + 5, limit=request.app.state.motion)
+    except MotionError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except HTTPException as exc:
+        if exc.status_code == 504:
+            raise HTTPException(504, "Motion analysis timed out. Try again.") from exc
+        raise
 
 
 @app.get("/api/playback/{job_id}/images/{name}.png")
@@ -225,11 +277,12 @@ async def wait_for_disconnect(request: Request):
         pass
 
 
-async def read_exposure(request, prepare, no_exposure):
-    deadline = asyncio.get_running_loop().time() + 75
+async def read_exposure(request, prepare, no_exposure, *, timeout=75, limit=None):
+    deadline = asyncio.get_running_loop().time() + timeout
+    limit = request.app.state.lookups if limit is None else limit
 
     async def read():
-        async with request.app.state.lookups:
+        async with limit:
             return await prepare(deadline)
 
     lookup = asyncio.create_task(read())

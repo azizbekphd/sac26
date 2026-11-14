@@ -63,6 +63,7 @@ class PlaybackJob:
     filters: ArchiveFilters = ArchiveFilters()
     min_gap: float = 0
     max_gap: float | None = None
+    motion_result: dict | None = None
     sequences: dict[str, "PlaybackJob"] | None = None
     invalid_sequences: set[str] = field(default_factory=set)
 
@@ -104,6 +105,8 @@ class PlaybackJob:
                     used.update(identities)
             snapshot["sequences"] = visible
             snapshot["sequenceCandidates"] = candidates
+        if self.motion_result is not None:
+            snapshot["motionResult"] = self.motion_result
         return snapshot
 
     def image(self, name, png):
