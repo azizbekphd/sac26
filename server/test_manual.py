@@ -1,5 +1,7 @@
 import asyncio
+from base64 import b64decode
 from io import BytesIO
+import struct
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -8,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 from .app import app
-from .exposure import Exposure
+from .exposure import Exposure, ExposurePixels, PixelQuality
 from .manual import render_selection
 from .playback import Center, PlaybackJob, PlaybackSearch
 
@@ -46,7 +48,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                 "startDate": "2026-05-21", "endDate": "2026-05-21", "minWavelength": 1, "maxWavelength": 2,
             }
             with (
-                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=(
+                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=ExposurePixels(
                     np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool), None, (3, 3),
                 ))),
                 patch.object(PlaybackSearch, "center", AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, 1.5, .25))),
@@ -81,7 +83,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
             with (
                 patch.object(PlaybackSearch, "discover", discover),
                 patch.object(PlaybackSearch, "center", AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, 1.5, .25))),
-                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=(
+                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=ExposurePixels(
                     np.ones((3, 3), dtype=np.float32), np.ones((3, 3), dtype=bool), None, (3, 3),
                 ))),
                 patch.object(PlaybackSearch, "field_bandpass", AsyncMock(return_value=(
@@ -118,14 +120,20 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         async def discover(runner):
             yield [last, later, nearby, early], False, True
 
-        image = np.arange(5, dtype=np.float32).reshape(1, 5)
+        image = np.arange(10, dtype=np.float32).reshape(2, 5)
         valid = np.ones(image.shape, dtype=bool)
 
         async def image_pixels(runner, item, *, require_science=False):
             mask = valid.copy()
+            inside = valid.copy()
+            flags = np.zeros(image.shape, dtype=np.uint32)
             if item == nearby:
-                mask[0, 0] = False
-            return image, mask, None, image.shape
+                mask[1, 0] = False
+                flags[1, 0] = 1 << 10
+            if item == later:
+                mask[0, 4] = inside[0, 4] = False
+            quality = PixelQuality(flags, inside, mask, {10: ("HOT", "Noisy detector pixel")})
+            return ExposurePixels(image, mask, None, image.shape, quality)
 
         async def center(runner, item, visit, minimum_area):
             return Center(item, visit, 1.0, .25)
@@ -163,11 +171,22 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(exploratory["mode"], "exploratory")
                     self.assertIn("same visit", exploratory["message"])
                     self.assertEqual([frame["key"] for frame in exploratory["frames"]], [early.key, nearby.key])
+
+                    async def flag_samples(frame):
+                        response = await client.get(frame["flagsUrl"])
+                        response.raise_for_status()
+                        data = response.json()
+                        self.assertEqual((data["height"], data["width"]), image.shape)
+                        self.assertEqual(data["definitions"]["10"], ["HOT", "Noisy detector pixel"])
+                        return list(struct.iter_unpack("<IB", b64decode(data["samples"])))
+
                     alphas = []
                     for frame in exploratory["frames"]:
                         png = await client.get(frame["imageUrl"])
                         alphas.append(np.array(Image.open(BytesIO(png.content)))[0, 0, 1])
                     self.assertEqual(alphas, [255, 0])
+                    self.assertEqual((await flag_samples(exploratory["frames"][0]))[0], (0, 2))
+                    self.assertEqual((await flag_samples(exploratory["frames"][1]))[0], (1 << 10, 1))
                     refused = await client.post(f"/api/playback/{exploratory_id}/image-math", json={
                         "operation": "stack", "keys": [early.key, nearby.key],
                     })
@@ -176,6 +195,8 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                     matched_id, matched = await finish(await client.post(f"{path}/comparison", json={"keys": [last.key, early.key, later.key]}))
                     self.assertEqual(matched["mode"], "matched")
                     self.assertEqual([frame["key"] for frame in matched["frames"]], [early.key, later.key, last.key])
+                    self.assertEqual((await flag_samples(matched["frames"][0]))[-1], (0, 3))
+                    self.assertEqual((await flag_samples(matched["frames"][1]))[-1], (0, 0))
                     stack = await client.post(f"/api/playback/{matched_id}/image-math", json={
                         "operation": "stack", "keys": [early.key, later.key, last.key],
                     })
@@ -194,7 +215,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                 mask[0, 0] = False
             if item == last:
                 mask[0, 1] = False
-            return image, mask, None, image.shape
+            return ExposurePixels(image, mask, None, image.shape)
 
         runner.image_pixels = AsyncMock(side_effect=frame)
         runner.center = AsyncMock(side_effect=lambda item, visit, **_: Center(item, visit, 1, .25))
@@ -217,7 +238,7 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
         async def pixels(_, item, *_args, **_kwargs):
             if item.key in (nearby.key, last.key):
                 return None
-            return image, np.ones(image.shape, dtype=bool), None, image.shape
+            return ExposurePixels(image, np.ones(image.shape, dtype=bool), None, image.shape)
 
         runner.center = AsyncMock(return_value=None)
         with (

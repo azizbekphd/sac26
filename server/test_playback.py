@@ -11,7 +11,8 @@ from PIL import Image
 
 from .app import app
 from .exposure import (
-    ArchiveFilters, QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, render_png, rows, search,
+    ArchiveFilters, QUALITY_MASK, Exposure, ExposurePixels, Raster, calibration_key,
+    exposure_metadata, exposure_pixels, render_png, rows, search,
 )
 from .playback import (
     Center, PlaybackJob, PlaybackSearch, ProjectedExposure, bandpass_overlap, group_visits,
@@ -32,25 +33,31 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         pixels = np.array([[0, 8, 16, 24], [4, 12, 20, 28], [8, np.nan, 24, 32]])
         flags = np.zeros_like(pixels, dtype=np.int32)
         flags[0, 2] = QUALITY_MASK
+        flags[1, 0] = 1 << 21
+        flags[1, 1] = 1
         world = (
             np.array([[.25, 1.5, 3, -.1, .5, 1]]),
             np.array([[.5, .5, 2, 0, 1.5, 0]]),
         )
         science = Raster(fits.ImageHDU(pixels).header, 0)
+        quality = Raster(fits.Header({"MSKN0021": "SOURCE", "MSKD0021": "Known source"}), 0)
         with (
             patch("server.exposure.WCS") as wcs,
-            patch("server.exposure.raster", return_value=object()),
+            patch("server.exposure.raster", return_value=quality),
             patch("server.exposure.rows", side_effect=[pixels, flags]),
         ):
             wcs.return_value.all_world2pix.return_value = world
-            image, valid, _, _ = await exposure_pixels(
-                None, exposure("frame", 60000), world, 0, science=science, bilinear=True,
+            frame = await exposure_pixels(
+                None, exposure("frame", 60000), world, 0, science=science, bilinear=True, keep_flags=True,
             )
 
         # A flagged contributor, nonfinite contributor, and off-detector sample
         # stay masked. A flagged neighbor with zero weight leaves the sample valid.
-        np.testing.assert_array_equal(valid, [[True, False, True, False, False, True]])
-        np.testing.assert_allclose(image[valid], [4, 32, 8])
+        np.testing.assert_array_equal(frame.valid, [[True, False, True, False, False, True]])
+        np.testing.assert_allclose(frame.image[frame.valid], [4, 32, 8])
+        np.testing.assert_array_equal(frame.quality.flags, [[(1 << 21) | 1, QUALITY_MASK | 1, 0, 0, (1 << 21) | 1, 0]])
+        np.testing.assert_array_equal(frame.quality.inside, [[True, True, True, False, True, True]])
+        self.assertEqual(frame.quality.definitions, {21: ("SOURCE", "Known source")})
 
     async def test_compact_metadata_handles_archive_csv_with_unquoted_cloud_json(self):
         key = "dr1/level2/2025W18_1B/l2b-v27-2026-196/3/level2_2025W18_1B_0081_2D3_spx_l2b-v27-2026-196.fits"
@@ -373,7 +380,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             patch("server.playback.ARCHIVE_FALLBACK_SECONDS", 0),
             patch("server.playback.search", query),
             patch("server.playback.raster", AsyncMock(return_value=object())),
-            patch("server.playback.exposure_pixels", AsyncMock(return_value=(values, values > 0, None, values.shape))),
+            patch("server.playback.exposure_pixels", AsyncMock(return_value=ExposurePixels(values, values > 0, None, values.shape))),
         ):
             task = asyncio.create_task(runner.run())
             try:
@@ -454,7 +461,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             b.exposure.key: (np.full(image.shape, b.wavelength), np.full(image.shape, b.bandwidth)),
         }
         runner = PlaybackSearch(None, PlaybackJob("test", sequences={}), 0, 0, 6)
-        runner.image = AsyncMock(side_effect=lambda item: (
+        runner.image = AsyncMock(side_effect=lambda item: ExposurePixels(
             image if item == a.exposure else image + 10,
             center_masked if item == a.exposure else all_valid, item.key, image.shape,
         ))
@@ -543,7 +550,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         for index, mask in enumerate(masks):
             mask[0, index] = False
         runner = PlaybackSearch(None, PlaybackJob("test"), 0, 0, 6)
-        runner.image = AsyncMock(side_effect=lambda item: (image, masks["abc".index(item.key)], None, image.shape))
+        runner.image = AsyncMock(side_effect=lambda item: ExposurePixels(image, masks["abc".index(item.key)], None, image.shape))
         runner.field_bandpass = AsyncMock(return_value=(image, image * .25))
         self.assertIsNotNone(await runner.match(items[:2], 1))
         self.assertIsNotNone(await runner.match(items[1:], 1))
@@ -588,7 +595,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("server.playback.search", AsyncMock(return_value=([newest, oldest], False))),
             patch("server.playback.raster", AsyncMock(return_value=object())),
-            patch("server.playback.exposure_pixels", AsyncMock(return_value=(values, valid, None, values.shape))),
+            patch("server.playback.exposure_pixels", AsyncMock(return_value=ExposurePixels(values, valid, None, values.shape))),
         ):
             task = asyncio.create_task(runner.run())
             try:

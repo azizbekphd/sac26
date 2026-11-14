@@ -16,7 +16,7 @@ import httpx
 import numpy as np
 
 from .exposure import (
-    ArchiveError, ArchiveFilters, Exposure, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
+    ArchiveError, ArchiveFilters, Exposure, PixelQuality, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
     exposure_pixels, interpolate_pixels, raster, render_difference_png, render_png, rows, search, sky_grid,
 )
 
@@ -53,6 +53,7 @@ class ProjectedExposure:
     image: np.ndarray
     valid: np.ndarray
     bandpass: tuple[np.ndarray, np.ndarray]
+    quality: PixelQuality | None = None
 
 
 @dataclass
@@ -67,6 +68,7 @@ class PlaybackJob:
     task: asyncio.Task | None = None
     touched: float = field(default_factory=monotonic)
     images: dict[str, bytes] = field(default_factory=dict)
+    pixel_flags: dict[str, tuple[PixelQuality, np.ndarray]] = field(default_factory=dict)
     projected: dict[str, ProjectedExposure] = field(default_factory=dict)
     records: tuple[Exposure, ...] = ()
     patch: tuple[float, float, int] | None = None
@@ -125,9 +127,14 @@ class PlaybackJob:
             snapshot["motionResult"] = self.motion_result
         return snapshot
 
-    def image(self, name, png):
-        self.images[name] = png
-        return f"/api/playback/{self.id}/images/{name}.png"
+    def exposure_image(self, name, image, valid, quality, stretch=None):
+        self.images[name] = render_png(image, valid, stretch)
+        base = f"/api/playback/{self.id}"
+        urls = {"imageUrl": f"{base}/images/{name}.png"}
+        if quality is not None:
+            self.pixel_flags[name] = quality, valid
+            urls["flagsUrl"] = f"{base}/flags/{name}"
+        return urls
 
 
 def group_visits(exposures):
@@ -243,10 +250,10 @@ def render_image_math(projected, operation):
 
 
 def publish_frames(job, frames):
-    stretch = np.percentile(np.concatenate([image[valid] for _, image, valid in frames]), [1, 99.5])
+    stretch = np.percentile(np.concatenate([image[valid] for _, image, valid, _ in frames]), [1, 99.5])
     job.frames = [
-        {**metadata, "imageUrl": job.image(f"frame-{index}", render_png(image, valid, stretch))}
-        for index, (metadata, image, valid) in enumerate(frames)
+        {**metadata, **job.exposure_image(f"frame-{index}", image, valid, quality, stretch)}
+        for index, (metadata, image, valid, quality) in enumerate(frames)
     ]
 
 
@@ -354,12 +361,12 @@ class PlaybackSearch:
             if require_science:
                 raise ArchiveError("Could not read the science image header.")
             return None
-        return await exposure_pixels(self.client, item, self.world, 0, science=science, bilinear=True)
+        return await exposure_pixels(self.client, item, self.world, 0, science=science, bilinear=True, keep_flags=True)
 
     async def image(self, item):
         pixels = await self.image_pixels(item)
         if pixels is not None and self.job.preview is None:
-            image, valid, _, _ = pixels
+            valid = pixels.valid
             self.preview_key = item.key
             center = self.reads.get(("center", item.key))
             center = center.result() if center is not None and center.done() else None
@@ -367,7 +374,7 @@ class PlaybackSearch:
                 **exposure_metadata(item, center.wavelength if center else None, float(valid.mean())),
                 "bandwidth": center.bandwidth if center else None,
                 "visitDates": self.visit_dates.get(item.key),
-                "imageUrl": self.job.image("preview", render_png(image, valid)),
+                **self.job.exposure_image("preview", pixels.image, valid, pixels.quality),
             }
             self.job.message = "Looking for matched visits…"
         return pixels
@@ -395,13 +402,12 @@ class PlaybackSearch:
         ))
         if any(result is None for result in pixels):
             return None
-        images, masks, _, _ = zip(*pixels)
-        valid = np.logical_and.reduce(masks)
+        valid = np.logical_and.reduce([frame.valid for frame in pixels])
         if valid.mean() < MIN_AREA:
             return None
         bands = await asyncio.gather(*(
-            self.read(("field bandpass", center.exposure.key), self.field_bandpass, center.exposure, wcs, shape)
-            for center, (_, _, wcs, shape) in zip(items, pixels)
+            self.read(("field bandpass", center.exposure.key), self.field_bandpass, center.exposure, frame.wcs, frame.shape)
+            for center, frame in zip(items, pixels)
         ))
         if any(band is None for band in bands):
             return None
@@ -410,8 +416,8 @@ class PlaybackSearch:
         if coverage < MIN_AREA:
             return None
         projected = tuple(
-            ProjectedExposure(image, mask, tuple(bandpass))
-            for image, mask, bandpass in zip(images, masks, bands)
+            ProjectedExposure(frame.image, frame.valid, tuple(bandpass), frame.quality)
+            for frame, bandpass in zip(pixels, bands)
         )
         return items, projected, valid, overlap, coverage
 
@@ -558,7 +564,7 @@ class PlaybackSearch:
         publish_frames(child, [
             ({**exposure_metadata(center.exposure, center.wavelength, coverage),
               "bandwidth": center.bandwidth, "visit": center.visit,
-              "visitDates": self.visit_dates.get(center.exposure.key)}, frame.image, valid)
+              "visitDates": self.visit_dates.get(center.exposure.key)}, frame.image, valid, frame.quality)
             for center, frame in zip(items, projected)
         ])
         child.comparison = {

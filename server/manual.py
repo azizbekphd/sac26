@@ -63,8 +63,7 @@ async def exposure_preview(client, patch, item):
     pixels = await exposure_pixels(client, item, world, 0, bilinear=True)
     if pixels is None:
         raise NoExposure
-    image, valid, _, _ = pixels
-    return render_png(image, valid)
+    return render_png(pixels.image, pixels.valid)
 
 
 async def render_selection(runner, selected, *, archive_visit_dates=None):
@@ -98,7 +97,7 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
         job.message = "Review the marked exposures in your selection."
         return
 
-    images, masks, _, _ = zip(*pixels)
+    masks = [frame.valid for frame in pixels]
     shared = np.logical_and.reduce(masks)
     coverage = float(shared.mean())
     reasons = []
@@ -122,7 +121,7 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
             bands = []
             for batch in batches(tuple(zip(selected, pixels)), 4):
                 bands.extend(await asyncio.gather(*(
-                    runner.field_bandpass(item, wcs, shape) for (item, _), (_, _, wcs, shape) in batch
+                    runner.field_bandpass(item, frame.wcs, frame.shape) for (item, _), frame in batch
                 )))
             if any(band is None for band in bands):
                 reasons.append("Could not verify bandpass overlap across the patch.")
@@ -136,16 +135,16 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
                     )
                 else:
                     job.projected = {
-                        item.key: ProjectedExposure(image, mask, tuple(bandpass))
-                        for (item, _), image, mask, bandpass in zip(selected, images, masks, bands)
+                        item.key: ProjectedExposure(frame.image, frame.valid, tuple(bandpass), frame.quality)
+                        for (item, _), frame, bandpass in zip(selected, pixels, bands)
                     }
 
     display_masks = masks if reasons else [shared] * len(masks)
     publish_frames(job, [
-        ({**exposure_metadata(item, center.wavelength if center else None, float(mask.mean())),
+        ({**exposure_metadata(item, center.wavelength if center else None, float(frame.valid.mean())),
           "bandwidth": center.bandwidth if center else None, "visit": visit,
-          "visitDates": (archive_visit_dates or {}).get(item.key)}, image, display_mask)
-        for (item, visit), center, image, mask, display_mask in zip(selected, centers, images, masks, display_masks)
+          "visitDates": (archive_visit_dates or {}).get(item.key)}, frame.image, display_mask, frame.quality)
+        for (item, visit), center, frame, display_mask in zip(selected, centers, pixels, display_masks)
     ])
     job.mode = "exploratory" if reasons else "matched"
     job.comparison = {

@@ -109,6 +109,38 @@ class Raster:
         return self.offset + ((size + 2879) // 2880) * 2880
 
 
+@dataclass(frozen=True)
+class PixelQuality:
+    flags: np.ndarray
+    inside: np.ndarray
+    usable: np.ndarray
+    definitions: dict[int, tuple[str, str]]
+
+    def inspect(self, displayed):
+        # Each sample has four little-endian flag bytes followed by its coverage state.
+        samples = np.empty(self.flags.shape, dtype=[("flags", "<u4"), ("status", "u1")])
+        samples["flags"] = self.flags
+        status = samples["status"]
+        status.fill(0)  # Outside the detector.
+        status[self.inside] = 1  # Masked in this exposure.
+        status[self.usable] = 3  # Masked by the shared comparison footprint.
+        status[displayed] = 2  # Visible in the frame.
+        height, width = samples.shape
+        return {
+            "width": width, "height": height, "definitions": self.definitions,
+            "samples": b64encode(samples[::-1].tobytes()).decode("ascii"),
+        }
+
+
+@dataclass(frozen=True)
+class ExposurePixels:
+    image: np.ndarray
+    valid: np.ndarray
+    wcs: WCS
+    shape: tuple[int, int]
+    quality: PixelQuality | None = None
+
+
 def sky_projection(ra, dec, field_size):
     degrees = field_size / 60
     count = round(field_size * 60 / 6.15)
@@ -424,7 +456,7 @@ def interpolate_pixels(values, usable, weights):
     return np.sum(np.where(usable, values, 0) * weights, axis=0), valid
 
 
-async def exposure_pixels(client, exposure, world, minimum_coverage, *, science=None, bilinear=False):
+async def exposure_pixels(client, exposure, world, minimum_coverage, *, science=None, bilinear=False, keep_flags=False):
     if science is None:
         science = await raster(client, exposure.key, 0, "IMAGE")
     wcs = WCS(science.header, naxis=2)
@@ -449,7 +481,16 @@ async def exposure_pixels(client, exposure, world, minimum_coverage, *, science=
 
     image = np.zeros(inside.shape, dtype=np.float32)
     image[inside] = values
-    return image, valid, wcs, science.shape
+    pixel_quality = None
+    if keep_flags:
+        projected = np.zeros(inside.shape, dtype=np.uint32)
+        projected[inside] = np.bitwise_or.reduce(np.where(weights > 0, quality, 0), axis=0) if bilinear else quality
+        definitions = {
+            bit: (name, str(flags.header.get(f"MSKD{bit:04d}", "")))
+            for bit in range(32) if isinstance(name := flags.header.get(f"MSKN{bit:04d}"), str)
+        }
+        pixel_quality = PixelQuality(projected, inside, valid, definitions)
+    return ExposurePixels(image, valid, wcs, science.shape, pixel_quality)
 
 
 def exposure_metadata(exposure, wavelength, coverage):
@@ -482,7 +523,7 @@ async def find_exposure(client, ra, dec, field_size, *, deadline, filters=Archiv
                     continue
                 if result is not None:
                     best = exposure, result
-                    coverage = float(result[1].mean())
+                    coverage = float(result.valid.mean())
                     if coverage >= .98:
                         break
     except TimeoutError:
@@ -493,13 +534,13 @@ async def find_exposure(client, ra, dec, field_size, *, deadline, filters=Archiv
             raise ArchiveError("Could not verify a usable exposure for this patch. Try again or choose a smaller field.")
         raise NoExposure
 
-    exposure, (image, valid, wcs, shape) = best
+    exposure, pixels = best
     try:
         async with asyncio.timeout(WAVELENGTH_TIMEOUT):
-            wavelength = await center_wavelength(client, exposure, wcs, ra, dec, shape)
+            wavelength = await center_wavelength(client, exposure, pixels.wcs, ra, dec, pixels.shape)
     except (TimeoutError, ArchiveError, httpx.HTTPError, OSError, ValueError, KeyError):
         wavelength = None
     return {
-        "image": b64encode(render_png(image, valid)).decode("ascii"),
+        "image": b64encode(render_png(pixels.image, pixels.valid)).decode("ascii"),
         **exposure_metadata(exposure, wavelength, coverage),
     }

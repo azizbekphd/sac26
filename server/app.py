@@ -371,6 +371,16 @@ async def playback_image(job_id: str, name: str, request: Request):
     return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=1800"})
 
 
+@app.get("/api/playback/{job_id}/flags/{name}")
+async def playback_flags(job_id: str, name: str, request: Request, response: Response):
+    entry = playback_job(request, job_id).pixel_flags.get(name)
+    if entry is None:
+        raise HTTPException(404, "Pixel flags are unavailable for this exposure.")
+    quality, displayed = entry
+    response.headers["Cache-Control"] = "private, max-age=1800"
+    return quality.inspect(displayed)
+
+
 @app.delete("/api/playback/{job_id}", status_code=204)
 async def cancel_playback(job_id: str, request: Request):
     job = request.app.state.playback.get(job_id)
