@@ -14,7 +14,7 @@ import numpy as np
 from .app import app
 from .exposure import Exposure
 from .motion import DetectorResult, MotionError, analyze, format_result
-from .motion_adapter import Rejected, validate_request
+from .motion_adapter import Rejected, inspect, validate_request
 from .playback import Center, PlaybackJob, PlaybackSearch
 
 PATCH = (133.759875, -7.24225, 6)
@@ -51,8 +51,12 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(detector=detector):
                 validate_request(request(frame(detector, 1, earlier), frame(detector, 2, later)))
 
-        with self.assertRaisesRegex(Rejected, "frames_must_have_same_detector"):
-            validate_request(request(frame(3, 1, earlier), frame(4, 2, later)))
+        mixed = request(frame(3, 1, earlier), frame(4, 1, earlier))
+        self.assertEqual([item["visit"] for item in validate_request(mixed)[3]], [1, 1])
+        with self.assertRaisesRegex(Rejected, "insufficient_independent_visits"):
+            inspect(mixed, cache_dir=None, offline=True)
+        with self.assertRaisesRegex(Rejected, "duplicate_detector_exposure"):
+            validate_request(request(frame(3, 1, earlier), frame(3, 1, earlier)))
         with self.assertRaisesRegex(Rejected, "frame_key_identity_mismatch"):
             validate_request(request(frame(3, 1, earlier), {**frame(3, 2, later), "detector": 4}))
         with self.assertRaisesRegex(Rejected, "unsupported_detector"):
@@ -62,6 +66,8 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
         sequence = [frame(3, i + 1, (start + timedelta(hours=i)).isoformat()) for i in range(13)]
         payload = {"ra": PATCH[0], "dec": PATCH[1], "fieldSize": 6}
         self.assertEqual(len(validate_request({**payload, "frames": sequence[:12]})[3]), 12)
+        grouped = validate_request({**payload, "frames": sequence[:4], "visits": [1, 1, 3, 4]})[3]
+        self.assertEqual([item["visit"] for item in grouped], [1, 1, 3, 4])
         with self.assertRaisesRegex(Rejected, "two_to_twelve_frames_required"):
             validate_request({**payload, "frames": sequence})
         with self.assertRaisesRegex(Rejected, "frames_must_be_chronological"):
@@ -113,15 +119,10 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
         ):
-            job = PlaybackJob("test", status="ready", patch=PATCH, frames=frames(), mode="exploratory")
+            job = PlaybackJob("test", status="ready", patch=PATCH, frames=frames(), mode="matched")
             job.frames.append({**job.frames[0], "observedAt": "2026-06-01T00:00:00Z"})
             app.state.playback[job.id] = job
             path = f"/api/playback/{job.id}/motion"
-            self.assertEqual((await client.post(path)).status_code, 409)
-            job.mode = "matched"
-            job.frames[-1]["detector"] = 3
-            self.assertEqual((await client.post(path)).status_code, 409)
-            job.frames[-1]["detector"] = 5
             incomplete = {"status": "incomplete", "candidates": [], "visits": [None, None, "error"]}
             with patch("server.app.analyze", AsyncMock(return_value=incomplete)):
                 self.assertEqual((await client.post(path)).json(), incomplete)
@@ -134,31 +135,31 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.json(), empty)
                 detector.assert_awaited_once_with(job)
 
-    async def test_low_shared_coverage_allows_motion_with_distinct_comparable_visits(self):
+    async def test_exploratory_playback_offers_motion_for_any_frame_selection(self):
         async with (
             app.router.lifespan_context(app),
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
         ):
-            exposures = [*frames(), {**frames()[0], "observationId": "third"}]
-            for i, frame in enumerate(exposures, 1):
-                frame["visit"] = i
-            job = PlaybackJob("low-coverage", status="ready", patch=PATCH, frames=exposures,
-                              mode="exploratory", comparison={"overlap": .98, "coverage": .789})
-            app.state.playback[job.id] = job
-            path = f"/api/playback/{job.id}"
-            result = {"status": "inspected", "candidates": [], "visits": [None] * 3}
-            with (
-                patch("server.app.motion_available", return_value=True),
-                patch("server.app.analyze", AsyncMock(return_value=result)) as detector,
-            ):
-                self.assertTrue((await client.get(path)).json()["motionAvailable"])
-                self.assertEqual((await client.post(path + "/motion")).json(), result)
-                job.frames[-1]["visit"] = 2
-                self.assertEqual((await client.post(path + "/motion")).status_code, 409)
-                job.frames[-1]["visit"] = 3
-                job.comparison["overlap"] = .6
-                self.assertEqual((await client.post(path + "/motion")).status_code, 409)
-                detector.assert_awaited_once_with(job)
+            for visits in ([1, 2], [1, 1], [1, 1, 2, 3], list(range(1, 13))):
+                with self.subTest(visits=visits):
+                    exposures = [
+                        {**frames()[i % 2], "visit": visit, "detector": 2 + i % 2}
+                        for i, visit in enumerate(visits)
+                    ]
+                    job = PlaybackJob("explore", status="ready", patch=PATCH, frames=exposures,
+                                      mode="exploratory", comparison={"overlap": .60, "coverage": .40})
+                    app.state.playback[job.id] = job
+                    path = f"/api/playback/{job.id}"
+                    result = {"status": "inspected", "candidates": [], "visits": [None] * len(visits)}
+                    if len(set(visits)) == 1:
+                        result.update(status="rejected", reason="Motion analysis needs 2 distinct visits.")
+                    with (
+                        patch("server.app.motion_available", return_value=True),
+                        patch("server.app.analyze", AsyncMock(return_value=result)) as detector,
+                    ):
+                        self.assertTrue((await client.get(path)).json()["motionAvailable"])
+                        self.assertEqual((await client.post(path + "/motion")).json(), result)
+                        detector.assert_awaited_once_with(job)
 
     def test_track_measurements_use_original_visit_indices(self):
         result = DetectorResult.model_validate({
@@ -202,6 +203,19 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(displacement, np.hypot(.14, .08) * times[-1])
         self.assertGreater(uncertainty, 0)
         self.assertEqual(list(link_tracks([[source(8, 8)] for _ in times], times, corroborates_motion=accepts)), [])
+
+    @unittest.skipUnless(find_spec("scipy"), "Sequence motion needs the installed detector dependencies")
+    def test_tracks_count_at_most_one_measurement_per_visit(self):
+        from .motion_tracks import link_tracks
+
+        times = [0, 2, 2, 5]
+        catalogs = [[{"point": np.array([10 + time * .3, 10]), "cov": np.eye(2) * .05**2, "band": (4.33, .05)}]
+                    for time in times]
+        accepts = lambda epochs, sources: True
+        tracks = list(link_tracks(catalogs, times, visits=[1, 2, 2, 3], corroborates_motion=accepts))
+        track, = tracks
+        self.assertIn(track[0], ([0, 1, 3], [0, 2, 3]))
+        self.assertEqual(list(link_tracks(catalogs, times, visits=[1, 2, 2, 2], corroborates_motion=accepts)), [])
 
     @unittest.skipUnless(find_spec("scipy"), "Sequence motion needs the installed detector dependencies")
     def test_rejected_false_track_does_not_claim_detections(self):

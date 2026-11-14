@@ -1,8 +1,8 @@
-"""Run the local motion detector on the exact matched playback sequence.
+"""Run the local motion detector on the exact playback sequence.
 
 Install the validated detector bundle under the app's Python environment, or
 set SPHEREX_MOTION_COMMAND to the path of another installed adapter.
-it reads one JSON object from stdin with ra, dec, fieldSize and ordered
+It reads one JSON object from stdin with ra, dec, fieldSize and ordered
 archive frames, and writes one DetectorResult JSON object to stdout.
 """
 
@@ -92,6 +92,11 @@ def format_result(report, patch, frame_count=2):
             "unsupported_pipeline_expected_7_0_5": "This sequence uses an unsupported pipeline version.",
             "playback_bandpass_or_shared_area_gate": "The detector found too little shared usable area or wavelength overlap.",
             "sequence_bandpass_gate": "The detector found too little wavelength overlap across the visits.",
+            "no_comparable_pixels": "The exposures have no shared usable pixels with comparable wavelengths.",
+            "insufficient_independent_visits": (
+                f"Motion analysis for this sequence needs {2 if frame_count == 2 else 3} distinct visits."
+            ),
+            "frames_must_be_chronological_distinct_visits": "Motion analysis needs exposures from distinct visits.",
             "registration_unconstrained": "The detector could not align the visits reliably enough to measure motion.",
             "native_frames_not_chronological_distinct_visits": "The archive timestamps do not resolve these exposures into distinct visits.",
             "insufficient_usable_visits": "Fewer than three visits could be evaluated. Try again or edit the exposures.",
@@ -148,6 +153,8 @@ async def analyze(job):
             for frame in job.frames
         ],
     }
+    if command[1:] == ("-m", "server.motion_adapter") and all("visit" in frame for frame in job.frames):
+        payload["visits"] = [frame["visit"] for frame in job.frames]
     try:
         proc = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,

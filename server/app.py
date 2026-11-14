@@ -18,7 +18,7 @@ from .manual import (
     indexed_visits, render_selection, run_manual,
 )
 from .motion import MotionError, analyze, available as motion_available, motion_timeout
-from .playback import MAX_FRAMES, MIN_OVERLAP, PlaybackJob, run_playback
+from .playback import MAX_FRAMES, PlaybackJob, run_playback
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
@@ -198,17 +198,7 @@ async def manual_preview(job_id: str, key: str, request: Request):
 
 
 def supports_motion(job):
-    count = len(job.frames)
-    if job.status != "ready" or job.patch is None or not 2 <= count <= MAX_FRAMES:
-        return False
-    if job.mode == "matched":
-        return True
-    overlap = (job.comparison or {}).get("overlap")
-    visits = {frame.get("visit") for frame in job.frames}
-    return (
-        count >= 3 and overlap is not None and overlap >= MIN_OVERLAP - 1e-12
-        and None not in visits and len(visits) == count
-    )
+    return job.status == "ready" and job.patch is not None and 2 <= len(job.frames) <= MAX_FRAMES
 
 
 @app.get("/api/playback/{job_id}")
@@ -217,11 +207,8 @@ async def playback_status(job_id: str, request: Request, response: Response):
     job = playback_job(request, job_id)
     count = len(job.frames)
     motion = supports_motion(job)
-    same_detector = len({frame["detector"] for frame in job.frames}) == 1
-    result = {**job.snapshot(), "motionAvailable": motion and same_detector and motion_available(count)}
-    if motion and not same_detector:
-        result["motionUnavailableReason"] = "Motion analysis needs every exposure to use the same detector."
-    elif motion and not result["motionAvailable"]:
+    result = {**job.snapshot(), "motionAvailable": motion and motion_available(count)}
+    if motion and not result["motionAvailable"]:
         result["motionUnavailableReason"] = "The installed motion detector does not support this sequence length."
     return result
 
@@ -230,9 +217,7 @@ async def playback_status(job_id: str, request: Request, response: Response):
 async def playback_motion(job_id: str, request: Request):
     job = playback_job(request, job_id)
     if not supports_motion(job):
-        raise HTTPException(409, "Motion analysis needs distinct visits with overlapping wavelength bands.")
-    if len({frame["detector"] for frame in job.frames}) != 1:
-        raise HTTPException(409, "Motion analysis needs every exposure to use the same detector.")
+        raise HTTPException(409, "Open a playable sequence before checking for motion.")
 
     async def inspect(_deadline):
         if job.motion_result is None:

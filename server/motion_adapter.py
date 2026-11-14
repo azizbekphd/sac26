@@ -101,7 +101,8 @@ def utc_date(value):
 def validate_request(request):
     require(isinstance(request, dict), "expected_json_object")
     require(
-        set(request) == {"ra", "dec", "fieldSize", "frames"},
+        {"ra", "dec", "fieldSize", "frames"} <= request.keys()
+        and request.keys() <= {"ra", "dec", "fieldSize", "frames", "visits"},
         "unsupported_request_fields",
     )
     ra, dec, size = map(number, [request["ra"], request["dec"], request["fieldSize"]])
@@ -169,17 +170,27 @@ def validate_request(request):
             )
         )
     require(
-        len({frame["detector"] for frame in frames}) == 1, "frames_must_have_same_detector"
+        len({(frame["observationId"], frame["detector"]) for frame in frames}) == len(frames),
+        "duplicate_detector_exposure",
     )
     require(
-        len({frame["observationId"] for frame in frames}) == len(frames),
-        "duplicate_observation",
+        all(earlier["date"] <= later["date"] for earlier, later in pairwise(validated)),
+        "frames_must_be_chronological",
     )
-    require(
-        all((later["date"] - earlier["date"]).total_seconds() > 600
-            for earlier, later in pairwise(validated)),
-        "frames_must_be_chronological_distinct_visits",
-    )
+    if "visits" in request:
+        visits = request["visits"]
+        require(
+            isinstance(visits, list) and len(visits) == len(frames)
+            and all(type(visit) is int and visit >= 1 for visit in visits)
+            and visits == sorted(visits),
+            "invalid_visit_groups",
+        )
+    else:
+        visits = [1]
+        for earlier, later in pairwise(validated):
+            visits.append(visits[-1] + ((later["date"] - earlier["date"]).total_seconds() > 600))
+    for item, visit in zip(validated, visits):
+        item["visit"] = visit
     return ra, dec, size, validated
 
 
@@ -208,19 +219,17 @@ def sequence_catalog(exposure, grid, shape, shift, cache):
     return sources
 
 
-def inspect_tracks(exposures, grid, shape, issues):
+def inspect_tracks(exposures, visits, grid, shape, issues):
     import numpy as np
     from frozen_revised.baseline import local_check, register
     from frozen_revised.proposals import FitCache, forced_signed_amplitudes
     from .motion_tracks import link_tracks
 
     available = [(index, exp) for index, exp in enumerate(exposures) if exp is not None]
-    if len(available) < 3:
-        return dict(status="incomplete", reason="insufficient_usable_visits", candidates=[], visits=issues)
-
-    # Prefer the first available reference when it covers all usable visits.
-    # Otherwise try other references and retain the one with the most coverage.
+    # Prefer the first reference that aligns every exposure. Otherwise keep
+    # the reference that aligns the most visits, then the most exposures.
     best = {}
+    best_rank = (0, 0)
     for reference, base in available:
         registrations = {reference: (np.zeros(2), np.zeros((2, 2)))}
         for index, exp in available:
@@ -229,8 +238,10 @@ def inspect_tracks(exposures, grid, shape, issues):
                 if result["ok"]:
                     registrations[index] = (np.asarray(result["shift_pixels"]),
                                             np.asarray(result["scatter_cov_pixels"]))
-        if len(registrations) > len(best):
+        rank = (len({visits[index] for index in registrations}), len(registrations))
+        if rank > best_rank:
             best = registrations
+            best_rank = rank
         if len(best) == len(available):
             break
 
@@ -264,7 +275,8 @@ def inspect_tracks(exposures, grid, shape, issues):
         catalogs.append(sources)
         times.append(float(exp.header["MJD-AVG"]))
 
-    if len(indices) < 3:
+    groups = [visits[index] for index in indices]
+    if len(set(groups)) < 3:
         return dict(status="incomplete", reason="insufficient_usable_visits", candidates=[], visits=issues)
 
     def corroborates_motion(epochs, sources):
@@ -286,7 +298,7 @@ def inspect_tracks(exposures, grid, shape, issues):
 
     scale = abs(grid.wcs.cdelt[0]) * 3600
     candidates = []
-    tracks = link_tracks(catalogs, times, corroborates_motion=corroborates_motion)
+    tracks = link_tracks(catalogs, times, visits=groups, corroborates_motion=corroborates_motion)
     for epochs, sources, displacement, uncertainty, score in islice(tracks, 100):
         measurements = []
         for epoch, source in zip(epochs, sources):
@@ -300,6 +312,9 @@ def inspect_tracks(exposures, grid, shape, issues):
 
 def inspect(request, cache_dir, offline=False, diagnostics=None):
     ra, dec, size, frames = validate_request(request)
+    visits = [item["visit"] for item in frames]
+    minimum_visits = min(len(frames), 3)
+    require(len(set(visits)) >= minimum_visits, "insufficient_independent_visits")
     verify_frozen()
     sys.path.insert(0, str(ROOT))
     import numpy as np
@@ -347,9 +362,9 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
         det = frame["detector"]
         release = frame["release"]
         calibration_url = f"{S3_ROOT}{release}/spectral_wcs/{CAL_VERSION}/{det}/spectral_wcs_D{det}_spx_{CAL_VERSION}.fits"
-        if release not in calibrations:
+        if (release, det) not in calibrations:
             cp = archive.get(calibration_url, ".fits")
-            calibrations[release] = SpectralCalibration.read(cp, calibration_url)
+            calibrations[release, det] = SpectralCalibration.read(cp, calibration_url)
         row = {
             "cloud_access": json.dumps(
                 {
@@ -371,7 +386,7 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
                 str(hdus[0].header.get("VERSION")) == "7.0.5",
                 "unsupported_pipeline_expected_7_0_5",
             )
-        exp = Exposure.read(path, calibrations[release], url)
+        exp = Exposure.read(path, calibrations[release, det], url)
         require(
             exp.header.get("OBSID") == frame["observationId"]
             and int(exp.header.get("DETECTOR", 0)) == det,
@@ -414,44 +429,31 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
                 raise
             exposures.append(None)
             issues.append(str(exc) if isinstance(exc, Rejected) else "archive_or_calibration_unavailable")
-    usable = [exp for exp in exposures if exp is not None]
+    usable = [(visit, exp) for visit, exp in zip(visits, exposures) if exp is not None]
     require(
-        all((later.header["MJD-AVG"] - earlier.header["MJD-AVG"]) * 86400 > 600
-            for earlier, later in pairwise(usable)),
+        all(later.header["MJD-AVG"] > earlier.header["MJD-AVG"]
+            for (before, earlier), (after, later) in pairwise(usable) if before != after),
         "native_frames_not_chronological_distinct_visits",
     )
     grid, count = sky_projection(ra, dec, size)
     shape = (count, count)
     if len(frames) > 2:
-        from .playback import common_overlap
-
-        if len(usable) < 3:
+        if len({visit for visit, _ in usable}) < 3:
             return dict(status="incomplete", reason="insufficient_usable_visits", candidates=[], visits=issues)
-        bands = [exp.bandpass(*exp.wcs.world_to_pixel_values(ra, dec)) for exp in usable]
-        require(common_overlap(bands) >= MIN_LOCAL_OVERLAP - 1e-12, "sequence_bandpass_gate")
-        result = inspect_tracks(exposures, grid, shape, issues)
+        result = inspect_tracks(exposures, visits, grid, shape, issues)
         if diagnostics:
             Path(diagnostics).write_text(json.dumps({"request": request, **result}, indent=2) + "\n")
         verify_frozen()
         return result
 
-    playback = eligibility(*exposures, grid, shape)
-    # Even grids have no pixel centered on the requested sky position.
-    center_bands = [
-        exp.bandpass(*exp.wcs.world_to_pixel_values(ra, dec)) for exp in exposures
-    ]
-    center_overlap = float(band_overlap(*center_bands[0], *center_bands[1]))
-    if not (center_overlap >= 0.75 and playback["shared_fraction"] >= 0.8):
-        return dict(
-            status="rejected",
-            reason="playback_bandpass_or_shared_area_gate",
-            candidates=[],
-        )
     registration = register(*exposures, grid)
     if not registration["ok"]:
         return dict(
             status="rejected", reason="registration_unconstrained", candidates=[]
         )
+    shared = eligibility(*exposures, grid, shape, shift=registration["shift_pixels"])
+    if not shared["shared"].any():
+        return dict(status="rejected", reason="no_comparable_pixels", candidates=[])
     raw, trace = native_candidates(*exposures, grid, shape, registration, FitCache())
     keys = [
         "position_earlier_icrs",
@@ -463,10 +465,16 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
     result = dict(
         status="inspected",
         candidates=[
-            {key: c[key] for key in keys} for c in raw if c["score"] >= SCORE_CUT
+            {key: c[key] for key in keys} for c in raw
+            if c["score"] >= SCORE_CUT
+            and all(check["bandpass_overlap"] >= MIN_LOCAL_OVERLAP for check in c["local_checks"])
         ],
     )
     if diagnostics:
+        playback = eligibility(*exposures, grid, shape)
+        # Even grids have no pixel centered on the requested sky position.
+        center_bands = [exp.bandpass(*exp.wcs.world_to_pixel_values(ra, dec)) for exp in exposures]
+        center_overlap = float(band_overlap(*center_bands[0], *center_bands[1]))
 
         def clean(value):
             if isinstance(value, dict):

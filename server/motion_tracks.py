@@ -12,8 +12,16 @@ MIN_MOTION_IMPROVEMENT = 16.0
 MAX_REDUCED_CHI2 = 2.5
 
 
-def link_tracks(catalogs, times, *, corroborates_motion):
+def link_tracks(catalogs, times, *, visits=None, corroborates_motion):
     """Fit straight tracks and check the native pixels before claiming detections."""
+    if visits is None:
+        visits = range(len(catalogs))
+    grouped_epochs = {}
+    for epoch, visit in enumerate(visits):
+        grouped_epochs.setdefault(visit, []).append(epoch)
+    if len(grouped_epochs) < 3:
+        return
+
     points = [np.asarray([source["point"] for source in catalog]).reshape(-1, 2) for catalog in catalogs]
     trees = [cKDTree(positions) for positions in points]
     times = np.asarray(times, dtype=float)
@@ -24,10 +32,14 @@ def link_tracks(catalogs, times, *, corroborates_motion):
     moving = []
     for epoch, positions in enumerate(points):
         matches = np.ones(len(positions), dtype=int)
-        for other, tree in enumerate(trees):
-            if other != epoch:
-                distance, _ = tree.query(positions, distance_upper_bound=.35)
-                matches += np.isfinite(distance)
+        for visit, epochs in grouped_epochs.items():
+            if visit == visits[epoch]:
+                continue
+            found = np.zeros(len(positions), dtype=bool)
+            for other in epochs:
+                distance, _ = trees[other].query(positions, distance_upper_bound=.35)
+                found |= np.isfinite(distance)
+            matches += found
         moving.append(np.flatnonzero(matches < 3))
     moving_trees = [cKDTree(positions[rows]) for positions, rows in zip(points, moving)]
 
@@ -35,7 +47,7 @@ def link_tracks(catalogs, times, *, corroborates_motion):
     for first, earlier in enumerate(moving):
         for last in range(first + 1, len(points)):
             later = moving[last]
-            if not len(earlier) or not len(later):
+            if visits[first] == visits[last] or not len(earlier) or not len(later):
                 continue
             a = np.repeat(earlier, len(later))
             b = np.tile(later, len(earlier))
@@ -43,22 +55,33 @@ def link_tracks(catalogs, times, *, corroborates_motion):
             slope = (points[last][b] - start) / (times[last] - times[first])
             links = np.full((len(a), len(points)), -1, dtype=int)
             links[:, first], links[:, last] = a, b
-            for epoch, positions in enumerate(points):
-                if epoch in (first, last) or not len(moving[epoch]):
+            row = np.arange(len(a))
+            for visit, epochs in grouped_epochs.items():
+                if visit in (visits[first], visits[last]):
                     continue
-                prediction = start + slope * (times[epoch] - times[first])
-                # Query only sources without a persistent stationary counterpart.
-                nearby = moving[epoch]
-                k = min(3, len(nearby))
-                distance, rows = moving_trees[epoch].query(prediction, k=list(range(1, k + 1)),
-                                                          distance_upper_bound=LINK_RADIUS)
-                found = nearby[np.minimum(rows, len(nearby) - 1)]
-                residual = positions[found] - prediction[:, None, :]
-                cost = np.einsum("...i,...ij,...j->...", residual, prec[epoch][found], residual)
-                cost[~np.isfinite(distance)] = np.inf
-                best = np.argmin(cost, axis=1)
-                row = np.arange(len(best))
-                links[:, epoch] = np.where(cost[row, best] <= POSITION_GATE, found[row, best], -1)
+                best_cost = np.full(len(a), np.inf)
+                best_epoch = np.full(len(a), -1)
+                best_source = np.full(len(a), -1)
+                for epoch in epochs:
+                    nearby = moving[epoch]
+                    if not len(nearby):
+                        continue
+                    prediction = start + slope * (times[epoch] - times[first])
+                    k = min(3, len(nearby))
+                    distance, rows = moving_trees[epoch].query(prediction, k=list(range(1, k + 1)),
+                                                              distance_upper_bound=LINK_RADIUS)
+                    found = nearby[np.minimum(rows, len(nearby) - 1)]
+                    residual = points[epoch][found] - prediction[:, None, :]
+                    cost = np.einsum("...i,...ij,...j->...", residual, prec[epoch][found], residual)
+                    cost[~np.isfinite(distance)] = np.inf
+                    best = np.argmin(cost, axis=1)
+                    lowest_cost = cost[row, best]
+                    improved = lowest_cost < best_cost
+                    best_cost[improved] = lowest_cost[improved]
+                    best_epoch[improved] = epoch
+                    best_source[improved] = found[row, best][improved]
+                linked = best_cost <= POSITION_GATE
+                links[row[linked], best_epoch[linked]] = best_source[linked]
             supported = links[(links >= 0).sum(axis=1) >= 3]
             proposals.update(map(tuple, np.unique(supported, axis=0).tolist()))
 
