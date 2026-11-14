@@ -62,6 +62,29 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(calibration_key(exposures[0]).startswith("dr1/spectral_wcs/"))
         self.assertTrue(partial)
 
+    async def test_sia_recovers_from_connection_timeout_with_verified_hostname(self):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            if request.url.host == "irsa.ipac.caltech.edu":
+                raise httpx.ConnectTimeout("Name resolution stalled", request=request)
+            if request.url.host == "cloudflare-dns.com":
+                self.assertEqual(dict(request.url.params), {"name": "irsa.ipac.caltech.edu", "type": "A"})
+                return httpx.Response(200, json={"Status": 0, "Answer": [
+                    {"type": 5, "data": "irsa-alias.example."}, {"type": 1, "data": "134.4.54.42"},
+                ]})
+            self.assertEqual(request.url.host, "134.4.54.42")
+            self.assertEqual(request.headers["Host"], "irsa.ipac.caltech.edu")
+            self.assertEqual(request.extensions["sni_hostname"], "irsa.ipac.caltech.edu")
+            self.assertEqual(request.url.params, requests[0].url.params)
+            return httpx.Response(200, text="obs_id,t_min,access_url\n")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            result = await search(client, (), region="CIRCLE 2 3 0.1", compact=True)
+        self.assertEqual(result, ([], False))
+        self.assertEqual(len(requests), 3)
+
     async def test_compressed_flags_read_only_requested_rows(self):
         flags = np.random.default_rng(34).integers(0, 2**29, size=(19, 33), dtype=np.int32)
         output = BytesIO()

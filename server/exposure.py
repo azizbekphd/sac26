@@ -5,6 +5,7 @@ from base64 import b64encode
 import csv
 from dataclasses import dataclass
 from io import BytesIO, StringIO
+from ipaddress import IPv4Address
 import json
 import math
 import re
@@ -19,7 +20,9 @@ import httpx
 import numpy as np
 from PIL import Image
 
-SIA = "https://irsa.ipac.caltech.edu/SIA"
+IRSA_HOST = "irsa.ipac.caltech.edu"
+SIA = f"https://{IRSA_HOST}/SIA"
+DNS_RESOLVER = "https://cloudflare-dns.com/dns-query"
 IRSA_DATA_PREFIX = "/ibe/data/spherex/"
 BUCKET = "nasa-irsa-spherex"
 REGION = "us-east-1"
@@ -172,7 +175,7 @@ def archive_key(row, compact):
     if compact:
         # IRSA's CSV leaves commas in cloud_access unquoted. The IBE file path mirrors the S3 key.
         url = urlsplit(str(row["access_url"]))
-        if url.hostname != "irsa.ipac.caltech.edu" or not url.path.startswith(IRSA_DATA_PREFIX):
+        if url.hostname != IRSA_HOST or not url.path.startswith(IRSA_DATA_PREFIX):
             raise ValueError("Invalid IRSA file URL")
         return url.path.removeprefix(IRSA_DATA_PREFIX)
 
@@ -180,6 +183,31 @@ def archive_key(row, compact):
     if aws["bucket_name"] != BUCKET or aws["region"] != REGION:
         raise ValueError("Unexpected archive bucket or region")
     return aws["key"]
+
+
+async def sia_response(client, url, params, limit, **connection):
+    async with client.stream("GET", url, params=params, timeout=httpx.Timeout(45, connect=8), **connection) as response:
+        response.raise_for_status()
+        body = bytearray()
+        async for chunk in response.aiter_bytes():
+            body.extend(chunk)
+            if len(body) > max(4 * 1024 * 1024, limit * 6000):
+                raise ArchiveError("The archive returned too much observation metadata.")
+    return body
+
+
+async def resolve_irsa(client):
+    response = await client.get(
+        DNS_RESOLVER, params={"name": IRSA_HOST, "type": "A"},
+        headers={"Accept": "application/dns-json"}, timeout=5,
+    )
+    response.raise_for_status()
+    answer = response.json()
+    if answer["Status"] == 0:
+        for record in answer.get("Answer", []):
+            if record["type"] == 1 and (address := IPv4Address(record["data"])).is_global:
+                return str(address)
+    raise ValueError("The DNS resolver did not return a public IRSA address.")
 
 
 async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False, filters=ArchiveFilters()):
@@ -197,13 +225,17 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
         params["BAND"] = f"{low:.12g} {high}"
     if compact:
         params["RESPONSEFORMAT"] = "CSV"
-    async with client.stream("GET", SIA, params=params, timeout=httpx.Timeout(45, connect=8)) as response:
-        response.raise_for_status()
-        body = bytearray()
-        async for chunk in response.aiter_bytes():
-            body.extend(chunk)
-            if len(body) > max(4 * 1024 * 1024, limit * 6000):
-                raise ArchiveError("The archive returned too much observation metadata.")
+    try:
+        body = await sia_response(client, SIA, params, limit)
+    except (httpx.ConnectTimeout, httpx.ConnectError) as error:
+        try:
+            address = await resolve_irsa(client)
+        except (httpx.HTTPError, KeyError, TypeError, ValueError) as dns_error:
+            raise error from dns_error
+        # Connect to the resolved address and still verify IRSA's TLS certificate by hostname.
+        url = httpx.URL(SIA).copy_with(host=address)
+        body = await sia_response(client, url, params, limit, headers={"Host": IRSA_HOST},
+                                  extensions={"sni_hostname": IRSA_HOST})
     table, overflow = archive_records(body, compact)
     truncated = overflow or len(table) >= limit
     exposures = {}

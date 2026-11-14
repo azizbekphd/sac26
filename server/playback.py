@@ -527,6 +527,10 @@ async def run_playback(client, job, ra, dec, field_size):
     try:
         async with asyncio.timeout(JOB_SECONDS):
             await PlaybackSearch(client, job, ra, dec, field_size).run()
+    except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
+        job.status = "error"
+        job.message = "Could not connect to IRSA to list exposures. Try again."
+        log.warning("Playback %s: IRSA metadata connection failed: %s", job.id, type(exc).__name__)
     except httpx.TimeoutException:
         job.status = "error"
         job.message = "IRSA timed out while listing exposures. Try again."
