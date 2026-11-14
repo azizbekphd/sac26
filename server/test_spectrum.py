@@ -102,17 +102,9 @@ class SpectrumTests(IsolatedAsyncioTestCase):
                 self.assertEqual((await client.delete(path)).status_code, 204)
                 self.assertEqual((await client.get(path)).status_code, 404)
 
-    async def test_cancelling_spectrum_releases_the_worker_slot(self):
-        exposure = Exposure("dr1/slow", 1, "slow", 61000)
-        started = asyncio.Event()
-        cancelled = asyncio.Event()
-
-        async def measure(*_args):
-            started.set()
-            try:
-                await asyncio.Future()
-            finally:
-                cancelled.set()
+    async def test_stopping_or_discarding_spectrum_releases_the_worker_slot(self):
+        fast = Exposure("dr1/fast", 1, "fast", 61000)
+        slow = Exposure("dr1/slow", 2, "slow", 61000)
 
         body = {"ra": 23, "dec": -30, "startDate": "2025-08-11", "endDate": "2025-08-11"}
         async with (
@@ -120,15 +112,34 @@ class SpectrumTests(IsolatedAsyncioTestCase):
             httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
             asyncio.timeout(3),
         ):
-            with patch("server.spectrum.search", return_value=([exposure], False)), \
-                    patch("server.spectrum.exposure_measurement", measure):
-                start = await client.post("/api/spectrum", json=body)
-                path = "/api/spectrum/" + start.json()["id"]
-                await started.wait()
-                self.assertEqual((await client.delete(path)).status_code, 204)
-                self.assertTrue(cancelled.is_set())
-                self.assertFalse(app.state.spectrum_slot.locked())
-                self.assertEqual((await client.get(path)).status_code, 404)
+            for retain in (True, False):
+                with self.subTest(retain=retain):
+                    started = asyncio.Event()
+                    cancelled = asyncio.Event()
+
+                    async def measure(_client, _calibration, item, visit, *_coords):
+                        if item is fast:
+                            return {"key": item.key, "visit": visit, "wavelength": 1.0}
+                        started.set()
+                        try:
+                            await asyncio.Future()
+                        finally:
+                            cancelled.set()
+
+                    with patch("server.spectrum.search", return_value=([fast, slow], False)), \
+                            patch("server.spectrum.exposure_measurement", measure):
+                        start = await client.post("/api/spectrum", json=body)
+                        path = "/api/spectrum/" + start.json()["id"]
+                        await started.wait()
+                        if retain:
+                            self.assertEqual((await client.post(path + "/stop")).status_code, 204)
+                            response = (await client.get(path)).json()
+                            self.assertEqual(response["status"], "cancelled")
+                            self.assertEqual([point["key"] for point in response["points"]], [fast.key])
+                        self.assertEqual((await client.delete(path)).status_code, 204)
+                        self.assertTrue(cancelled.is_set())
+                        self.assertFalse(app.state.spectrum_slot.locked())
+                        self.assertEqual((await client.get(path)).status_code, 404)
 
     async def test_spectrum_polling_extends_expiry_and_idle_job_releases_slot(self):
         fast = Exposure("dr1/fast", 1, "fast", 61000)

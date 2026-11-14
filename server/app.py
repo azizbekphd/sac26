@@ -156,6 +156,20 @@ async def spectrum_status(job_id: str, request: Request, response: Response):
 async def cancel_spectrum(job_id: str, request: Request):
     job = request.app.state.spectra.pop(job_id, None)
     if job is not None and not job.task.done():
+        if not job.task.cancelling():
+            job.task.cancel()
+        await asyncio.gather(job.task, return_exceptions=True)
+    return Response(status_code=204)
+
+
+@app.post("/api/spectrum/{job_id}/stop", status_code=204)
+async def stop_spectrum(job_id: str, request: Request):
+    job = request.app.state.spectra.get(job_id)
+    if job is None:
+        raise HTTPException(404, "This spectrum request has expired. Try again.")
+    if job.status == "searching":
+        job.status = "cancelled"
+        job.message = "Spectrum stopped."
         job.task.cancel()
         await asyncio.gather(job.task, return_exceptions=True)
     return Response(status_code=204)

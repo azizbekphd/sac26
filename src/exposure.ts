@@ -114,14 +114,29 @@ export type SpectrumUpdate = {
   reconnecting?: boolean;
 };
 
-export async function watchSpectrum(
+const spectrumUnavailable = 'The spectrum service is unavailable. Try again.';
+
+export function watchSpectrum(
   body: SkyPosition & { startDate: string; endDate: string; release: ArchiveRelease | null },
   signal: AbortSignal, update: (result: SpectrumUpdate) => void,
 ) {
-  const unavailable = 'The spectrum service is unavailable. Try again.';
-  // Finish reading the ID even if the user cancels during submission, so the job can be deleted.
-  const { id } = await jsonResponse<{ id: string }>(await post('/api/spectrum', body), undefined, unavailable);
-  const path = `/api/spectrum/${encodeURIComponent(id)}`;
+  // Read the ID even if the user leaves or asks to stop while the job is being submitted.
+  const path = post('/api/spectrum', body, AbortSignal.timeout(5000))
+    .catch(() => { throw new Error(spectrumUnavailable); })
+    .then((response) => jsonResponse<{ id: string }>(response, undefined, spectrumUnavailable))
+    .then(({ id }) => `/api/spectrum/${encodeURIComponent(id)}`);
+  return {
+    finished: path.then((url) => pollSpectrum(url, signal, update)),
+    async stop() {
+      const url = await path;
+      signal.throwIfAborted();
+      const response = await post(`${url}/stop`, {}, AbortSignal.any([signal, AbortSignal.timeout(5000)]));
+      if (!response.ok) await jsonResponse(response, undefined, spectrumUnavailable);
+    },
+  };
+}
+
+async function pollSpectrum(path: string, signal: AbortSignal, update: (result: SpectrumUpdate) => void) {
   let previous: SpectrumUpdate | undefined;
   let failures = 0;
   try {
@@ -135,11 +150,11 @@ export async function watchSpectrum(
         });
       signal.throwIfAborted();
       if (!response || response.status >= 500) {
-        if (++failures >= 6) throw new Error(unavailable);
+        if (++failures >= 6) throw new Error(spectrumUnavailable);
         update({ ...(previous ?? { status: 'searching', message: '', processed: 0, total: null, points: [] }),
           reconnecting: true });
       } else {
-        const result = await jsonResponse<SpectrumUpdate>(response, undefined, unavailable);
+        const result = await jsonResponse<SpectrumUpdate>(response, undefined, spectrumUnavailable);
         signal.throwIfAborted();
         previous = result;
         failures = 0;

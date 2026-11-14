@@ -1,4 +1,5 @@
-import { useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import { flushSync } from 'react-dom';
 import { formatPosition, type SkyPosition } from './coordinates';
 import { watchSpectrum, type ArchiveRelease, type Exposure, type SpectrumPoint, type SpectrumUpdate } from './exposure';
 
@@ -71,20 +72,48 @@ function SpectrumChart({ points, active, onSelect }: {
   );
 }
 
+const MeasurementSelect = memo(function MeasurementSelect({ points, selectedKey, onSelect }: {
+  points: SpectrumPoint[];
+  selectedKey: string;
+  onSelect: (key: string) => void;
+}) {
+  return (
+    <select aria-label="Measurement" value={selectedKey} onChange={(event) => onSelect(event.currentTarget.value)}>
+      {points.map((item) => (
+        <option key={item.key} value={item.key}>Visit {item.visit} · {item.wavelength.toFixed(4)} µm · D{item.detector}</option>
+      ))}
+    </select>
+  );
+});
+
 function SpectrumMeasurement({ points, point, onSelect }: {
   points: SpectrumPoint[];
   point: SpectrumPoint;
   onSelect: (key: string) => void;
 }) {
+  const [optionsDuringSelection, setOptionsDuringSelection] = useState<SpectrumPoint[] | null>(null);
+  const select = useCallback((key: string) => {
+    onSelect(key);
+    setOptionsDuringSelection(null);
+  }, [onSelect]);
+  const options = optionsDuringSelection?.some((item) => item.key === point.key) ? optionsDuringSelection : points;
   return (
     <>
-      <label className="field spectrum-measurement">
+      {/* Polls can insert options ahead of the current choice. Keep the native picker stable during input. */}
+      <label className="field spectrum-measurement"
+        onFocus={() => setOptionsDuringSelection(points)}
+        onPointerDown={() => setOptionsDuringSelection(points)}
+        onKeyDown={(event) => {
+          if (event.target instanceof HTMLSelectElement && CSS.supports('selector(:open)') && !event.target.matches(':open')) {
+            // Refresh before the browser handles the key using the current options.
+            flushSync(() => setOptionsDuringSelection(points));
+          } else {
+            setOptionsDuringSelection((current) => current ?? points);
+          }
+        }}
+        onBlur={() => setOptionsDuringSelection(null)}>
         Measurement
-        <select aria-label="Measurement" value={point.key} onChange={(event) => onSelect(event.currentTarget.value)}>
-          {points.map((item) => (
-            <option key={item.key} value={item.key}>Visit {item.visit} · {item.wavelength.toFixed(4)} µm · D{item.detector}</option>
-          ))}
-        </select>
+        <MeasurementSelect points={options} selectedKey={point.key} onSelect={select} />
       </label>
       <div className="spectrum-point">
         <dl>
@@ -111,9 +140,11 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
   const [submitted, setSubmitted] = useState<DateRange | null>(null);
   const [result, setResult] = useState<SpectrumUpdate | null>(null);
   const [busy, setBusy] = useState(false);
+  const [stopping, setStopping] = useState(false);
+  const [stopError, setStopError] = useState('');
   const [error, setError] = useState('');
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
-  const request = useRef<AbortController | null>(null);
+  const request = useRef<{ controller: AbortController; stop: () => Promise<void> } | null>(null);
   const dialog = useRef<HTMLDialogElement>(null);
   const measurementDetails = useRef<HTMLDetailsElement>(null);
   const sourceDetails = useRef<HTMLDetailsElement>(null);
@@ -122,7 +153,7 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
   const titleId = useId();
   const positionLabel = formatPosition(position);
 
-  useEffect(() => () => request.current?.abort(), []);
+  useEffect(() => () => request.current?.controller.abort(), []);
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -130,19 +161,23 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
       setError('Enter a start and end date with the start on or before the end.');
       return;
     }
-    request.current?.abort();
+    request.current?.controller.abort();
     const controller = new AbortController();
-    request.current = controller;
     setBusy(true);
+    setStopping(false);
+    setStopError('');
     setError('');
     setResult(null);
     setSelectedKey(null);
     setSubmitted(dates);
-    void watchSpectrum({ ...position, ...dates, release }, controller.signal, (update) => {
+    const job = watchSpectrum({ ...position, ...dates, release }, controller.signal, (update) => {
       setResult(update);
       const firstPoint = update.points[0];
       if (firstPoint) setSelectedKey((key) => key ?? firstPoint.key);
-    }).catch((failure: unknown) => {
+      else if (update.status === 'cancelled' && sourceDetails.current) sourceDetails.current.open = true;
+    });
+    request.current = { controller, stop: job.stop };
+    void job.finished.catch((failure: unknown) => {
       if (!controller.signal.aborted) {
         const message = failure instanceof Error && !(failure instanceof TypeError) ? failure.message :
           'The spectrum service could not complete the request. Try again.';
@@ -150,21 +185,25 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
           status: previous?.points.length ? 'partial' : 'error', message, reconnecting: false }));
       }
     }).finally(() => {
-      if (request.current === controller) {
+      if (request.current?.controller === controller) {
         setBusy(false);
+        setStopping(false);
+        setStopError('');
         request.current = null;
       }
     });
   }
 
-  function cancel() {
-    request.current?.abort();
-    request.current = null;
-    setBusy(false);
-    setResult(null);
-    setSubmitted(null);
-    setError('');
-    if (sourceDetails.current) sourceDetails.current.open = true;
+  function stop() {
+    const job = request.current;
+    if (!job) return;
+    setStopping(true);
+    setStopError('');
+    void job.stop().catch(() => {
+      if (request.current !== job || job.controller.signal.aborted) return;
+      setStopping(false);
+      setStopError('Could not stop the spectrum. Try again.');
+    });
   }
 
   const edited = submitted && (dates.startDate !== submitted.startDate || dates.endDate !== submitted.endDate);
@@ -196,10 +235,13 @@ export function Spectrum({ position, initialDates, release, visible, onClear }: 
       <div className="spectrum-heading">
         <h2 id={titleId}>Spectrum</h2>
         <div className="spectrum-actions">
-          {busy && <button className="control" type="button" onClick={cancel}>Cancel spectrum</button>}
+          {busy && <button className="control" type="button" disabled={stopping} onClick={stop}>
+            {stopping ? 'Stopping spectrum…' : 'Stop spectrum'}
+          </button>}
           <button className="control spectrum-clear" type="button" onClick={onClear}>Clear source</button>
         </div>
       </div>
+      {stopError && <p className="lookup-status" role="alert">{stopError}</p>}
       {!hasPoints && submitted && <p className="spectrum-window">Requested {submitted.startDate} to {submitted.endDate} UTC</p>}
       {(hasPoints || scanning || status) && (
         <p role="status" className="spectrum-caption">

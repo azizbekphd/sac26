@@ -411,6 +411,8 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     result.frames[0].visitDates = ['2024-12-31', '2025-01-01'];
     const submitted = [];
     const removed = [];
+    const stopped = new Set();
+    let rejectStop = true;
     let measurements = [];
     let finish = false;
     let interruptPoll = false;
@@ -434,6 +436,14 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
         return send({ id: String(submitted.length) });
       }
       if (path.startsWith('/api/spectrum/')) {
+        if (path.endsWith('/stop')) {
+          if (rejectStop) {
+            rejectStop = false;
+            return route.fulfill({ status: 503 });
+          }
+          stopped.add(path.slice(0, -'/stop'.length));
+          return route.fulfill({ status: 204 });
+        }
         if (request.method() === 'DELETE') {
           removed.push(path);
           return route.fulfill({ status: 204 });
@@ -442,6 +452,8 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
           interruptPoll = false;
           return route.abort('failed');
         }
+        if (stopped.has(path)) return send({ status: 'cancelled', points: measurements, message: 'Spectrum stopped.',
+          processed: measurements.length, total: 60 });
         return send(finish
           ? { status: 'partial', points, message: 'Some archive exposures could not be checked.', processed: 60, total: 60 }
           : { status: 'searching', points: measurements, message: 'Measuring the spectrum…',
@@ -513,17 +525,37 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     interruptPoll = true;
     await panel.getByText(/Reconnecting to the spectrum request/).waitFor();
     assert.equal(await chart.locator('.spectrum-chart-target').count(), 6);
+    await measurement.focus();
     measurements = points.slice(3, 16);
     await panel.getByText(/14 \/ 60 exposures checked/).waitFor();
     assert.equal(await chart.locator('.spectrum-chart-target').count(), 13);
-    assert.equal(await measurement.inputValue(), 's8');
-    await button('Cancel spectrum').waitFor();
+    assert.equal(await measurement.locator('option').count(), 6, 'The chart can grow without changing the active dropdown');
+    await measurement.press('End');
+    assert.equal(await measurement.inputValue(), 's15');
+    await measurement.selectOption('s7');
+    assert.equal(await measurement.inputValue(), 's7');
+    assert.equal(await measurement.locator('option').count(), 13);
+
+    await expand.click({ position: { x: 10, y: 20 } });
+    const expandedMeasurement = expanded.getByRole('combobox', { name: 'Measurement' });
+    assert.equal(await expandedMeasurement.inputValue(), 's7');
+    await expandedMeasurement.focus();
+    measurements = points.slice(0, 20);
+    const expandedChart = expanded.getByRole('img', { name: /Flux density by wavelength/i });
+    await expandedChart.locator('.spectrum-chart-target').nth(19).waitFor();
+    assert.equal(await expandedMeasurement.locator('option').count(), 13);
+    await expandedMeasurement.selectOption('s12');
+    assert.match(await expandedChart.locator('.spectrum-chart-marker[opacity="1"] title').textContent(), /^Visit 4 · 1\.9000 µm/);
+    assert.equal(await expandedMeasurement.locator('option').count(), 20);
+    await expanded.getByRole('button', { name: 'Close' }).click();
+    assert.equal(await measurement.inputValue(), 's12');
+    await button('Stop spectrum').waitFor();
     await panel.getByText('Measurement details', { exact: true }).click();
     await panel.evaluate((node) => { node.scrollTop = 0; });
     finish = true;
     await panel.getByText('Some archive exposures could not be checked.', { exact: true }).waitFor();
     await panel.getByText('42 measurements', { exact: true }).waitFor();
-    await button('Cancel spectrum').waitFor({ state: 'hidden' });
+    await button('Stop spectrum').waitFor({ state: 'hidden' });
     async function checkPlayback() {
       const playback = page.getByRole('region', { name: 'Comparison playback' });
       const strip = await playback.boundingBox();
@@ -574,12 +606,12 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     await checkChartFits();
     await page.setViewportSize({ width: 390, height: 844 });
     await panel.getByText('Measurement details', { exact: true }).click();
-    assert.equal(await measurement.inputValue(), 's8');
+    assert.equal(await measurement.inputValue(), 's12');
     await checkLayout();
     await panel.getByText('Source and dates', { exact: true }).click();
     await button('Motion').click();
     await button('Spectrum').click();
-    assert.equal(await measurement.inputValue(), 's8');
+    assert.equal(await measurement.inputValue(), 's12');
     assert.equal(await panel.getByLabel('Through').inputValue(), '2025-03-01');
     assert.equal(await marker.getAttribute('style'), style);
     assert.equal(submitted.length, 1);
@@ -609,12 +641,31 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
     await target.press('ArrowDown');
     await panel.getByText(/Measuring the spectrum/).waitFor({ state: 'hidden' });
     await button('Show spectrum').click();
-    measurements = points.slice(0, 1);
-    await chart.waitFor();
-    await button('Cancel spectrum').click();
+    measurements = points.slice(0, 5);
+    await panel.getByText('5 measurements', { exact: true }).waitFor();
+    await panel.getByText('Measurement details', { exact: true }).click();
+    await measurement.selectOption('s4');
+    const waitForRemoval = (id) => page.waitForResponse((response) =>
+      new URL(response.url()).pathname === `/api/spectrum/${id}` && response.request().method() === 'DELETE');
+    await button('Stop spectrum').click();
+    await panel.getByRole('alert').getByText('Could not stop the spectrum. Try again.').waitFor();
+    assert.equal(await panel.getByText('Spectrum stopped.', { exact: true }).isVisible(), false);
+    await Promise.all([waitForRemoval(3), button('Stop spectrum').click()]);
+    await panel.getByText('Spectrum stopped.', { exact: true }).waitFor();
+    assert.equal(await chart.locator('.spectrum-chart-target').count(), 5);
+    assert.equal(await measurement.inputValue(), 's4');
+    await measurement.selectOption('s2');
+    assert.equal(await measurement.inputValue(), 's2');
+
+    await panel.getByText('Source and dates', { exact: true }).click();
+    measurements = [];
+    await button('Show spectrum').click();
+    await panel.getByText(/Measuring the spectrum/).waitFor();
+    await Promise.all([waitForRemoval(4), button('Stop spectrum').click()]);
+    await panel.getByText('Spectrum stopped.', { exact: true }).waitFor();
     await chart.waitFor({ state: 'hidden' });
     await button('Show spectrum').waitFor();
-    assert.deepEqual(removed.sort(), ['/api/spectrum/1', '/api/spectrum/2', '/api/spectrum/3']);
+    assert.deepEqual(removed.sort(), ['/api/spectrum/1', '/api/spectrum/2', '/api/spectrum/3', '/api/spectrum/4']);
   } finally {
     await browser.close();
   }
