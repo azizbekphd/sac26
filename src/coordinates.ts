@@ -49,3 +49,15 @@ export function formatPosition(position: SkyPosition): CoordinateFields {
   const ra = Number(position.ra.toFixed(6));
   return { ra: (ra === 360 ? 0 : ra).toFixed(6), dec: position.dec.toFixed(6) };
 }
+
+export function positionInPatch(center: SkyPosition, fieldSize: number, x: number, y: number): SkyPosition {
+  // Invert the north-up TAN projection used to render the comparison PNG.
+  const radians = Math.PI / 180;
+  const east = (.5 - x) * fieldSize * radians / 60;
+  const north = (.5 - y) * fieldSize * radians / 60;
+  const declination = center.dec * radians;
+  const denominator = Math.cos(declination) - north * Math.sin(declination);
+  const ra = center.ra + Math.atan2(east, denominator) / radians;
+  const dec = Math.atan2(Math.sin(declination) + north * Math.cos(declination), Math.hypot(east, denominator)) / radians;
+  return { ra: (ra + 360) % 360, dec };
+}

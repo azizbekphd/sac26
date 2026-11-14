@@ -2,10 +2,11 @@ import '@fontsource/ibm-plex-mono/latin-400.css';
 import '@fontsource/ibm-plex-mono/latin-600.css';
 import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
-import { formatPosition, parseCoordinate, parsePosition, presets, type CoordinateFields, type SkyPosition } from './coordinates';
+import { formatPosition, parseCoordinate, parsePosition, positionInPatch, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
 import { MotionMarkers, MotionReview } from './MotionReview';
+import { Spectrum, spectrumDates } from './Spectrum';
 import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
   type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
 import './styles.css';
@@ -46,6 +47,7 @@ type SubmittedPatch = PlaybackPatch & {
 type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string } };
+type SpectrumPick = { id: number; x: number; y: number; position: SkyPosition; dates: ReturnType<typeof spectrumDates> };
 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
@@ -102,6 +104,7 @@ function App() {
   const currentFrame = useRef<string | undefined>(undefined);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
   const [markedMotion, setMarkedMotion] = useState<Record<string, MotionCandidate | null>>({});
   const [motionResults, setMotionResults] = useState<Record<string, MotionResult>>({});
   const requestRef = useRef<AbortController | null>(null);
@@ -110,6 +113,7 @@ function App() {
   const submitAction = useRef<HTMLButtonElement>(null);
   const backAction = useRef<HTMLButtonElement>(null);
   const detailsAction = useRef<HTMLButtonElement>(null);
+  const spectrumTarget = useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const filtersRef = useRef<HTMLDetailsElement>(null);
   const draftPosition = useMemo(() => parsePosition(fields), [fields]);
@@ -185,6 +189,7 @@ function App() {
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
+    setSpectrumPick(null);
     setView({ patch, result: emptySearch });
     setSearch(emptySearch);
     setPendingSequence(undefined);
@@ -399,6 +404,7 @@ function App() {
         result.frames.every((frame) => !identities.has(exposureIdentity(frame))))]);
     } else {
       setSearch(null);
+      setSpectrumPick(null);
       setStopError('');
       setMarkedMotion({});
       setMotionResults({});
@@ -415,6 +421,7 @@ function App() {
     selectionRef.current?.abort();
     selectionRef.current = null;
     setView(null);
+    setSpectrumPick(null);
     setSearch(null);
     setManualResults([]);
     setPendingSequence(undefined);
@@ -432,6 +439,16 @@ function App() {
   function stepFrame(direction: number) {
     setPlaying(false);
     setFrameIndex((index) => (index + direction + frameCount) % frameCount);
+  }
+
+  function pickSpectrum(x: number, y: number) {
+    if (!view || !exposure) return;
+    setPlaying(false);
+    setDetailsOpen(false);
+    const position = positionInPatch(view.patch.position, view.patch.fieldSize, x, y);
+    const dates = spectrumDates(result?.frames.length ? result.frames : [exposure]);
+    setSpectrumPick((current) => current?.x === x && current.y === y ? current :
+      { id: (current?.id ?? 0) + 1, x, y, position, dates });
   }
 
   const drawerAction = drawerOpen ? 'Hide patch' : 'Choose patch';
@@ -603,6 +620,30 @@ function App() {
                     <img className="sky-frame" src={exposure.imageUrl}
                       alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
                     {motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
+                    <button className="spectrum-target" type="button" ref={spectrumTarget}
+                      aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
+                      onClick={(event) => {
+                        if (event.detail === 0) {
+                          pickSpectrum(spectrumPick?.x ?? .5, spectrumPick?.y ?? .5);
+                          return;
+                        }
+                        const box = event.currentTarget.getBoundingClientRect();
+                        pickSpectrum((event.clientX - box.left) / box.width, (event.clientY - box.top) / box.height);
+                      }} onKeyDown={(event) => {
+                        const offsets: Record<string, [number, number]> = {
+                          ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, -1], ArrowDown: [0, 1],
+                        };
+                        const offset = offsets[event.key];
+                        if (!offset) return;
+                        event.preventDefault();
+                        const pixels = Math.round(view.patch.fieldSize * 60 / 6.15);
+                        const limit = (value: number) => Math.max(.5 / pixels, Math.min(1 - .5 / pixels, value));
+                        pickSpectrum(limit((spectrumPick?.x ?? .5) + offset[0] / pixels),
+                          limit((spectrumPick?.y ?? .5) + offset[1] / pixels));
+                      }}>
+                      {spectrumPick && <span className="spectrum-marker" aria-hidden="true"
+                        style={{ left: `${spectrumPick.x * 100}%`, top: `${spectrumPick.y * 100}%` }} />}
+                    </button>
                   </div>
                 </div>
                 <aside className="exposure-panel" aria-label="Comparison controls" onKeyDown={(event) => {
@@ -668,6 +709,9 @@ function App() {
                       <p className="lookup-status" role="status">{motionUnavailableReason}</p>
                     )}
                     {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
+                    <p id="spectrum-pick-help" className="lookup-status" hidden={Boolean(spectrumPick)}>
+                      Select a source on the image for a spectrum. Use arrow keys to move the marker with the keyboard.
+                    </p>
                     <button ref={detailsAction} className="control details-toggle" type="button"
                       aria-expanded={detailsOpen} aria-controls="exposure-details"
                       onClick={() => setDetailsOpen((open) => !open)}>
@@ -734,6 +778,11 @@ function App() {
                     </div>
                     <a className="control source-fits" href={exposure.sourceUrl} target="_blank" rel="noreferrer">Source FITS</a>
                   </section>
+                  {spectrumPick && <Spectrum key={spectrumPick.id} position={spectrumPick.position}
+                    initialDates={spectrumPick.dates} release={view.patch.release} onClear={() => {
+                      setSpectrumPick(null);
+                      spectrumTarget.current?.focus({ preventScroll: true });
+                    }} />}
                 </aside>
               </div>
             </div>

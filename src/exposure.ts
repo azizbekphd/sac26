@@ -25,7 +25,7 @@ export type ArchiveExposure = {
   sourceUrl: string;
 };
 
-export type Exposure = ArchiveExposure & { imageUrl: string; coverage: number; visit?: number };
+export type Exposure = ArchiveExposure & { imageUrl: string; coverage: number; visit?: number; visitDates?: [string, string] | null };
 export type InventoryExposure = ArchiveExposure & { visit: number; wavelengthBounds?: [number, number] | null };
 export type Bandpass = { wavelength: number; bandwidth: number };
 export type ExposureIssue = 'no-usable-pixels' | 'read-failed';
@@ -90,15 +90,70 @@ export async function inspectMotion(jobId: string, signal: AbortSignal) {
   );
 }
 
+export type SpectrumPoint = Omit<ArchiveExposure, 'wavelength' | 'bandwidth'> & Bandpass & {
+  visit: number;
+  flux: number;
+  uncertainty: number;
+  flags: string[];
+};
+export type SpectrumUpdate = {
+  status: 'searching' | 'ready' | 'partial' | 'empty' | 'timeout' | 'error' | 'cancelled';
+  message: string;
+  processed: number;
+  total: number | null;
+  points: SpectrumPoint[];
+  reconnecting?: boolean;
+};
+
+export async function watchSpectrum(
+  body: SkyPosition & { startDate: string; endDate: string; release: ArchiveRelease | null },
+  signal: AbortSignal, update: (result: SpectrumUpdate) => void,
+) {
+  const unavailable = 'The spectrum service is unavailable. Try again.';
+  // Finish reading the ID even if the user cancels during submission, so the job can be deleted.
+  const { id } = await jsonResponse<{ id: string }>(await post('/api/spectrum', body), undefined, unavailable);
+  const path = `/api/spectrum/${encodeURIComponent(id)}`;
+  let previous: SpectrumUpdate | undefined;
+  let failures = 0;
+  try {
+    for (;;) {
+      signal.throwIfAborted();
+      const response = await fetch(path, { signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) })
+        .catch((error: unknown) => {
+          signal.throwIfAborted();
+          if (!(error instanceof TypeError || (error instanceof DOMException && error.name === 'TimeoutError'))) throw error;
+          return null;
+        });
+      signal.throwIfAborted();
+      if (!response || response.status >= 500) {
+        if (++failures >= 6) throw new Error(unavailable);
+        update({ ...(previous ?? { status: 'searching', message: '', processed: 0, total: null, points: [] }),
+          reconnecting: true });
+      } else {
+        const result = await jsonResponse<SpectrumUpdate>(response, undefined, unavailable);
+        signal.throwIfAborted();
+        previous = result;
+        failures = 0;
+        update(result);
+        if (result.status !== 'searching') return;
+      }
+      await nextPoll(signal);
+    }
+  } finally {
+    void fetch(path, { method: 'DELETE', keepalive: true }).catch(() => {});
+  }
+}
+
 export const maxManualFrames = 12;
 
-async function jsonResponse<T>(response: Response, missingEndpoint?: string): Promise<T> {
+async function jsonResponse<T>(response: Response, missingEndpoint?: string,
+  fallback = 'The playback service is unavailable. Try again.'): Promise<T> {
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     if (missingEndpoint && response.status === 404 && (!body?.detail || body.detail === 'Not Found')) {
       throw new Error(missingEndpoint);
     }
-    throw new Error(typeof body?.detail === 'string' ? body.detail : 'The playback service is unavailable. Try again.');
+    throw new Error(typeof body?.detail === 'string' ? body.detail : fallback);
   }
   return response.json();
 }

@@ -209,3 +209,134 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await browser.close();
   }
 });
+
+test('requests a sidebar spectrum at the picked sky position and keeps partial results', { timeout: 30_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  try {
+    const page = await browser.newPage({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    page.setDefaultTimeout(6_000);
+    const { result, summary } = sequence('lookup.2', [0, 1, 2, 3]);
+    result.frames[0].visitDates = ['2024-12-31', '2025-01-01'];
+    const submitted = [];
+    const removed = [];
+    let finish = false;
+    let pollInterrupted = false;
+    const point = { ...exposure(0), wavelength: 1.5, bandwidth: .03, flux: 80, uncertainty: 6, flags: ['Masked pixels'] };
+    const points = Array.from({ length: 42 }, (_, i) => ({ ...point, key: `s${i}`,
+      wavelength: .82 + i * .09, flux: 1500 / (i + 1) + 25 * Math.sin(i), uncertainty: 8 + i,
+      visit: Math.floor(i / 4) + 1,
+    }));
+    const reply = (status, points, message) => ({ status, points, message, processed: points.length || 1, total: 60 });
+    await page.route('**/*', async (route) => {
+      const request = route.request();
+      const url = new URL(request.url());
+      if (url.origin !== origin) return route.abort();
+      const path = url.pathname;
+      const send = (json) => route.fulfill({ json });
+      if (path === '/api/playback') return send({ id: 'lookup' });
+      if (path === '/api/playback/lookup') return send({ ...base, sequences: [summary] });
+      if (path === '/api/playback/lookup.2') return send(result);
+      if (path.startsWith('/api/playback/lookup.2/images/')) return route.fulfill({ body: png, contentType: 'image/png' });
+      if (path === '/api/spectrum') {
+        submitted.push(request.postDataJSON());
+        return send({ id: String(submitted.length) });
+      }
+      if (path.startsWith('/api/spectrum/')) {
+        if (request.method() === 'DELETE') {
+          removed.push(path);
+          return route.fulfill({ status: 204 });
+        }
+        if (finish && !pollInterrupted) {
+          pollInterrupted = true;
+          return route.abort('failed');
+        }
+        return send(finish ? reply('partial', points, 'The request reached the 60-second limit.')
+          : reply('searching', [], 'Measuring the spectrum…'));
+      }
+      return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
+    });
+
+    const button = (name) => page.getByRole('button', { name, exact: true });
+    const target = button('Select a source for spectrum');
+    await page.goto(origin);
+    await page.getByLabel('Right ascension (RA)').fill('10');
+    await page.getByLabel('Declination (Dec)').fill('20');
+    await button('Compare visits').click();
+    await page.getByText('1 / 4 visits', { exact: true }).waitFor();
+    await button('Play').click();
+    const box = await target.boundingBox();
+    assert.ok(box.width > 100);
+    await page.touchscreen.tap(box.x + .25 * box.width, box.y + .25 * box.height);
+    await button('Play').waitFor();
+    const panel = page.getByRole('region', { name: 'Spectrum', exact: true });
+    assert.equal(await panel.getByLabel('From').inputValue(), '2024-12-31');
+    assert.equal(await panel.getByLabel('Through').inputValue(), '2025-01-04');
+    await panel.getByLabel('Through').fill('2025-02-01');
+    await button('Show spectrum').click();
+    await panel.getByText(/Measuring the spectrum/).waitFor();
+    assert.equal(submitted.length, 1);
+    assert.equal(submitted[0].endDate, '2025-02-01');
+    assert.ok(Math.abs(submitted[0].ra - 10.02661) < .001, JSON.stringify(submitted[0]));
+    assert.ok(Math.abs(submitted[0].dec - 20.025) < .001, JSON.stringify(submitted[0]));
+    const marker = target.locator('.spectrum-marker');
+    const style = await marker.getAttribute('style');
+    await button('Next').click();
+    assert.equal(await marker.getAttribute('style'), style);
+    await panel.getByLabel('Through').fill('2025-03-01');
+    await panel.getByText('Requested 2024-12-31 to 2025-02-01 UTC').waitFor();
+    finish = true;
+    await panel.getByText('Reconnecting to the spectrum request…', { exact: false }).waitFor();
+    await panel.getByText('The request reached the 60-second limit.', { exact: false }).waitFor();
+    await panel.getByText(/42 measurements/).waitFor();
+    const chart = panel.getByRole('img', { name: /Flux density by wavelength/i });
+    const expand = button('Expand spectrum');
+    const measurement = panel.locator('details').getByLabel('Measurement', { exact: true });
+    async function checkLayout() {
+      const chartBox = await chart.boundingBox();
+      const next = await measurement.isVisible() ? await measurement.boundingBox() :
+        await panel.getByText('Measurement details', { exact: true }).boundingBox();
+      assert.ok(chartBox.height > 100, 'The chart has enough height to read its axes');
+      assert.ok(chartBox.y + chartBox.height <= next.y, 'The chart stays above the controls');
+      await button('Next').click();
+    }
+    async function checkChartFits() {
+      const chartBox = await chart.boundingBox();
+      const panelBox = await panel.boundingBox();
+      assert.ok(chartBox.y + chartBox.height <= panelBox.y + panelBox.height, 'The chart fits in the visible sidebar');
+    }
+    await checkLayout();
+    await checkChartFits();
+    await page.setViewportSize({ width: 1150, height: 620 });
+    await checkLayout();
+    await checkChartFits();
+    await page.setViewportSize({ width: 390, height: 844 });
+    await panel.getByText('Measurement details', { exact: true }).click();
+    await measurement.selectOption('5');
+    await checkLayout();
+    await panel.getByText('Source and dates', { exact: true }).click();
+    assert.equal(await panel.getByLabel('Through').inputValue(), '2025-03-01');
+    await expand.click();
+    const expanded = page.getByRole('dialog', { name: 'Expanded spectrum' });
+    await expanded.getByText('Masked pixels', { exact: true }).waitFor();
+    assert.equal(await expanded.getByRole('link', { name: 'Source FITS · obs-0' }).getAttribute('href'), point.sourceUrl);
+    await expanded.getByRole('button', { name: 'Close' }).click();
+    await button('Clear source').click();
+    await panel.waitFor({ state: 'hidden' });
+    assert.deepEqual(removed, ['/api/spectrum/1']);
+    await target.press('ArrowRight');
+    await button('Show spectrum').waitFor();
+
+    finish = false;
+    await button('Show spectrum').click();
+    await panel.getByText(/Measuring the spectrum/).waitFor();
+    await target.press('ArrowDown');
+    await panel.getByText(/Measuring the spectrum/).waitFor({ state: 'hidden' });
+    await button('Show spectrum').click();
+    await panel.getByText(/Measuring the spectrum/).waitFor();
+    await button('Cancel spectrum').click();
+    await panel.getByText(/Measuring the spectrum/).waitFor({ state: 'hidden' });
+    assert.deepEqual(removed.sort(), ['/api/spectrum/1', '/api/spectrum/2', '/api/spectrum/3']);
+  } finally {
+    await browser.close();
+  }
+});
