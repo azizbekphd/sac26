@@ -25,7 +25,13 @@ export type ArchiveExposure = {
   sourceUrl: string;
 };
 
-export type Exposure = ArchiveExposure & { imageUrl: string; coverage: number; visit?: number; visitDates?: [string, string] | null };
+export type Exposure = ArchiveExposure & {
+  imageUrl: string;
+  flagsUrl?: string;
+  coverage: number;
+  visit?: number;
+  visitDates?: [string, string] | null;
+};
 export type InventoryExposure = ArchiveExposure & { visit: number; wavelengthBounds?: [number, number] | null };
 export type Bandpass = { wavelength: number; bandwidth: number };
 export type ExposureIssue = 'no-usable-pixels' | 'read-failed';

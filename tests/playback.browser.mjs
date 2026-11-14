@@ -402,6 +402,126 @@ test('keeps Stack and Difference inputs synchronized with the active sequence', 
   }
 });
 
+test('opens Pixel Flags from the tool rail and inspects each exposure', { timeout: 25_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  const secondMap = Promise.withResolvers();
+  try {
+    const page = await browser.newPage({ hasTouch: true });
+    page.setDefaultTimeout(6_000);
+    const { result, summary } = sequence('lookup.1', [0, 1]);
+    const requests = [];
+    for (const [index, frame] of result.frames.entries()) {
+      frame.flagsUrl = `/api/playback/lookup.1/flags/frame-${index}`;
+    }
+    const flagMap = (samples) => {
+      const bytes = Buffer.alloc(5 * samples.length);
+      for (const [index, [flags, status]] of samples.entries()) {
+        bytes.writeUInt32LE(flags, index * 5);
+        bytes.writeUInt8(status, index * 5 + 4);
+      }
+      return { width: 2, height: 2, samples: bytes.toString('base64'), definitions: {
+        10: ['HOT', 'Noisy detector pixel'], 21: ['SOURCE', 'Known source'], 25: ['STREAK', 'Satellite streak'],
+      } };
+    };
+
+    await page.route('**/*', async (route) => {
+      const url = new URL(route.request().url());
+      if (url.origin !== origin) return route.abort();
+      const path = url.pathname;
+      if (path === '/api/playback') return route.fulfill({ json: { id: 'lookup' } });
+      if (path === '/api/playback/lookup') return route.fulfill({ json: { ...base, sequences: [summary] } });
+      if (path === '/api/playback/lookup.1') return route.fulfill({ json: result });
+      if (path.includes('/images/') || path.endsWith('/image-math')) {
+        return route.fulfill({ body: png, contentType: 'image/png' });
+      }
+      if (path.includes('/flags/')) {
+        requests.push(path);
+        const first = path.endsWith('frame-0');
+        if (!first) await secondMap.promise;
+        return route.fulfill({ json: flagMap(first
+          ? [[1 << 10, 1], [1 << 21, 2], [0, 0], [0, 2]]
+          : [[1 << 25, 2], [0, 2], [0, 0], [0, 3]]) });
+      }
+      return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
+    });
+
+    const button = (name) => page.getByRole('button', { name, exact: true });
+    const panel = page.getByRole('region', { name: 'Pixel Flags', exact: true });
+    const rail = page.getByRole('group', { name: 'Active tool' });
+    const readout = panel.locator('.pixel-flag-readout');
+    const overlay = page.locator('.pixel-flag-overlay');
+    const target = button('Inspect pixel flags');
+    await page.goto(origin);
+    await page.getByLabel('Right ascension (RA)').fill('10');
+    await page.getByLabel('Declination (Dec)').fill('20');
+    await button('Compare visits').click();
+    const flagsTool = rail.getByRole('button', { name: 'Pixel Flags', exact: true });
+    await flagsTool.waitFor();
+    assert.deepEqual(requests, []);
+    await button('Stack').click();
+    const stack = page.getByRole('img', { name: /North-up average/ });
+    await stack.waitFor();
+    await flagsTool.press('Enter');
+    await overlay.waitFor();
+    assert.equal(await flagsTool.getAttribute('aria-pressed'), 'true');
+    await stack.waitFor({ state: 'hidden' });
+    await panel.getByRole('button', { name: 'Inspect with arrow keys' }).press('Enter');
+    assert.equal(await target.evaluate((element) => element === document.activeElement), true);
+    const box = await target.boundingBox();
+    const railBox = await rail.boundingBox();
+    const panelBox = await panel.boundingBox();
+    assert.ok(railBox.x + railBox.width <= panelBox.x, 'The tool rail sits to the left of the panel');
+    assert.ok(panelBox.x + panelBox.width <= box.x, 'The sidebar sits to the left of the image');
+    await page.mouse.move(box.x + box.width / 4, box.y + box.height / 4);
+    await readout.getByText('HOT', { exact: true }).waitFor();
+    await readout.getByText('Masked in this exposure', { exact: true }).waitFor();
+    assert.deepEqual(await overlay.evaluate((canvas) => {
+      const pixels = canvas.getContext('2d').getImageData(0, 0, 2, 2).data;
+      return [pixels[3], pixels[7], pixels[11], pixels[15]];
+    }), [135, 0, 0, 0]);
+
+    await target.press('ArrowRight');
+    await readout.getByText('SOURCE', { exact: true }).waitFor();
+    await target.press('ArrowDown');
+    await readout.getByText('No flags set', { exact: true }).waitFor();
+    await page.touchscreen.tap(box.x + box.width / 4, box.y + box.height * 3 / 4);
+    await readout.getByText('Outside detector coverage', { exact: true }).waitFor();
+    await page.touchscreen.tap(box.x + box.width / 4, box.y + box.height / 4);
+    await readout.getByText('HOT', { exact: true }).waitFor();
+
+    await button('Next').click();
+    await readout.getByText('Loading pixel flags…', { exact: true }).waitFor();
+    await readout.getByText('HOT', { exact: true }).waitFor({ state: 'hidden' });
+    await page.touchscreen.tap(box.x + box.width * 3 / 4, box.y + box.height * 3 / 4);
+    await page.mouse.move(box.x + box.width / 4, box.y + box.height / 4);
+    secondMap.resolve();
+    await readout.getByText('STREAK', { exact: true }).waitFor();
+    await page.mouse.move(0, 0);
+    await readout.getByText('Pixel 2, 2 · Pinned', { exact: true }).waitFor();
+    await readout.getByText('Masked in this comparison', { exact: true }).waitFor();
+    await button('Spectrum').click();
+    await overlay.waitFor({ state: 'hidden' });
+    await button('Compare').click();
+    await stack.waitFor();
+    await overlay.waitFor({ state: 'hidden' });
+    await page.setViewportSize({ width: 320, height: 680 });
+    await flagsTool.tap();
+    await overlay.waitFor();
+    const toolBoxes = await Promise.all((await rail.getByRole('button').all()).map((tool) => tool.boundingBox()));
+    assert.equal(toolBoxes.length, 4);
+    for (const tool of toolBoxes) {
+      assert.equal(tool.y, toolBoxes[0].y, 'All four tools fit on the mobile row');
+      assert.ok(tool.x >= 0 && tool.x + tool.width <= 320);
+    }
+    const mobileImage = await target.boundingBox();
+    await page.touchscreen.tap(mobileImage.x + mobileImage.width / 4, mobileImage.y + mobileImage.height / 4);
+    await readout.getByText('STREAK', { exact: true }).waitFor();
+  } finally {
+    secondMap.resolve();
+    await browser.close();
+  }
+});
+
 test('updates the spectrum chart while measurements arrive and keeps partial results', { timeout: 30_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   try {
@@ -564,7 +684,7 @@ test('updates the spectrum chart while measurements arrive and keeps partial res
       assert.ok(strip.y >= frame.y + frame.height - 1);
       assert.ok(strip.y + strip.height <= page.viewportSize().height + 1);
       if (page.viewportSize().width < 600) assert.ok(tools.y >= strip.y + strip.height - 1);
-      else assert.ok(tools.x >= strip.x + strip.width - 1);
+      else assert.ok(tools.x + tools.width <= strip.x + 1);
       await playback.getByRole('slider', { name: 'Playback position' }).waitFor();
       assert.deepEqual(await playback.getByRole('button').evaluateAll((buttons) =>
         buttons.map((button) => button.getAttribute('aria-label'))), ['Previous', 'Play', 'Next']);

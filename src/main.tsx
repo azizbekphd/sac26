@@ -7,6 +7,7 @@ import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
 import { CompareImageControls, CompareMathImage, defaultVisitSelections, retainVisitSelections, type CompareMode } from './CompareImages';
 import { MotionMarkers, MotionReview } from './MotionReview';
+import { PixelFlags } from './PixelFlags';
 import { Spectrum, spectrumDates } from './Spectrum';
 import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
   type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
@@ -49,8 +50,13 @@ type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelec
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string } };
 type SpectrumPick = { id: number; x: number; y: number; position: SkyPosition; dates: ReturnType<typeof spectrumDates> };
-const comparisonTools = ['Compare', 'Motion', 'Spectrum'] as const;
-type ComparisonTool = typeof comparisonTools[number];
+const comparisonTools = [
+  { id: 'compare', label: 'Compare' },
+  { id: 'motion', label: 'Motion' },
+  { id: 'spectrum', label: 'Spectrum' },
+  { id: 'pixel-flags', label: 'Pixel Flags' },
+] as const;
+type ComparisonTool = typeof comparisonTools[number]['id'];
 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
@@ -107,8 +113,9 @@ function App() {
   const currentFrame = useRef<string | undefined>(undefined);
   const [playing, setPlaying] = useState(false);
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const [activeTool, setActiveTool] = useState<ComparisonTool>('Compare');
+  const [activeTool, setActiveTool] = useState<ComparisonTool>('compare');
   const [compareMode, setCompareMode] = useState<CompareMode>('blink');
+  const [pixelFlagReadout, setPixelFlagReadout] = useState<HTMLDivElement | null>(null);
   const [visitSelections, setVisitSelections] = useState(defaultVisitSelections);
   const hasOpenedSequence = useRef(false);
   const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
@@ -120,6 +127,7 @@ function App() {
   const submitAction = useRef<HTMLButtonElement>(null);
   const backAction = useRef<HTMLButtonElement>(null);
   const detailsAction = useRef<HTMLButtonElement>(null);
+  const pixelFlagTarget = useRef<HTMLButtonElement>(null);
   const spectrumTarget = useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const filtersRef = useRef<HTMLDetailsElement>(null);
@@ -147,7 +155,7 @@ function App() {
     ? 'New archive metadata changed the visit grouping. Open a current matched sequence to stack or subtract visits.'
     : !canPlay || result?.mode !== 'matched' || !result.jobId
       ? 'Stack and Difference require a matched sequence.' : '';
-  const imageMathMode = activeTool === 'Compare' && compareMode !== 'blink' ? compareMode : null;
+  const imageMathMode = activeTool === 'compare' && compareMode !== 'blink' ? compareMode : null;
   const imageMathKeys = imageMathMode && visitSelections[imageMathMode];
   const motionJobId = canPlay && result?.motionAvailable && !withdrawn ? result.jobId : undefined;
   const motionUnavailableReason = withdrawn
@@ -205,7 +213,7 @@ function App() {
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
-    setActiveTool('Compare');
+    setActiveTool('compare');
     setCompareMode('blink');
     setVisitSelections(defaultVisitSelections());
     hasOpenedSequence.current = false;
@@ -428,7 +436,7 @@ function App() {
         result.frames.every((frame) => !identities.has(exposureIdentity(frame))))]);
     } else {
       setSearch(null);
-      setActiveTool('Compare');
+      setActiveTool('compare');
       setSpectrumPick(null);
       setStopError('');
       setMarkedMotion({});
@@ -473,7 +481,7 @@ function App() {
   }
 
   function pickSpectrum(x: number, y: number) {
-    if (activeTool !== 'Spectrum' || !view || !exposure) return;
+    if (activeTool !== 'spectrum' || !view || !exposure) return;
     setPlaying(false);
     const position = positionInPatch(view.patch.position, view.patch.fieldSize, x, y);
     const dates = spectrumDates(result?.frames.length ? result.frames : [exposure]);
@@ -658,8 +666,10 @@ function App() {
                       <img className="sky-frame" src={exposure.imageUrl}
                         alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
                     )}
-                    {activeTool === 'Motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
-                    {activeTool === 'Spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
+                    {activeTool === 'pixel-flags' && exposure.flagsUrl && pixelFlagReadout &&
+                      <PixelFlags url={exposure.flagsUrl} targetRef={pixelFlagTarget} readoutHost={pixelFlagReadout} />}
+                    {activeTool === 'motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
+                    {activeTool === 'spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
                       aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
                       onClick={(event) => {
                         if (event.detail === 0) {
@@ -709,26 +719,26 @@ function App() {
                   </section>
                 )}
                 <aside className="exposure-panel" aria-label="Comparison tools">
-                  <div className="comparison-header">
-                    <button ref={backAction} type="button" className="control symbol-control"
+                  <div className="comparison-rail">
+                    <button ref={backAction} type="button" className="control comparison-back"
                       aria-label={backLabel} title={backLabel} onClick={backToSky}>
-                      <span aria-hidden="true">←</span>
+                      {isLoading ? 'Cancel' : 'Back'}
                     </button>
                     <div className="comparison-tools" role="group" aria-label="Active tool">
-                      {comparisonTools.map((tool) => (
-                        <button key={tool} type="button" className="control" aria-pressed={activeTool === tool}
-                          aria-controls={`comparison-tool-${tool.toLowerCase()}`} onClick={() => {
-                            if (tool === 'Compare' && compareMode !== 'blink') setPlaying(false);
-                            setActiveTool(tool);
+                      {comparisonTools.map(({ id, label }) => (
+                        <button key={id} type="button" className="control" aria-pressed={activeTool === id}
+                          aria-controls={`comparison-tool-${id}`} onClick={() => {
+                            if (id === 'compare' && compareMode !== 'blink') setPlaying(false);
+                            setActiveTool(id);
                           }}>
-                          {tool}
+                          {label}
                         </button>
                       ))}
                     </div>
                   </div>
                   <div className="comparison-tool-content">
                     <section id="comparison-tool-compare" className="comparison-tool" aria-label="Compare"
-                      hidden={activeTool !== 'Compare'} onKeyDown={(event) => {
+                      hidden={activeTool !== 'compare'} onKeyDown={(event) => {
                         if (event.key === 'Escape' && detailsOpen) {
                           setDetailsOpen(false);
                           detailsAction.current?.focus();
@@ -823,7 +833,7 @@ function App() {
                         <a className="control source-fits" href={exposure.sourceUrl} target="_blank" rel="noreferrer">Source FITS</a>
                       </section>
                     </section>
-                    <section id="comparison-tool-motion" className="comparison-tool" aria-label="Motion" hidden={activeTool !== 'Motion'}>
+                    <section id="comparison-tool-motion" className="comparison-tool" aria-label="Motion" hidden={activeTool !== 'motion'}>
                       {motionJobId && result ? <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
                         inspected={inspected} selectedCandidate={motionMarker}
                         onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
@@ -831,15 +841,27 @@ function App() {
                         <p className="lookup-status" role="status">{motionUnavailableReason}</p>}
                     </section>
                     <section id="comparison-tool-spectrum" className="comparison-tool" aria-label="Spectrum controls"
-                      hidden={activeTool !== 'Spectrum'}>
+                      hidden={activeTool !== 'spectrum'}>
                       <p id="spectrum-pick-help" className="lookup-status" hidden={Boolean(spectrumPick)}>
                         Select a source on the image. Use arrow keys to move the marker with the keyboard.
                       </p>
                       {spectrumPick && <Spectrum key={spectrumPick.id} position={spectrumPick.position}
-                        initialDates={spectrumPick.dates} release={view.patch.release} visible={activeTool === 'Spectrum'} onClear={() => {
+                        initialDates={spectrumPick.dates} release={view.patch.release} visible={activeTool === 'spectrum'} onClear={() => {
                           setSpectrumPick(null);
                           spectrumTarget.current?.focus({ preventScroll: true });
                         }} />}
+                    </section>
+                    <section id="comparison-tool-pixel-flags" className="comparison-tool" aria-label="Pixel Flags"
+                      hidden={activeTool !== 'pixel-flags'}>
+                      {exposure.flagsUrl ? <>
+                        <div className="pixel-flags-help" id="pixel-flags-help">
+                          <p className="pixel-flags-legend"><span aria-hidden="true" /> Amber marks warnings</p>
+                          <p className="lookup-status">Hover to inspect a pixel. Click or tap to pin it as you change visits.</p>
+                        </div>
+                        <div ref={setPixelFlagReadout} />
+                        <button className="control pixel-flags-focus" type="button"
+                          onClick={() => pixelFlagTarget.current?.focus({ preventScroll: true })}>Inspect with arrow keys</button>
+                      </> : <p className="lookup-status" role="status">Pixel flags are unavailable for this exposure.</p>}
                     </section>
                   </div>
                 </aside>
