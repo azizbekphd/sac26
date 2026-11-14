@@ -135,8 +135,25 @@ def render_png(image, valid, stretch=None):
     normalized = np.clip((values - low) / max(float(high - low), 1e-8), 0, 1)
     brightness = np.zeros(image.shape, dtype=np.uint8)
     brightness[valid] = np.rint(255 * np.arcsinh(8 * normalized) / np.arcsinh(8)).astype(np.uint8)
-    # The sky grid runs south to north, and PNG rows start at the top.
     pixels = np.stack((brightness, valid.astype(np.uint8) * 255), axis=-1)
+    return encode_png(pixels)
+
+
+def render_difference_png(image, valid):
+    magnitude = np.abs(image[valid])
+    limit = float(np.percentile(magnitude, 99.5)) or float(magnitude.max()) or 1
+    strength = np.arcsinh(8 * np.clip(magnitude / limit, 0, 1)) / np.arcsinh(8)
+    endpoints = np.where(
+        (image[valid] < 0)[:, None], [75, 175, 255], [255, 170, 75],
+    )
+    pixels = np.zeros((*image.shape, 4), dtype=np.uint8)
+    pixels[valid, :3] = np.rint(24 + strength[:, None] * (endpoints - 24)).astype(np.uint8)
+    pixels[valid, 3] = 255
+    return encode_png(pixels)
+
+
+def encode_png(pixels):
+    # The sky grid runs south to north, and PNG rows start at the top.
     output = BytesIO()
     Image.fromarray(np.flipud(pixels)).save(output, format="PNG")
     return output.getvalue()

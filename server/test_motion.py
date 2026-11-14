@@ -15,7 +15,7 @@ from .app import app
 from .exposure import Exposure
 from .motion import DetectorResult, MotionError, analyze, format_result
 from .motion_adapter import ROOT, Rejected, inspect, inspect_tracks, validate_request
-from .playback import Center, PlaybackJob, PlaybackSearch
+from .playback import Center, PlaybackJob, PlaybackSearch, ProjectedExposure
 
 PATCH = (133.759875, -7.24225, 6)
 EXPOSURE_KEYS = (
@@ -291,7 +291,9 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
         runner = PlaybackSearch(None, job, *PATCH)
         centers = [Center(item, index, 4.33, .037) for index, item in enumerate(EXPOSURES)]
         image = np.arange(25).reshape((5, 5))
-        runner.publish((centers, (image, image), np.ones(image.shape, dtype=bool), .99, .86))
+        valid = np.ones(image.shape, dtype=bool)
+        projected = ProjectedExposure(image, valid, (np.full(image.shape, 4.33), np.full(image.shape, .037)))
+        runner.publish((centers, (projected,) * 2, valid, .99, .86))
         sequence = next(iter(job.sequences.values()))
         result = {"status": "inspected", "candidates": [], "visits": [None, None]}
 

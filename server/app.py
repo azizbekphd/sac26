@@ -12,6 +12,7 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request, Response
 import httpx
 from pydantic import BaseModel, Field, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from .exposure import ArchiveError, ArchiveFilters, NoExposure, Release, find_exposure
 from .manual import (
@@ -19,7 +20,7 @@ from .manual import (
     indexed_visits, render_selection, run_manual,
 )
 from .motion import MotionError, analyze, available as motion_available, motion_timeout
-from .playback import MAX_FRAMES, PlaybackJob, group_visits, run_playback, visit_dates_by_key
+from .playback import MAX_FRAMES, PlaybackJob, group_visits, render_image_math, run_playback, visit_dates_by_key
 from .spectrum import SpectrumJob, run_spectrum
 
 JOB_RETENTION = 30 * 60
@@ -77,6 +78,11 @@ class ManualSelection(BaseModel):
     keys: list[str] = Field(min_length=2, max_length=MAX_FRAMES)
 
 
+class ImageMathRequest(BaseModel):
+    operation: Literal["stack", "difference"]
+    keys: list[str] = Field(min_length=2, max_length=MAX_FRAMES)
+
+
 class SpectrumRequest(BaseModel):
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
@@ -98,6 +104,7 @@ async def lifespan(app):
         app.state.archive = client
         app.state.lookups = asyncio.Semaphore(4)
         app.state.motion = asyncio.Semaphore(1)
+        app.state.image_math = asyncio.Semaphore(2)
         app.state.playback = {}
         app.state.previews = OrderedDict()
         app.state.spectra = {}
@@ -311,6 +318,35 @@ async def playback_motion(job_id: str, request: Request):
         if exc.status_code == 504:
             raise HTTPException(504, "Motion analysis timed out. Try again.") from exc
         raise
+
+
+@app.post("/api/playback/{job_id}/image-math")
+async def playback_image_math(job_id: str, source: ImageMathRequest, request: Request):
+    job = playback_job(request, job_id)
+    if job.status != "ready" or job.mode != "matched" or len(job.frames) < 2 or not job.projected:
+        raise HTTPException(409, "Open a matched sequence to stack or subtract visits.")
+    withdrawn_message = "New archive metadata changed the visit grouping. Choose a current matched sequence."
+    if withdrawn_sequence(request, job_id):
+        raise HTTPException(409, withdrawn_message)
+
+    keys = set(source.keys)
+    if len(keys) != len(source.keys) or not keys.issubset(job.projected):
+        raise HTTPException(422, "Choose distinct visits from this sequence.")
+    if source.operation == "difference" and len(keys) != 2:
+        raise HTTPException(422, "Choose two visits to subtract.")
+    projected = [job.projected[frame["key"]] for frame in job.frames if frame["key"] in keys]
+
+    async with request.app.state.image_math:
+        if await request.is_disconnected():
+            return Response(status_code=499)
+        if withdrawn_sequence(request, job_id):
+            raise HTTPException(409, withdrawn_message)
+        png = await run_in_threadpool(render_image_math, projected, source.operation)
+        if withdrawn_sequence(request, job_id):
+            raise HTTPException(409, withdrawn_message)
+    if png is None:
+        raise HTTPException(409, "The selected visits have no shared usable pixels at comparable wavelengths.")
+    return Response(png, media_type="image/png", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/playback/{job_id}/images/{name}.png")

@@ -157,7 +157,9 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                         bad = await client.post(f"{path}/comparison", json={"keys": keys})
                         self.assertEqual(bad.status_code, 422)
 
-                    _, exploratory = await finish(await client.post(f"{path}/comparison", json={"keys": [nearby.key, early.key]}))
+                    exploratory_id, exploratory = await finish(await client.post(
+                        f"{path}/comparison", json={"keys": [nearby.key, early.key]},
+                    ))
                     self.assertEqual(exploratory["mode"], "exploratory")
                     self.assertIn("same visit", exploratory["message"])
                     self.assertEqual([frame["key"] for frame in exploratory["frames"]], [early.key, nearby.key])
@@ -166,10 +168,19 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                         png = await client.get(frame["imageUrl"])
                         alphas.append(np.array(Image.open(BytesIO(png.content)))[0, 0, 1])
                     self.assertEqual(alphas, [255, 0])
+                    refused = await client.post(f"/api/playback/{exploratory_id}/image-math", json={
+                        "operation": "stack", "keys": [early.key, nearby.key],
+                    })
+                    self.assertEqual(refused.status_code, 409)
 
-                    _, matched = await finish(await client.post(f"{path}/comparison", json={"keys": [last.key, early.key, later.key]}))
+                    matched_id, matched = await finish(await client.post(f"{path}/comparison", json={"keys": [last.key, early.key, later.key]}))
                     self.assertEqual(matched["mode"], "matched")
                     self.assertEqual([frame["key"] for frame in matched["frames"]], [early.key, later.key, last.key])
+                    stack = await client.post(f"/api/playback/{matched_id}/image-math", json={
+                        "operation": "stack", "keys": [early.key, later.key, last.key],
+                    })
+                    self.assertEqual(stack.status_code, 200)
+                    self.assertEqual(stack.headers["content-type"], "image/png")
 
     async def test_matches_coverage_across_every_selected_frame(self):
         early, _, later, last = fixture()

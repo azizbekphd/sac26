@@ -1,5 +1,6 @@
 import asyncio
 from io import BytesIO
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -9,12 +10,21 @@ import numpy as np
 from PIL import Image
 
 from .app import app
-from .exposure import ArchiveFilters, QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, rows, search
-from .playback import Center, PlaybackJob, PlaybackSearch, bandpass_overlap, group_visits, run_playback
+from .exposure import (
+    ArchiveFilters, QUALITY_MASK, Exposure, Raster, calibration_key, exposure_metadata, exposure_pixels, render_png, rows, search,
+)
+from .playback import (
+    Center, PlaybackJob, PlaybackSearch, ProjectedExposure, bandpass_overlap, group_visits,
+    render_image_math, run_playback,
+)
 
 
 def exposure(name, mjd):
     return Exposure(name, 2, name, mjd)
+
+
+def projected_frame(image):
+    return ProjectedExposure(image, np.ones_like(image, dtype=bool), (np.ones_like(image), np.full_like(image, .25)))
 
 
 class PlaybackTests(unittest.IsolatedAsyncioTestCase):
@@ -148,7 +158,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             if tuple(center.exposure for center in centers) != tuple(items[:2]):
                 waiting.set()
                 await finish.wait()
-            return centers, tuple(image for _ in centers), image > 0, overlap, 1.
+            return centers, (projected_frame(image),) * len(centers), image > 0, overlap, 1.
 
         with (
             patch.object(PlaybackSearch, "discover", discover),
@@ -180,6 +190,10 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([frame["key"] for frame in first_result["frames"]], ["a", "b"])
                 self.assertEqual([frame["visit"] for frame in first_result["frames"]], [1, 2])
                 self.assertEqual((await client.get(first_result["frames"][0]["imageUrl"])).status_code, 200)
+                pair = {"operation": "difference", "keys": ["a", "b"]}
+                difference = await client.post(first_path + "/image-math", json=pair)
+                self.assertEqual(difference.status_code, 200)
+                self.assertEqual(difference.headers["content-type"], "image/png")
 
                 finish.set()
                 await job.task
@@ -194,6 +208,15 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(longer["comparison"]["days"], 3)
                 self.assertNotEqual(longer["frames"][0]["imageUrl"], first_result["frames"][0]["imageUrl"])
                 self.assertEqual((await client.get(first_path)).json(), first_result)
+                extension_path = f"/api/playback/{extension['id']}/image-math"
+                same_pair = await client.post(extension_path, json=pair)
+                self.assertEqual(same_pair.content, difference.content)
+                for operation, keys in (("difference", ["a", "b", "c"]), ("stack", ["a", "a"]),
+                                        ("stack", ["a", "missing"]), ("stack", ["a"]), ("other", ["a", "b"])):
+                    invalid = await client.post(extension_path, json={"operation": operation, "keys": keys})
+                    self.assertEqual(invalid.status_code, 422)
+                expired = await client.post("/api/playback/expired/image-math", json=pair)
+                self.assertEqual(expired.status_code, 404)
 
     async def test_search_continues_after_reaching_the_visit_limit(self):
         items = [exposure(str(index), 60000 + index) for index in range(13)]
@@ -202,7 +225,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 1, .25))
         image = np.ones((3, 3), dtype=np.float32)
         runner.match = AsyncMock(side_effect=lambda items, overlap: (
-            items, tuple(image for _ in items), image > 0, overlap, 1.,
+            items, (projected_frame(image),) * len(items), image > 0, overlap, 1.,
         ))
         try:
             await runner.find_sequences(group_visits(items))
@@ -222,7 +245,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 1, .25))
         image = np.ones((3, 3))
         runner.match = AsyncMock(side_effect=lambda items, overlap: (
-            items, (image,) * len(items), image > 0, overlap, 1.,
+            items, (projected_frame(image),) * len(items), image > 0, overlap, 1.,
         ))
         try:
             await runner.find_sequences(group_visits(items))
@@ -243,7 +266,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
 
         def publish(*items):
             centers = tuple(Center(item, index, 1, .25) for index, item in enumerate(items))
-            runner.publish((centers, (image,) * len(items), image > 0, 1., 1.))
+            runner.publish((centers, (projected_frame(image),) * len(items), image > 0, 1., 1.))
 
         def visible():
             return [item["exposureIds"] for item in job.snapshot()["sequences"]]
@@ -293,7 +316,9 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         runner.discover = discover
         runner.find_usable = AsyncMock(return_value=None)
         runner.center = AsyncMock(side_effect=lambda item, visit: Center(item, visit, 4.33, .05))
-        runner.match = AsyncMock(side_effect=lambda items, overlap: (items, (image,) * len(items), image > 0, overlap, 1.))
+        runner.match = AsyncMock(side_effect=lambda items, overlap: (
+            items, (projected_frame(image),) * len(items), image > 0, overlap, 1.,
+        ))
         await runner.run()
 
         self.assertEqual(job.status, "no-match")
@@ -313,6 +338,9 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(snapshot["motionAvailable"])
             self.assertNotIn("motionResult", snapshot)
             self.assertEqual((await client.post(path + "/motion")).status_code, 409)
+            image_math = await client.post(path + "/image-math", json={"operation": "stack", "keys": ["first", "last"]})
+            self.assertEqual(image_math.status_code, 409)
+            self.assertIn("changed the visit grouping", image_math.json()["detail"])
             self.assertEqual((await client.get(snapshot["frames"][0]["imageUrl"])).status_code, 200)
 
     async def test_later_metadata_updates_visit_ids_when_exposures_stay_distinct(self):
@@ -321,10 +349,11 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         runner = PlaybackSearch(None, job, 10, 20, 6)
         image = np.ones((3, 3))
         centers = [Center(first, 1, 4.33, .05), Center(last, 2, 4.33, .05)]
-        runner.publish((centers, (image, image), image > 0, 1., 1.))
+        runner.publish((centers, (projected_frame(image),) * 2, image > 0, 1., 1.))
         runner.revalidate_visits(group_visits([older, first, last]))
         child, = job.ranked_sequences()
         self.assertEqual([frame["visit"] for frame in child.frames], [2, 3])
+        self.assertEqual(job.snapshot()["sequences"][0]["visits"], [2, 3])
 
     async def test_bounded_metadata_publishes_preview_before_full_query_times_out(self):
         item = exposure("first", 60000)
@@ -443,6 +472,69 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
 
         matching_bands[b.exposure.key][0][0, 0] = 1.0626
         self.assertIsNone(await runner.match((a, b), .75))
+
+    async def test_image_math_uses_only_selected_pixels_and_chronological_direction(self):
+        earlier = np.array([[10., 15., 30., 40., 50., 60.]])
+        later = np.array([[12., 13., 30., 60., 70., 60.]])
+        extra = np.array([[18., 23., 42., 90., 110., 60.]])
+        projected = (
+            projected_frame(earlier),
+            ProjectedExposure(later, np.array([[True, True, True, False, True, True]]),
+                              (np.array([[1., 1., 1., 1., 1.2, 1.]]), np.full_like(later, .25))),
+            ProjectedExposure(extra, np.array([[False, True, True, True, True, True]]),
+                              (np.ones_like(extra), np.full_like(extra, .25))),
+        )
+        pair_mask = np.array([[True, True, True, False, False, True]])
+        self.assertEqual(render_image_math(projected[:2], "stack"), render_png(
+            np.array([[11., 14., 30., 50., 60., 60.]]), pair_mask,
+        ))
+        sequence_mask = np.array([[False, True, True, False, False, True]])
+        self.assertEqual(render_image_math(projected, "stack"), render_png(
+            np.array([[40 / 3, 17., 34., 190 / 3, 230 / 3, 60.]]), sequence_mask,
+        ))
+
+        job = PlaybackJob("test", sequences={})
+        runner = PlaybackSearch(None, job, 0, 0, 6)
+        centers = [Center(exposure(name, 60000 + index), index + 1, 1, .25)
+                   for index, name in enumerate(("earlier", "later", "extra"))]
+        # The published match uses a stricter mask from all three visits.
+        runner.publish((centers, projected, sequence_mask, 1., float(sequence_mask.mean())))
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            app.state.playback[job.id] = job
+            response = await client.post("/api/playback/test.1/image-math", json={
+                "operation": "difference", "keys": ["later", "earlier"],
+            })
+        self.assertEqual(response.status_code, 200)
+        pixels = np.asarray(Image.open(BytesIO(response.content)))
+        self.assertEqual(pixels[0, 0].tolist(), [255, 170, 75, 255])
+        self.assertEqual(pixels[0, 1].tolist(), [75, 175, 255, 255])
+        self.assertEqual(pixels[0, 2].tolist(), [24, 24, 24, 255])
+        np.testing.assert_array_equal(pixels[..., 3], pair_mask * 255)
+
+    async def test_disconnected_image_math_request_skips_render(self):
+        frame = projected_frame(np.ones((3, 3)))
+        job = PlaybackJob("test", status="ready", frames=[{"key": "a"}, {"key": "b"}],
+                          projected={"a": frame, "b": frame})
+        body = json.dumps({"operation": "stack", "keys": ["a", "b"]}).encode()
+        receive = AsyncMock(side_effect=[
+            {"type": "http.request", "body": body},
+            {"type": "http.disconnect"},
+        ])
+        send = AsyncMock()
+        scope = {
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+            "scheme": "http", "path": "/api/playback/test/image-math", "root_path": "", "query_string": b"",
+            "headers": [(b"content-type", b"application/json")],
+        }
+        async with app.router.lifespan_context(app):
+            app.state.playback[job.id] = job
+            with patch("server.app.render_image_math") as render:
+                await app(scope, receive, send)
+            render.assert_not_called()
+        self.assertEqual(send.await_args_list[0].args[0]["status"], 499)
 
     async def test_sequence_requires_joint_coverage_even_when_each_two_visits_match(self):
         items = tuple(Center(exposure(name, 60000 + index), index, 1, .25) for index, name in enumerate("abc"))

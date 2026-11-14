@@ -10,8 +10,8 @@ import numpy as np
 
 from .exposure import NoExposure, exposure_metadata, exposure_pixels, render_png, sky_grid
 from .playback import (
-    ARCHIVE_ERRORS, JOB_SECONDS, MIN_AREA, MIN_OVERLAP, PlaybackSearch, batches, common_overlap,
-    group_visits, publish_frames,
+    ARCHIVE_ERRORS, JOB_SECONDS, MIN_AREA, MIN_OVERLAP, PlaybackSearch, ProjectedExposure,
+    batches, common_overlap, group_visits, matching_pixels, publish_frames,
 )
 
 log = logging.getLogger(__name__)
@@ -127,13 +127,18 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
             if any(band is None for band in bands):
                 reasons.append("Could not verify bandpass overlap across the patch.")
             else:
-                shared &= common_overlap(bands) >= MIN_OVERLAP - 1e-12
+                shared = matching_pixels(shared, bands)
                 matched_coverage = float(shared.mean())
                 if matched_coverage < MIN_AREA:
                     reasons.append(
                         f"All frames share usable pixels with matching wavelength bands across {matched_coverage:.1%} of the patch. "
                         f"At least {MIN_AREA:.0%} is required."
                     )
+                else:
+                    job.projected = {
+                        item.key: ProjectedExposure(image, mask, tuple(bandpass))
+                        for (item, _), image, mask, bandpass in zip(selected, images, masks, bands)
+                    }
 
     display_masks = masks if reasons else [shared] * len(masks)
     publish_frames(job, [

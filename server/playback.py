@@ -17,7 +17,7 @@ import numpy as np
 
 from .exposure import (
     ArchiveError, ArchiveFilters, Exposure, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
-    exposure_pixels, interpolate_pixels, raster, render_png, rows, search, sky_grid,
+    exposure_pixels, interpolate_pixels, raster, render_difference_png, render_png, rows, search, sky_grid,
 )
 
 ARCHIVE_ERRORS = (ArchiveError, httpx.HTTPError, OSError, ValueError, KeyError)
@@ -48,6 +48,13 @@ def sequence_rank(records, overlap):
     return -len(records), records[0].mjd - records[-1].mjd, -overlap, tuple(item.key for item in records)
 
 
+@dataclass(frozen=True)
+class ProjectedExposure:
+    image: np.ndarray
+    valid: np.ndarray
+    bandpass: tuple[np.ndarray, np.ndarray]
+
+
 @dataclass
 class PlaybackJob:
     id: str
@@ -60,6 +67,7 @@ class PlaybackJob:
     task: asyncio.Task | None = None
     touched: float = field(default_factory=monotonic)
     images: dict[str, bytes] = field(default_factory=dict)
+    projected: dict[str, ProjectedExposure] = field(default_factory=dict)
     records: tuple[Exposure, ...] = ()
     patch: tuple[float, float, int] | None = None
     mode: str = "matched"
@@ -101,6 +109,7 @@ class PlaybackJob:
                 summary = {
                     "id": child.id, "count": len(child.frames), "exposureIds": identities,
                     "keys": [item.key for item in child.records],
+                    "visits": [frame["visit"] for frame in child.frames],
                     "start": child.frames[0]["observedAt"], "end": child.frames[-1]["observedAt"],
                     "bandpass": child.comparison["bandpass"],
                 }
@@ -212,6 +221,25 @@ def common_overlap(bands):
     upper = (waves + widths / 2).min(axis=0)
     with np.errstate(invalid="ignore", divide="ignore"):
         return np.maximum(upper - lower, 0) / widths.max(axis=0)
+
+
+def matching_pixels(valid, bands):
+    return valid & (common_overlap(bands) >= MIN_OVERLAP - 1e-12)
+
+
+def render_image_math(projected, operation):
+    usable = np.logical_and.reduce([item.valid for item in projected])
+    valid = matching_pixels(usable, [item.bandpass for item in projected])
+    if not valid.any():
+        return None
+    if operation == "difference":
+        earlier, later = projected
+        return render_difference_png(np.subtract(later.image, earlier.image, dtype=np.float64), valid)
+    average = np.zeros(valid.shape, dtype=np.float64)
+    for item in projected:
+        average += item.image
+    average /= len(projected)
+    return render_png(average, valid)
 
 
 def publish_frames(job, frames):
@@ -377,11 +405,15 @@ class PlaybackSearch:
         ))
         if any(band is None for band in bands):
             return None
-        valid &= common_overlap(bands) >= MIN_OVERLAP - 1e-12
+        valid = matching_pixels(valid, bands)
         coverage = float(valid.mean())
         if coverage < MIN_AREA:
             return None
-        return items, images, valid, overlap, coverage
+        projected = tuple(
+            ProjectedExposure(image, mask, tuple(bandpass))
+            for image, mask, bandpass in zip(images, masks, bands)
+        )
+        return items, projected, valid, overlap, coverage
 
     async def find_usable(self, exposures):
         async def candidate(item):
@@ -514,19 +546,20 @@ class PlaybackSearch:
             self.job.partial = True
 
     def publish(self, result):
-        items, images, valid, overlap, coverage = result
+        items, projected, valid, overlap, coverage = result
         records = tuple(center.exposure for center in items)
         keys = tuple(item.key for item in records)
         if keys in self.verified:
             return
         sequences = self.job.sequences
         child = PlaybackJob(f"{self.job.id}.{len(sequences) + 1}", status="ready", message="",
-                            records=records, patch=self.job.patch, filters=self.job.filters)
+                            records=records, patch=self.job.patch, filters=self.job.filters,
+                            projected=dict(zip(keys, projected)))
         publish_frames(child, [
             ({**exposure_metadata(center.exposure, center.wavelength, coverage),
               "bandwidth": center.bandwidth, "visit": center.visit,
-              "visitDates": self.visit_dates.get(center.exposure.key)}, image, valid)
-            for center, image in zip(items, images)
+              "visitDates": self.visit_dates.get(center.exposure.key)}, frame.image, valid)
+            for center, frame in zip(items, projected)
         ])
         child.comparison = {
             "days": items[-1].exposure.mjd - items[0].exposure.mjd,
