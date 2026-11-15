@@ -18,6 +18,10 @@ RUN --mount=type=bind,target=/context --mount=type=secret,id=motion-detector_b64
       tar -xzf /context/motion-detector.tar.gz -C /detector; \
     fi
 
+FROM python:3.13-slim-bookworm AS exposure-index
+COPY deploy/install-spherex-index.py deploy/spherex-index.lock /build/
+RUN python /build/install-spherex-index.py /build/spherex-index.lock /snapshot/spherex.sqlite3
+
 FROM python:3.13-slim-bookworm
 WORKDIR /app
 ENV HOME=/tmp \
@@ -32,6 +36,7 @@ COPY --from=detector /detector/ /usr/local/share/spherex-motion-detector/
 RUN pip install --no-cache-dir -r requirements.txt -r /usr/local/share/spherex-motion-detector/requirements.txt \
     && pip check
 COPY server/ ./server/
+COPY --from=exposure-index /snapshot/ ./data/
 COPY --from=viewer /build/dist/ ./dist/
 RUN python -c 'from server.motion_adapter import verify_frozen; verify_frozen()'
 

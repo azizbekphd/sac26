@@ -7,8 +7,10 @@ from dataclasses import dataclass
 from io import BytesIO, StringIO
 from ipaddress import IPv4Address
 import json
+import logging
 import math
 import re
+import sqlite3
 from typing import Literal, get_args
 from urllib.parse import quote, urlsplit
 
@@ -19,6 +21,8 @@ from astropy.wcs import WCS
 import httpx
 import numpy as np
 from PIL import Image
+
+from .exposure_index import index_path, matching_rows
 
 IRSA_HOST = "irsa.ipac.caltech.edu"
 SIA = f"https://{IRSA_HOST}/SIA"
@@ -36,6 +40,7 @@ SEARCH_LIMIT = 32
 CANDIDATE_LIMIT = 8
 ROW_READ_BYTES = 2 * 1024 * 1024
 WAVELENGTH_TIMEOUT = 5
+log = logging.getLogger(__name__)
 
 
 class ArchiveError(Exception):
@@ -270,8 +275,24 @@ async def resolve_irsa(client):
     raise ValueError("The DNS resolver did not return a public IRSA address.")
 
 
+async def search_index(corners, limit, *, region=None, filters=ArchiveFilters()):
+    path = index_path()
+    if not path.is_file():
+        return None
+    try:
+        rows, truncated = await asyncio.to_thread(matching_rows, path, corners, region, filters, limit)
+    except sqlite3.DatabaseError:
+        log.exception("Could not read the SPHEREx exposure snapshot")
+        return None
+    return [Exposure(*row) for row in rows], truncated
+
+
 async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=False, filters=ArchiveFilters(),
                  read_timeout=45):
+    corners = tuple(corners)
+    indexed = await search_index(corners, limit, region=region, filters=filters)
+    if indexed is not None:
+        return indexed
     if region is None:
         region = "POLYGON " + " ".join(f"{value:.9f}" for corner in corners for value in corner)
     releases = RELEASES if filters.release is None else (filters.release,)

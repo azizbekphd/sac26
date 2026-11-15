@@ -6,6 +6,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date
 from functools import partial
 from pathlib import Path
+import sqlite3
 from time import monotonic
 from typing import Annotated, Literal, get_args
 from uuid import uuid4
@@ -19,6 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from .catalogs import Catalog, catalog_sources
 from .exposure import ArchiveError, ArchiveFilters, NoExposure, Release, find_exposure
+from .exposure_index import index_path, snapshot_info
 from .manual import (
     CALIBRATION_BATCH, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
     indexed_visits, render_selection, run_manual,
@@ -131,6 +133,15 @@ async def lifespan(app):
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+@app.get("/api/archive-index")
+async def archive_index_status(response: Response):
+    response.headers["Cache-Control"] = "no-store"
+    try:
+        return await run_in_threadpool(snapshot_info, index_path())
+    except sqlite3.DatabaseError:
+        raise HTTPException(503, "No exposure snapshot is available.") from None
 
 
 @app.post("/api/spectrum", status_code=202)

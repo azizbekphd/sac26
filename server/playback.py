@@ -17,7 +17,7 @@ import numpy as np
 
 from .exposure import (
     ArchiveError, ArchiveFilters, Exposure, PixelQuality, bilinear_pixels, calibration_key, detector_pixels, exposure_metadata,
-    exposure_pixels, interpolate_pixels, raster, render_difference_png, render_png, rows, search, sky_grid,
+    exposure_pixels, interpolate_pixels, raster, render_difference_png, render_png, rows, search, search_index, sky_grid,
 )
 
 ARCHIVE_ERRORS = (ArchiveError, httpx.HTTPError, OSError, ValueError, KeyError)
@@ -594,6 +594,11 @@ class PlaybackSearch:
     async def discover(self):
         # Keep wavelength-ineligible exposures in the timeline for visit grouping.
         filters = replace(self.job.filters, min_wavelength=None, max_wavelength=None)
+        indexed = await search_index(self.corners, METADATA_LIMIT, filters=filters)
+        if indexed is not None:
+            exposures, truncated = indexed
+            yield exposures, truncated, not truncated
+            return
 
         async def query(corners, limit, region=None, delay=0, budget=METADATA_SECONDS):
             if delay:

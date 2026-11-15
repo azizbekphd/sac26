@@ -10,6 +10,9 @@
 !server/*.py
 server/test_*.py
 !motion-detector.tar.gz
+!deploy/
+!deploy/install-spherex-index.py
+!deploy/spherex-index.lock
 !src/
 !src/**
 !public/

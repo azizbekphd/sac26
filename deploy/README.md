@@ -17,6 +17,19 @@ rm -r "$bundle_dir"
 
 If the detector bundle changes, use **Clear build cache & deploy** so Docker extracts the new secret. Once the generated Render URL serves the viewer and API, add `phds-sac26.earth` under **Custom Domains** and apply the DNS records Render provides in Porkbun. Render adds the `www` redirect for an apex domain. Verify the managed certificate and both `/` and `/embed` over HTTPS. The Free instance has 512 MB of RAM and spins down after 15 minutes without traffic.
 
+### SPHEREx exposure snapshot
+
+Run **Refresh SPHEREx exposure index** from GitHub Actions on `main` for the initial snapshot. The workflow also runs every Saturday. It exports DR1 and QR3 Level 2 footprints from IRSA, including the deep surveys, and builds a SQLite R-tree. It publishes the compressed database as a versioned asset on this repository's GitHub Releases and updates [the lock file](spherex-index.lock) only after the asset uploads. Keep Render's auto-deploy mode set to **After CI Checks Pass**. The refresh dispatches the verification workflow for the updated lock, then checks the live snapshot timestamp and counts and requests a new S3 exposure preview on Render.
+
+Docker verifies the asset against the lock file and bundles the uncompressed SQLite file into the image. Render reads it from disk on each lookup, including after spin-down. The previous image and release asset remain available when an export, validation, or build fails. With an empty lock, the viewer uses live IRSA metadata. Check `GET /api/archive-index` for the bundled snapshot timestamp and row counts.
+
+For a local refresh and lookup:
+
+```sh
+PYTHONPATH=. python deploy/build-spherex-index.py .cache/spherex.sqlite3
+SPHEREX_INDEX_PATH="$PWD/.cache/spherex.sqlite3" python -m uvicorn server.app:app
+```
+
 ## Azure free trial
 
 The Azure free account provides up to $200 in credit for 30 days to eligible users. Keep the subscription spending limit enabled. Azure stops the service when the credit is exhausted or expires. The bootstrap checks that the spending limit is enabled before it creates the resource group, the Basic container registry and the Consumption environment. It limits GitHub's deployment identity to the `main` branch of the supplied repository.
