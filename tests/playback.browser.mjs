@@ -76,6 +76,76 @@ async function routeCoordinateViewer(context, lookupStatus) {
   return requests;
 }
 
+test('keeps the patch drawer closed while panning and pinching the sky map', { timeout: 25_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  try {
+    const context = await browser.newContext({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const requests = await routeCoordinateViewer(context, async (_, __, ready) => ready);
+    await context.route(/\/(?:DSS2\/color|DSS\/DSSColor)\//, (route) => {
+      if (route.request().url().endsWith('/properties')) {
+        return route.fulfill({ body: 'dataproduct_type=image\nhips_order=9\nhips_frame=equatorial\nhips_tile_width=512\nhips_tile_format=jpeg\n' });
+      }
+      return route.fulfill({ body: png, contentType: 'image/png' });
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(6_000);
+    await page.goto(`${origin}/?ra=80&dec=-2`);
+    await page.getByText('Pick a point on the sky').waitFor();
+    await page.getByRole('button', { name: 'Hide patch' }).tap();
+    const drawer = page.locator('#patch-drawer');
+    const coordinates = () => page.evaluate(() => location.search);
+    const initial = await coordinates();
+    await page.locator('.map-host').evaluate((host) => {
+      host.addEventListener('AL:position.changed', () => { host.dataset.panned = 'true'; });
+      host.addEventListener('AL:zoom.changed', () => { host.dataset.zoomed = 'true'; });
+    });
+    const cdp = await context.newCDPSession(page);
+    const touch = (type, ...points) => cdp.send('Input.dispatchTouchEvent', {
+      type, touchPoints: points.map(([id, x, y]) => ({ id, x, y })),
+    });
+
+    await touch('touchStart', [1, 150, 240]);
+    await touch('touchMove', [1, 200, 260]);
+    await touch('touchMove', [1, 250, 280]);
+    await touch('touchEnd');
+    await page.locator('.map-host[data-panned]').waitFor();
+    assert.equal(await drawer.isVisible(), false, 'A drag should keep the drawer closed');
+    assert.equal(await coordinates(), initial);
+
+    await touch('touchStart', [1, 150, 240]);
+    await touch('touchStart', [1, 150, 240], [2, 240, 240]);
+    await touch('touchMove', [1, 90, 240], [2, 300, 240]);
+    // Release one contact while the other is still down to reproduce the stray click.
+    await touch('touchEnd', [2, 300, 240]);
+    await touch('touchEnd');
+    await page.locator('.map-host[data-zoomed]').waitFor();
+    assert.equal(await drawer.isVisible(), false, 'Lifting both fingers should keep the drawer closed');
+    assert.equal(await coordinates(), initial);
+
+    await page.touchscreen.tap(195, 240);
+    await drawer.waitFor();
+    const tapped = await coordinates();
+    assert.notEqual(tapped, initial, 'A fresh tap should select a patch');
+
+    await page.getByRole('button', { name: 'Hide patch' }).click();
+    await page.mouse.click(240, 240);
+    await drawer.waitFor();
+    const clicked = await coordinates();
+    assert.notEqual(clicked, tapped, 'A mouse click should select a patch');
+
+    await page.getByRole('button', { name: 'Hide patch' }).click();
+    await page.mouse.click(120, 200, { button: 'right' });
+    await page.getByText('Select sources', { exact: true }).hover();
+    await page.getByText('Rectangular', { exact: true }).click();
+    await page.touchscreen.tap(300, 500);
+    assert.equal(await drawer.isVisible(), false, 'The map selection tool should keep the drawer closed');
+    assert.equal(await coordinates(), clicked);
+    assert.equal(requests.length, 0);
+  } finally {
+    await browser.close();
+  }
+});
+
 test('prefills shared patches and browser history without starting a comparison', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   const staleLookup = Promise.withResolvers();

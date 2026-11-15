@@ -2,6 +2,52 @@ import { useEffect, useEffectEvent, useRef, useState } from 'react';
 import type { SkyPosition } from './coordinates';
 
 const survey = 'https://irsa.ipac.caltech.edu/data/hips/CDS/DSS2/color';
+const aladinLongPressMs = 800; // Aladin Lite's context menu delay
+
+type Atlas = ReturnType<typeof import('aladin-lite').default.aladin>;
+
+function listenForMapPicks(host: HTMLDivElement, atlas: Atlas, signal: AbortSignal, pick: (position: SkyPosition) => void) {
+  const doc = host.ownerDocument;
+  const options = { capture: true, passive: true, signal };
+  let touchStart: TouchEvent | undefined;
+  let primaryPress = false;
+  let canPick = false;
+
+  function isMapCanvas(target: EventTarget | null) {
+    return target instanceof HTMLCanvasElement && host.contains(target);
+  }
+
+  // Observe every contact so a second finger invalidates a tap even if it lands off the map.
+  doc.addEventListener('touchstart', (event) => {
+    touchStart = event.touches.length === 1 && isMapCanvas(event.target) ? event : undefined;
+    primaryPress = false;
+  }, options);
+  doc.addEventListener('touchcancel', () => { touchStart = undefined; }, options);
+
+  // Aladin calls its click handler during release, but can do so for the last finger of a pinch.
+  doc.addEventListener('touchend', (event) => {
+    canPick = touchStart !== undefined && event.touches.length === 0 && event.changedTouches.length === 1 &&
+      event.changedTouches[0].identifier === touchStart.touches[0].identifier &&
+      event.timeStamp - touchStart.timeStamp < aladinLongPressMs;
+    touchStart = undefined;
+  }, options);
+  doc.addEventListener('pointerdown', (event) => {
+    // Touch can generate a second mouseup without a corresponding mouse pointerdown.
+    primaryPress = event.pointerType !== 'touch' && event.button === 0 && isMapCanvas(event.target);
+  }, options);
+  doc.addEventListener('pointercancel', () => { primaryPress = false; }, options);
+  doc.addEventListener('mouseup', (event) => {
+    canPick = primaryPress && event.button === 0 && event.buttons === 0;
+    primaryPress = false;
+  }, options);
+
+  atlas.on('click', ({ ra, dec, isDragging }) => {
+    const valid = canPick && !isDragging;
+    canPick = false;
+    if (valid && Number.isFinite(ra) && Number.isFinite(dec)) pick({ ra: ((ra % 360) + 360) % 360, dec });
+  });
+  signal.addEventListener('abort', () => atlas.off('click'), { once: true });
+}
 
 function patchCorners({ ra, dec }: SkyPosition, fieldSize: number): [number, number][] {
   const radians = Math.PI / 180;
@@ -27,10 +73,12 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
   onPick: (position: SkyPosition) => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
-  const atlasRef = useRef<ReturnType<typeof import('aladin-lite').default.aladin> | null>(null);
+  const atlasRef = useRef<Atlas | null>(null);
   const markRef = useRef<((position: SkyPosition | null, size: number) => void) | null>(null);
   const [status, setStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading');
-  const pick = useEffectEvent(onPick);
+  const pick = useEffectEvent((position: SkyPosition) => {
+    if (active) onPick(position);
+  });
 
   useEffect(() => {
     const atlas = atlasRef.current;
@@ -113,11 +161,7 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
           outline.reportChange();
         };
 
-        atlas.on('click', ({ ra, dec, isDragging }) => {
-          if (isDragging || !Number.isFinite(ra) || !Number.isFinite(dec)) return;
-          const position = { ra: ((ra % 360) + 360) % 360, dec };
-          pick(position);
-        });
+        listenForMapPicks(element, atlas, controller.signal, (position) => pick(position));
         setStatus('ready');
       } catch {
         if (!controller.signal.aborted) setStatus('unavailable');
@@ -125,10 +169,7 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
     }
 
     void openAtlas(host);
-    return () => {
-      controller.abort();
-      atlasRef.current?.off('click');
-    };
+    return () => controller.abort();
   }, []);
 
   return (
