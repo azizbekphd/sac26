@@ -537,7 +537,11 @@ function App({ embed }: { embed: boolean }) {
   const drawerAction = drawerOpen ? 'Hide patch' : 'Choose patch';
   const backLabel = isLoading ? 'Cancel lookup' : 'Back to sky';
   const playbackLabel = playing ? 'Pause' : 'Play';
-  const selectedSequenceId = pendingSequence ?? (canPlay ? result?.jobId : undefined);
+  const selectedSequenceId = activeTool === 'motion' && motionJobId
+    ? motionJobId : pendingSequence ?? (canPlay ? result?.jobId : undefined);
+  const selectedSequenceIsListed = sequences.some(({ id }) => id === selectedSequenceId);
+  const unlistedMotionSequence = activeTool === 'motion' && !selectedSequenceIsListed && motionJobId && result
+    ? summarizeSelection(result, motionJobId) : undefined;
   const playbackControls = canPlay && !imageMathMode && (
     <section className="exposure-toolbar" aria-label="Comparison playback">
       <div className="playback-controls" role="group" aria-label="Playback controls">
@@ -566,10 +570,15 @@ function App({ embed }: { embed: boolean }) {
       {sequences.length > (embed ? 1 : 0) && (
         <div className="sequence-choice">
           <label htmlFor="sequence-choice">Sequence</label>
-          <select id="sequence-choice" value={sequences.some((item) => item.id === selectedSequenceId) ? selectedSequenceId : ''} onChange={(event) => {
-            if (event.currentTarget.value) selectSequence(view.patch, event.currentTarget.value);
-          }}>
+          <select id="sequence-choice" value={selectedSequenceIsListed || unlistedMotionSequence ? selectedSequenceId : ''}
+            onChange={(event) => {
+              const id = event.currentTarget.value;
+              if (id && id !== pendingSequence) selectSequence(view.patch, id);
+            }}>
             <option value="" disabled>Choose a sequence</option>
+            {unlistedMotionSequence && <option value={unlistedMotionSequence.id} disabled>
+              {describeSequence(unlistedMotionSequence)}
+            </option>}
             {sequences.map((item, index) => <option key={item.id} value={item.id}>
               {index + 1}. {describeSequence(item)}{manualResults.some(({ result }) => result.jobId === item.id) ? ' · Manual' : ''}
             </option>)}
@@ -858,7 +867,7 @@ function App({ embed }: { embed: boolean }) {
                       {result?.message && (canPlay || sequences.length === 0) && <p className="lookup-status" role="status">
                         {exploratory && 'Matched playback was unavailable. '}{result.message}
                       </p>}
-                      {sequenceControls}
+                      {activeTool === 'compare' && sequenceControls}
                       {canRetry && <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>}
                       {!isLoading && <button type="button" className="control" onClick={editComparison}>Edit exposures</button>}
                       {!imageMathMode && <button ref={detailsAction} className="control details-toggle" type="button"
@@ -928,8 +937,9 @@ function App({ embed }: { embed: boolean }) {
                       </section>
                     </section>
                     <section id="comparison-tool-motion" className="comparison-tool" aria-label="Motion" hidden={activeTool !== 'motion'}>
+                      {activeTool === 'motion' && sequenceControls}
                       {motionJobId && result ? <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
-                        inspected={inspected} selectedCandidate={motionMarker}
+                        inspected={inspected} selectedCandidate={motionMarker} sequenceLoading={Boolean(pendingSequence)}
                         onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
                         onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} /> :
                         <p className="lookup-status" role="status">{motionUnavailableReason}</p>}

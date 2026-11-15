@@ -260,6 +260,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
   const channel = process.env.SAC26_BROWSER_CHANNEL;
   const browser = await chromium.launch({ channel, chromiumSandbox: true });
   const firstMotion = Promise.withResolvers();
+  const otherSequence = Promise.withResolvers();
   try {
     const page = await browser.newPage();
     page.setDefaultTimeout(6_000);
@@ -316,7 +317,10 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
       const match = path.match(/^\/api\/playback\/([^/]+)(?:\/(.+))?$/);
       if (match && sequences[match[1]]) {
         const [, id, action] = match;
-        if (!action) return send(sequences[id].result);
+        if (!action) {
+          if (id === 'lookup.3') await otherSequence.promise;
+          return send(sequences[id].result);
+        }
         if (action.startsWith('images/')) {
           if (id === 'lookup.2' && failExtensionImage) return route.fulfill({ status: 404 });
           return route.fulfill({ body: png, contentType: 'image/png' });
@@ -325,6 +329,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
           const retry = requests.motion.includes(id);
           requests.motion.push(id);
           if (id === 'lookup.1') await firstMotion.promise;
+          if (id === 'lookup.3') return send({ status: 'inspected', visits: [null, null], candidates: [] });
           const [status, displacement, frames, issues] = {
             'lookup.1': ['inspected', 2.1, [0, 1], [null, null]],
             'lookup.2': ['inspected', 3.7, [0, 2, 3], [null, null, null, null]],
@@ -370,6 +375,7 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     await button('Next').click();
     await checkFrame('lookup.1', 1, 2);
     await button('Motion').click();
+    assert.equal(await selector.inputValue(), 'lookup.1');
     await button('Check for motion').click();
     await visible('Checking the sequence for motion…');
     await button('Spectrum').click();
@@ -400,6 +406,8 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     assert.deepEqual(await choices(), ['lookup.2', 'lookup.3']);
     await button('Motion').click();
     await visible('Detected in 2 of 2 visits');
+    assert.equal(await selector.inputValue(), 'lookup.1');
+    assert.deepEqual(await choices(), ['lookup.2', 'lookup.3']);
     withdrawFirst = true;
     await visible('New archive metadata changed the visit grouping. Choose a current sequence to check for motion.');
     await markers.waitFor({ state: 'hidden' });
@@ -452,20 +460,31 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     assert.equal(await selector.inputValue(), 'manual');
     await button('Stop search').click();
     await visible('Search stopped.');
+    await button('Motion').click();
     await selector.selectOption('lookup.3');
+    await visible('Loading sequence…');
+    await visible('Detected in 3 of 4 visits');
+    assert.equal(await selector.inputValue(), 'manual');
+    assert.equal(await button('Retry motion analysis').isDisabled(), true);
+    otherSequence.resolve();
     await visible('1 / 2 visits');
     await markers.waitFor({ state: 'hidden' });
+    await button('Compare').click();
     await checkFrame('lookup.3', 0, 5);
+    await button('Motion').click();
+    assert.equal(await selector.inputValue(), 'lookup.3');
+    await button('Check for motion').click();
+    await visible('No motion candidates met the alert threshold in this sequence.');
     await selector.selectOption('manual');
     await visible('1 / 5 frames');
-    await button('Motion').click();
     await visible('Detected in 3 of 4 visits');
     await markers.locator('.marker-outline').waitFor();
     assert.equal(requests.lookups, 1);
-    assert.deepEqual(requests.motion, ['lookup.1', 'lookup.2', 'manual', 'manual']);
+    assert.deepEqual(requests.motion, ['lookup.1', 'lookup.2', 'manual', 'manual', 'lookup.3']);
     assert.deepEqual(requests.unexpected, []);
   } finally {
     firstMotion.resolve();
+    otherSequence.resolve();
     await browser.close();
   }
 });

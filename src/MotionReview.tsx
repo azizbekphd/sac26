@@ -17,12 +17,13 @@ export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate
   );
 }
 
-export function MotionReview({ jobId, frames, exploratory, inspected, selectedCandidate, onResult, onCandidate }: {
+export function MotionReview({ jobId, frames, exploratory, inspected, selectedCandidate, sequenceLoading, onResult, onCandidate }: {
   jobId: string;
   frames: Exposure[];
   exploratory: boolean;
   inspected?: MotionResult;
   selectedCandidate?: MotionCandidate | null;
+  sequenceLoading: boolean;
   onResult: (result: MotionResult) => void;
   onCandidate: (candidate: MotionCandidate | null) => void;
 }) {
@@ -42,7 +43,7 @@ export function MotionReview({ jobId, frames, exploratory, inspected, selectedCa
   useEffect(() => () => request.current?.abort(), []);
 
   function start() {
-    if (request.current) return;
+    if (sequenceLoading || request.current) return;
     const controller = new AbortController();
     request.current = controller;
     setState('loading');
@@ -73,7 +74,7 @@ export function MotionReview({ jobId, frames, exploratory, inspected, selectedCa
   const candidate = candidates[index];
   return (
     <div className="motion-review">
-      {!state && <button type="button" className="control" onClick={start}>{error ? 'Retry motion analysis' : 'Check for motion'}</button>}
+      {!state && <button type="button" className="control" disabled={sequenceLoading} onClick={start}>{error ? 'Retry motion analysis' : 'Check for motion'}</button>}
       {error && <p className="lookup-status" role="alert">{error}</p>}
       {state === 'loading' && (
         <>
@@ -89,10 +90,10 @@ export function MotionReview({ jobId, frames, exploratory, inspected, selectedCa
       )}
       {skipped.length > 0 && <p className="lookup-status" role="status">Could not evaluate {skipped.length === 1 ? 'exposure' : 'exposures'} {skipped.join(', ')}.</p>}
       {(motionStatus === 'incomplete' || partial) && (
-        <button type="button" className="control" onClick={start}>Retry motion analysis</button>
+        <button type="button" className="control" disabled={sequenceLoading} onClick={start}>Retry motion analysis</button>
       )}
       {motionStatus === 'inspected' && !partial && !candidate && (
-        <p className="lookup-status" role="status">No motion candidates met the alert threshold in the comparable data.</p>
+        <p className="lookup-status" role="status">No motion candidates met the alert threshold in this sequence.</p>
       )}
       {candidate && (
         <>
