@@ -11,7 +11,7 @@ from astropy.io import fits
 
 from .exposure import ArchiveFilters, search, sky_grid
 from .exposure_index import FOOTPRINT, SCHEMA, SCHEMA_VERSION, cap_box, snapshot_info
-from .playback import PlaybackJob, PlaybackSearch
+from .playback import PlaybackJob, PlaybackSearch, run_playback
 from .spectrum import discover_spectrum
 
 
@@ -40,8 +40,10 @@ class ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_playback_finds_exposures_crossing_zero_and_touching_the_patch(self):
         async with httpx.AsyncClient(transport=httpx.MockTransport(self.unreachable)) as client:
-            runner = PlaybackSearch(client, PlaybackJob("test"), 0, 0, 6)
+            job = PlaybackJob("test", require_snapshot=True)
+            runner = PlaybackSearch(client, job, 0, 0, 6)
             ((rows, truncated, full_field),) = [result async for result in runner.discover()]
+            self.assertEqual(job.snapshot()["metadataSource"], "snapshot")
             self.assertEqual([row.key for row in rows], ["qr3/edge", "dr1/center"])
             self.assertFalse(truncated)
             self.assertTrue(full_field)
@@ -49,6 +51,14 @@ class ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
             rows, truncated = await search(client, corners, limit=1)
             self.assertEqual([row.key for row in rows], ["qr3/edge"])
             self.assertTrue(truncated)
+
+    async def test_requiring_a_snapshot_prevents_live_fallback(self):
+        self.path.unlink()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(self.unreachable)) as client:
+            job = PlaybackJob("test", require_snapshot=True)
+            await run_playback(client, job, 0, 0, 6)
+            self.assertEqual(job.status, "error")
+            self.assertEqual(job.message, "The bundled exposure snapshot is unavailable.")
 
     async def test_circle_search_filters_and_distinguishes_empty_results(self):
         async with httpx.AsyncClient(transport=httpx.MockTransport(self.unreachable)) as client:

@@ -24,9 +24,9 @@ def wait_for_snapshot(client, expected):
     raise RuntimeError("Render did not load the selected SPHEREx snapshot")
 
 
-def check_preview(client):
+def check_preview(client, ra=127.69444, dec=-39.1776, release="dr1"):
     response = client.post("/api/playback", json={
-        "ra": 127.69444, "dec": -39.1776, "fieldSize": 6, "release": "dr1",
+        "ra": ra, "dec": dec, "fieldSize": 6, "release": release, "requireSnapshot": True,
     })
     response.raise_for_status()
     path = "/api/playback/" + response.json()["id"]
@@ -37,13 +37,16 @@ def check_preview(client):
             response.raise_for_status()
             job = response.json()
             if preview := job["preview"]:
+                if job.get("metadataSource") != "snapshot":
+                    raise RuntimeError("The Render lookup did not use the bundled exposure snapshot")
                 if not preview["sourceUrl"].startswith(S3):
                     raise RuntimeError("Preview source was not the public SPHEREx S3 bucket")
                 image = client.get(preview["imageUrl"])
                 image.raise_for_status()
                 if image.content.startswith(b"\x89PNG\r\n\x1a\n"):
-                    print("Render returned a PNG for a new playback lookup using the bundled snapshot and S3.")
-                    return
+                    print(f"Render returned a PNG for {release.upper()} at {ra}, {dec} using SQLite and S3: "
+                          f"{preview['key']}", flush=True)
+                    return preview
                 raise RuntimeError("Render did not return a PNG")
             if job["status"] != "searching":
                 raise RuntimeError(job["message"])

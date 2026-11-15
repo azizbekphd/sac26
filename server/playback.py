@@ -38,6 +38,10 @@ TRANSIENT_METADATA_STATUSES = (502, 503, 504)
 log = logging.getLogger(__name__)
 
 
+class SnapshotUnavailable(ArchiveError):
+    pass
+
+
 def batches(items, size):
     remaining = iter(items)
     while batch := tuple(islice(remaining, size)):
@@ -81,6 +85,8 @@ class PlaybackJob:
     motion_result: dict | None = None
     sequences: dict[str, "PlaybackJob"] | None = None
     invalid_sequences: set[str] = field(default_factory=set)
+    require_snapshot: bool = False
+    metadata_source: str | None = None
 
     def accepts_gap(self, days):
         return days >= self.min_gap - 1e-10 and (self.max_gap is None or days <= self.max_gap + 1e-10)
@@ -98,6 +104,8 @@ class PlaybackJob:
             "status": self.status, "message": self.message, "preview": self.preview,
             "frames": self.frames, "comparison": self.comparison, "partial": self.partial, "mode": self.mode,
         }
+        if self.metadata_source is not None:
+            snapshot["metadataSource"] = self.metadata_source
         if self.inventory is not None:
             snapshot["exposures"] = self.inventory
         if self.exposure_issues:
@@ -596,9 +604,12 @@ class PlaybackSearch:
         filters = replace(self.job.filters, min_wavelength=None, max_wavelength=None)
         indexed = await search_index(self.corners, METADATA_LIMIT, filters=filters)
         if indexed is not None:
+            self.job.metadata_source = "snapshot"
             exposures, truncated = indexed
             yield exposures, truncated, not truncated
             return
+        if self.job.require_snapshot:
+            raise SnapshotUnavailable("The bundled exposure snapshot is unavailable.")
 
         async def query(corners, limit, region=None, delay=0, budget=METADATA_SECONDS):
             if delay:
@@ -729,6 +740,9 @@ async def run_playback(client, job, ra, dec, field_size):
     try:
         async with asyncio.timeout(JOB_SECONDS):
             await PlaybackSearch(client, job, ra, dec, field_size).run()
+    except SnapshotUnavailable as error:
+        job.status = "error"
+        job.message = str(error)
     except (httpx.ConnectTimeout, httpx.ConnectError) as exc:
         job.status = "error"
         job.message = "Could not connect to IRSA to list exposures. Try again."

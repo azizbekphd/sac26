@@ -66,6 +66,7 @@ class Patch(BaseModel):
 class PlaybackPatch(Patch):
     minGapDays: float = Field(default=0, ge=0, allow_inf_nan=False)
     maxGapDays: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    requireSnapshot: bool = False
 
     @model_validator(mode="after")
     def check_gap(self):
@@ -215,14 +216,15 @@ def playback_job(request: Request, job_id: str):
     return job
 
 
-def register_job(request, coordinates, run, *args, filters, min_gap=0, max_gap=None, sequences=None):
+def register_job(request, coordinates, run, *args, filters, min_gap=0, max_gap=None, sequences=None,
+                 require_snapshot=False):
     jobs = request.app.state.playback
     cutoff = monotonic() - JOB_RETENTION
     for job_id in list(jobs):
         if jobs[job_id].task.done() and jobs[job_id].touched < cutoff:
             del jobs[job_id]
     job = PlaybackJob(uuid4().hex, patch=coordinates, filters=filters, min_gap=min_gap, max_gap=max_gap,
-                      sequences=sequences)
+                      sequences=sequences, require_snapshot=require_snapshot)
     job.task = asyncio.create_task(run(request.app.state.archive, job, *args))
     jobs[job.id] = job
     return {"id": job.id}
@@ -234,6 +236,7 @@ async def start_playback(patch: PlaybackPatch, request: Request):
     return register_job(
         request, coordinates, run_playback, *coordinates,
         filters=patch.archive_filters(), min_gap=patch.minGapDays, max_gap=patch.maxGapDays, sequences={},
+        require_snapshot=patch.requireSnapshot,
     )
 
 
