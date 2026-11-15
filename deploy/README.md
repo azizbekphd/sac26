@@ -1,8 +1,30 @@
 # Deploy Planet X and SPHEREx
 
-The container serves the Vite build and FastAPI from the same origin. Cloud Run runs one Uvicorn worker on one instance with CPU available between requests. Playback and spectrum jobs live in memory, so a restart or deployment clears active jobs. This deployment uses South Carolina (`us-east1`), near the public SPHEREx archive in AWS `us-east-1`.
+The container serves the Vite build and FastAPI from the same origin. Both deployment targets run one Uvicorn worker on one replica with CPU available between requests. Playback and spectrum jobs live in memory, so a restart or deployment clears active jobs.
 
-## First deployment
+## Azure free trial
+
+The Azure free account provides up to $200 in credit for 30 days to eligible users. Keep the subscription spending limit enabled. Azure stops the service when the credit is exhausted or expires. The bootstrap checks that the spending limit is enabled before it creates the resource group, the Basic container registry and the Consumption environment. It limits GitHub's deployment identity to the `main` branch of the supplied repository.
+
+1. Authenticate the [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli) and [GitHub CLI](https://cli.github.com/). Select the Azure trial subscription and run the bootstrap from the repository root. It packages the validated local detector and stores the compressed bundle in a GitHub Actions secret. Use `MOTION_PYTHON` to select a different Python environment with the validated detector installed.
+
+   ```sh
+   bash deploy/bootstrap-azure.sh SUBSCRIPTION_ID OWNER/REPO
+   ```
+
+2. Run **Verify and deploy** on `main`. The `deploy-azure` job starts one Container Apps replica in East US 2 and checks the generated HTTPS endpoint. The instance has 1 vCPU and 2 GiB of memory. The detector timeout is 230 seconds so it can return an error before Azure's 240-second ingress timeout.
+3. In Porkbun DNS, replace the apex parking records with an `A` record for the environment's static IP. Add the `asuid` TXT record for the app's verification ID. Use the following commands to get both values.
+
+   ```sh
+   az containerapp env show --name sac26 --resource-group sac26 --query properties.staticIp -o tsv
+   az containerapp show --name sac26 --resource-group sac26 --query properties.customDomainVerificationId -o tsv
+   ```
+
+4. In the app's **Custom domains** page, add `phds-sac26.earth` with the [free managed certificate](https://learn.microsoft.com/en-us/azure/container-apps/custom-domains-managed-certificates). Once the domain is marked **Secured**, check `https://phds-sac26.earth/` and `https://phds-sac26.earth/embed`.
+
+## Google Cloud Run first deployment
+
+This deployment uses South Carolina (`us-east1`), near the public SPHEREx archive in AWS `us-east-1`. GitHub uses Azure when Azure configuration is present.
 
 1. Select a dedicated Google Cloud project with active trial credits or authorized billing. Authenticate the [Google Cloud CLI](https://cloud.google.com/sdk/docs/install) and [GitHub CLI](https://cli.github.com/) with permission to configure the project and repository.
 2. From the repository root, run the bootstrap with the project ID and GitHub repository. It verifies the local motion detector, uploads only the frozen sources and requirements to a private Cloud Storage bucket, and configures Artifact Registry and GitHub OIDC. Use `MOTION_PYTHON` to select a different Python environment with the validated detector installed.
@@ -19,7 +41,7 @@ The container serves the Vite build and FastAPI from the same origin. Cloud Run 
    gcloud run services describe sac26 --project PROJECT_ID --region us-east1 --format='value(status.url)'
    ```
 
-## Connect `phds-sac26.earth`
+## Connect `phds-sac26.earth` to Cloud Run
 
 1. [Verify ownership in Google Search Console](https://search.google.com/search-console/welcome) using the TXT record it provides. Manage DNS in [Porkbun](https://kb.porkbun.com/article/231-how-to-add-dns-records-on-porkbun).
 2. Create a [Cloud Run domain mapping](https://cloud.google.com/run/docs/mapping-custom-domains#run) for the root domain using the verified Google account. This feature is in preview.

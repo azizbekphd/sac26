@@ -35,7 +35,9 @@ jobs:
 
   deploy:
     needs: verify
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.GCP_PROJECT_ID != ''
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      vars.GCP_PROJECT_ID != '' && vars.AZURE_SUBSCRIPTION_ID == ''
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     concurrency:
@@ -71,19 +73,7 @@ jobs:
         run: |
           image="$REGION-docker.pkg.dev/$PROJECT/$SERVICE/$SERVICE:$GITHUB_SHA"
           echo "IMAGE=$image" >> "$GITHUB_ENV"
-          docker build --platform linux/amd64 -t "$image" .
-          container=$(docker run --rm -d -p 127.0.0.1:8080:8080 "$image")
-          trap 'docker stop "$container" >/dev/null' EXIT
-          if ! curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1 \
-              http://127.0.0.1:8080/ -o /tmp/sac26-index.html; then
-            docker logs "$container"
-            exit 1
-          fi
-          grep -Fq 'Planet X and SPHEREx' /tmp/sac26-index.html
-          curl --fail --silent --show-error -D /tmp/sac26-embed.headers -o /dev/null http://127.0.0.1:8080/embed
-          grep -Fqi "frame-ancestors 'self' https:" /tmp/sac26-embed.headers
-          status=$(curl --silent --show-error -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/playback/missing)
-          test "$status" = 404
+          bash deploy/smoke-container.sh "$image"
       - name: Push and deploy the tested image
         env:
           CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
@@ -96,3 +86,102 @@ jobs:
             --service-account "sac26-runtime@$PROJECT.iam.gserviceaccount.com" \
             --scaling=1 --no-cpu-throttling --cpu=1 --memory=2Gi --concurrency=16 --timeout=300s \
             --startup-probe=httpGet.path=/,httpGet.port=8080,periodSeconds=5,failureThreshold=12 --quiet
+
+  deploy-azure:
+    needs: verify
+    if: >-
+      github.ref == 'refs/heads/main' && github.event_name != 'pull_request' &&
+      vars.AZURE_SUBSCRIPTION_ID != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    concurrency:
+      group: azure-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      GROUP: sac26
+      APP: sac26
+      REGISTRY: ${{ vars.AZURE_REGISTRY_NAME }}
+      REGISTRY_HOST: ${{ vars.AZURE_REGISTRY_HOST }}
+      PULL_ID: ${{ vars.AZURE_PULL_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build and smoke-test the container
+        env:
+          MOTION_BUNDLE: ${{ secrets.MOTION_DETECTOR_BUNDLE }}
+        run: |
+          test -n "$MOTION_BUNDLE"
+          printf '%s' "$MOTION_BUNDLE" | base64 --decode > motion-detector.tar.gz
+          image="$REGISTRY_HOST/$APP:$GITHUB_SHA"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          bash deploy/smoke-container.sh "$image"
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Push and deploy the tested image
+        run: |
+          az acr login --name "$REGISTRY"
+          docker push "$IMAGE"
+          digest=$(docker image inspect "$IMAGE" --format='{{index .RepoDigests 0}}')
+          if az containerapp show --resource-group "$GROUP" --name "$APP" --output none; then
+            az containerapp update --resource-group "$GROUP" --name "$APP" --image "$digest" --output none
+          else
+            environment=$(az containerapp env show --resource-group "$GROUP" --name "$GROUP" \
+              --query id --output tsv)
+            cat > "$RUNNER_TEMP/sac26-app.yml" <<EOF
+          location: eastus2
+          identity:
+            type: UserAssigned
+            userAssignedIdentities:
+              "$PULL_ID": {}
+          properties:
+            environmentId: "$environment"
+            configuration:
+              activeRevisionsMode: Single
+              ingress:
+                external: true
+                targetPort: 8080
+              registries:
+                - server: "$REGISTRY_HOST"
+                  identity: "$PULL_ID"
+            template:
+              containers:
+                - name: sac26
+                  image: "$digest"
+                  resources:
+                    cpu: 1
+                    memory: 2Gi
+                  env:
+                    - name: SPHEREX_MOTION_MAX_SECONDS
+                      value: "230"
+              scale:
+                minReplicas: 1
+                maxReplicas: 1
+          EOF
+            az containerapp create --resource-group "$GROUP" --name "$APP" \
+              --yaml "$RUNNER_TEMP/sac26-app.yml" --output none
+          fi
+          revision=$(az containerapp show --resource-group "$GROUP" --name "$APP" \
+            --query properties.latestRevisionName --output tsv)
+          test -n "$revision"
+          for attempt in {1..24}; do
+            ready_revision=$(az containerapp show --resource-group "$GROUP" --name "$APP" \
+              --query properties.latestReadyRevisionName --output tsv)
+            if [ "$revision" = "$ready_revision" ]; then
+              break
+            fi
+            sleep 5
+          done
+          test "$revision" = "$ready_revision"
+          fqdn=$(az containerapp show --resource-group "$GROUP" --name "$APP" \
+            --query properties.configuration.ingress.fqdn --output tsv)
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 5 \
+            "https://$fqdn/" --output /tmp/sac26-live.html
+          grep -Fq 'Planet X and SPHEREx' /tmp/sac26-live.html
+          echo "Deployed to https://$fqdn/" >> "$GITHUB_STEP_SUMMARY"

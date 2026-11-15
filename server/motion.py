@@ -24,6 +24,7 @@ from .exposure import sky_projection
 log = logging.getLogger(__name__)
 MAX_OUTPUT_BYTES = 256 * 1024
 ALERT_SCORE = 30
+MAX_MOTION_SECONDS = int(os.environ.get("SPHEREX_MOTION_MAX_SECONDS", "240"))
 
 
 class MotionError(Exception):
@@ -31,7 +32,7 @@ class MotionError(Exception):
 
 
 def motion_timeout(frame_count):
-    return max(120, 20 * frame_count)
+    return min(MAX_MOTION_SECONDS, max(120, 20 * frame_count))
 
 
 class Candidate(BaseModel):

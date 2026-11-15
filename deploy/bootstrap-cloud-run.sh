@@ -15,7 +15,6 @@ pool=sac26-github
 deployer="sac26-deployer@$project.iam.gserviceaccount.com"
 runtime="sac26-runtime@$project.iam.gserviceaccount.com"
 bucket="gs://$project-sac26-motion"
-python=${MOTION_PYTHON:-.venv/bin/python}
 
 command -v gcloud >/dev/null
 command -v gh >/dev/null
@@ -25,12 +24,9 @@ read -r repo_id owner_id <<< "$ids"
 project_number=$(gcloud projects describe "$project" --format='value(projectNumber)')
 [[ "$project_number" =~ ^[0-9]+$ ]]
 
-bundle=$("$python" -c 'from server.motion_adapter import ROOT, verify_frozen; verify_frozen(); print(ROOT)')
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
-tar -C "$bundle" -czf "$temp_dir/motion-detector.tar.gz" \
-  requirements.txt frozen-source-manifest.json source-validation-manifest.json \
-  frozen_revised/{__init__,archive,baseline,calibration,coverage,proposals}.py
+bash deploy/package-motion.sh "$temp_dir/motion-detector.tar.gz"
 
 export CLOUDSDK_CORE_PROJECT="$project"
 gcloud services enable run.googleapis.com artifactregistry.googleapis.com storage.googleapis.com \
