@@ -1,0 +1,55 @@
+# SPHEREx band browser and detector composites
+
+**Status** · Static DR1 scope agreed · S/N pilot complete
+
+Add a **Bands** control to the viewer for a selected sky patch. **Individual channels** shows the 102 nominal SPHEREx channels. **Detector composites** offers one broadband view per detector, made by combining its usable wavelength channels on the same sky grid. Use the composite to inspect broadband structure and step into its individual channels to check a feature.
+
+## Browsing a patch
+
+- Put **Bands** next to **Compare** and **Spectrum** in the patch viewer. Make it available as soon as the patch is applied, including while the exposure search runs or when the search finds no matched visits. Today the workspace tool rail is rendered only when an exposure is available. [Workspace viewer](../src/main.tsx)
+- Open in **Individual channels**. Choose D1–D6 and a channel from 1–17, or use **Previous** and **Next** to step through all 102 in wavelength order. Show the detector, channel, central wavelength, and nominal wavelength range. Start near the current exposure's calibrated wavelength within its detector when available, otherwise start at the first usable channel.
+- Switch to **Detector composites** to view the broadband image for the selected detector. Replace the channel picker with the detector's contributing wavelength range and coverage summary. Returning to **Individual channels** restores the last channel viewed on that detector, or its first usable channel on the first visit.
+- Keep the patch center, angular size, and north-up orientation fixed across both views. Browse independently of the current playback sequence. Returning to **Compare** restores its selected exposure, if available.
+- Keep the 102 channel slots addressable. Label D3 channel 17 and D4 channel 1 **Blank in DR1** because they are at the dichroic crossover. Distinguish those slots from missing coverage at this patch and from an archive error. [IRSA cube guide](https://caltech-ipac.github.io/irsa-tutorials/spherex-hipscube/#understanding-the-hips-all-sky-mosaic-cube)
+
+## Data scope and observation dates
+
+Use the **DR1 all-sky mosaic** as the source for both views in the first version. It is a published combination of survey observations. Label its survey scope on the image. The first Bands view uses the applied sky geometry and the full DR1 channel set. When the applied patch has date or wavelength limits, or selects QR3, show that the mosaic uses its own survey scope and require the user to choose **View DR1 mosaic** before displaying it. This prevents the mosaic from being mistaken for data that match the exposure search. [DR1 release overview](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/overview_dr1.html)
+
+For a later date-bounded option, first measure how many distinct channels cover a fixed sky position within candidate date windows. SPHEREx uses linear variable filters, so one visit can sample only a fraction of a detector's wavelength range at that position. A composite assembled across dates can blur or duplicate a moving target. Date-bounded composites would need per-channel timestamps and coverage before they could support motion review. [IRSA spectral image data products](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-products/#main-science-data-product-spectral-image-multi-extension-fits-files-mef)
+
+## How to make a detector composite
+
+1. Read the detector and channel definitions from the release's `SPECTRAL_CHANNELS` table. Use the numeric FITS `IMAGE` planes and the associated `NHITS` and `FLAGS` data. IRSA's display PNGs apply a fixed stretch that changes the relationship between image values and surface brightness. [SPHEREx Explanatory Supplement, sections 2.5 and 3.4](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/SPHEREx_Expsupp.pdf)
+2. Load the archive tiles that intersect the patch. Mask a channel sample before reprojection if its value is nonfinite, `NHITS` is zero, or the release's quality flags exclude it. Reproject onto the viewer's sky grid using only valid samples. Record the DR1 cube's native sampling of 12.9″ per pixel in the readout. [IRSA all-sky cube data products](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-products/)
+3. At each sky pixel, average the calibrated values of the detector's valid channels with equal weights. This gives a quick-look image in MJy/sr. Use `NHITS` for coverage because it counts contributing input pixels. Estimating S/N requires a separate noise measurement since the cube has no variance plane. [SPHEREx Explanatory Supplement, section 2.5](https://irsa.ipac.caltech.edu/data/SPHEREx/docs/SPHEREx_Expsupp.pdf)
+4. Carry the valid channel count per sky pixel. Treat the two globally blank channels as unavailable when calculating expected coverage, so D3 and D4 can each reach full DR1 coverage with 16 channels. Mask positions with fewer than two valid channels. For positions with partial coverage, let the user inspect the count and label gaps in the contributing spectrum. A pixel's mean can change where the set of contributing wavelengths changes.
+
+Use equal weights for the optional quick-look view. This gives every valid channel the same contribution at a sky pixel. A bandwidth-weighted mean would estimate mean brightness over the detector's spectral interval. Noise weighting would emphasize channels with less measured scatter and can change the effective spectral response.
+
+## Pilot validation
+
+- **Sensitivity.** On representative shallow and deep fields, compare each detector composite against the best eligible individual channel. Use isolated stars and injected faint sources with flat and sloped continuum spectra. Measure recovered signal and background scatter using the same aperture on the calibrated images, then report S/N by detector. Evaluate full-coverage pixels first, then measure the effect of partial coverage. Use a line-rich field to check how averaging dilutes narrow features. The expected gain is roughly √N only when all N channels contain the same source signal and have equal, independent noise.
+- **Alignment and masks.** Check point-source centroids across channels and composites, including a patch that crosses a tile boundary. Check blank channels, partial coverage, zero coverage, and archive failures. Verify that coverage gaps are distinguishable from faint signal. Inspect whether the known DR1 stripes around strong emission lines persist in the composites. [IRSA all-sky cube data products](https://caltech-ipac.github.io/spherex-archive-documentation/spherex-data-products/)
+- **Interaction and retrieval.** Switch detector, channel, and mode while an archive request is in flight. Only the latest request should update the image. Measure time to the first image, time to change selection, and bytes transferred for the smallest and largest supported patches. A full DR1 FITS cube tile is about 300 MB, so test a bounded cutout or byte-range reads before choosing a retrieval path. Reuse the patch projection and image renderer where practical. The current **Stack visits** operation only averages comparable wavelengths over matched visits and serves a separate playback workflow. [IRSA cube guide](https://caltech-ipac.github.io/irsa-tutorials/spherex-hipscube/#about-this-notebook) · [Current image math](../server/playback.py)
+
+## DR1 pilot results
+
+Four cutouts were measured at the native DR1 sampling. Each spans 112 × 112 pixels, roughly 24′ on a side. The table gives equal-weight composite S/N divided by the strongest single-channel S/N for a model point source with constant flux density across wavelengths. It uses apertures with full spectral coverage, excluding the two globally blank channels. The source profile was modeled and the background scatter was measured on the calibrated sky pixels. The offsets are zero-based FITS `(x, y)` origins. [IRSA DR1 cube guide](https://caltech-ipac.github.io/irsa-tutorials/spherex-hipscube/)
+
+| Patch center in ICRS | FITS tile and origin | D1 | D2 | D3 | D4 | D5 | D6 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Galactic plane (60.8130°, +51.3405°) | 445 (184, 156) | 0.60× | 0.82× | 0.85× | 0.77× | 0.76× | 0.83× |
+| Lockman Hole (161.2581°, +57.9941°) | 1517 (400, 200) | 0.66× | 0.95× | 0.94× | 0.84× | 0.88× | **1.27×** |
+| North ecliptic pole (270.6152°, +66.4435°) | 4010 (400, 400) | — | 0.93× | — | — | 0.89× | — |
+| WISE 0855 field (133.7640°, −7.2419°) | 10226 (156, 182) | 0.80× | 0.92× | 0.79× | 0.71× | 0.83× | **1.16×** |
+
+The north-pole cutout had data for D2 and D5. Across the 20 measurable detector and patch combinations, the median ratio was **0.83×** against the best channel and **1.03×** against the median channel. The D6 gains in Lockman Hole and WISE 0855 were the only gains over the best channel for the flat-spectrum model. The median ratios for model flux density proportional to λ⁻² and λ² were **0.83×** and **0.75×**, respectively. Allowing partial-coverage apertures gave **0.84×** for the flat-spectrum model.
+
+For the point-source cross-check, 212 source and detector measurements used isolated 2MASS positions with Kₛ between 8 and 12 and a best-channel S/N of at least 10. The median of the detector and patch medians was **0.85×**. D6 reached a median **1.13×** on eight sources in Lockman Hole and **1.06×** on 21 sources in the WISE 0855 field. Some sources contribute to multiple detectors. Choosing the strongest measured channel for each source favors the single-channel baseline. [2MASS Point Source Catalog](https://irsa.ipac.caltech.edu/2MASS/download/allsky/format_psc.html)
+
+The aperture radius was two pixels, with the mean background measured from radii greater than three and up to five pixels. S/N used robust aperture scatter (1.4826 × median absolute deviation) on 131–167 matched background positions per full-coverage comparison, excluding positions near Kₛ ≤ 10 sources. The model used a common Gaussian profile with a 1.5-pixel FWHM. The baseline masked nonfinite, zero-hit and `OVERFLOW` samples and retained propagated `OUTLIER` samples. Masking `OUTLIER` as well reduced the full-coverage sample to one detector and patch comparison above the 25-aperture minimum. In a separate two-fold spatial holdout, inverse-scatter-squared weighting moved the median ratio from **0.79×** to **0.82×** and gave two wins over the best channel with either weighting. [IRSA mosaic flag definitions](https://irsa.ipac.caltech.edu/onlinehelp/spherex/spherex/mosaic.html)
+
+## First release scope
+
+Build the static DR1 browser with **Individual channels** as the default and **Detector composites** as an optional broadband view. Show the contributing wavelength coverage so users can tell where a composite represents a different mix of channels. The pilot supports describing composites as broadband context with field-dependent sensitivity. Diffuse-source sensitivity, viewer reprojection, and production retrieval performance still need validation. Motion searches and date-bounded composites are deferred.
