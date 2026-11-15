@@ -209,6 +209,43 @@ test('opens and shares coordinate searches and restores them across browser hist
   }
 });
 
+test('clears the filter badge and submitted date after deleting every date segment', { timeout: 20_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  try {
+    const context = await browser.newContext();
+    const requests = await routeCoordinateViewer(context, async (_patch, _id, ready) => ready);
+    const page = await context.newPage();
+    page.setDefaultTimeout(5_000);
+    await page.goto(origin);
+    await page.locator('#ra').fill('10');
+    await page.locator('#dec').fill('20');
+    const badge = page.locator('.patch-filters summary');
+    await badge.click();
+    const date = page.locator('#startDate');
+    await date.fill('2026-01-08');
+    await date.press('ArrowLeft');
+    await date.press('ArrowLeft');
+    await date.press('Backspace');
+    assert.equal(await date.evaluate((input) => input.validity.badInput), true);
+    assert.equal(new URL(page.url()).searchParams.get('startDate'), '2026-01-08');
+
+    await date.press('ArrowRight');
+    await date.press('Backspace');
+    await date.press('ArrowRight');
+    await date.press('Backspace');
+    assert.equal(await date.evaluate((input) => input.validity.badInput), false);
+    assert.equal(await date.inputValue(), '');
+    assert.equal(await badge.textContent(), 'Filters');
+    assert.equal(new URL(page.url()).searchParams.has('startDate'), false);
+
+    await page.getByRole('button', { name: 'Compare visits' }).click();
+    await page.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    assert.equal(requests[0].startDate, null);
+  } finally {
+    await browser.close();
+  }
+});
+
 test('plays a fixed sky patch inside a different origin', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   try {

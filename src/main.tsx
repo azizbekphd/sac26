@@ -219,8 +219,11 @@ function App({ embed }: { embed: boolean }) {
   }
 
   function editFilter(field: FilterField, input: HTMLInputElement) {
+    // Clearing the last date segment can change validity without an input event.
     const bad = input.validity.badInput;
-    if (incompleteFilters.has(field) !== bad) {
+    const wasIncomplete = incompleteFilters.has(field);
+    if (wasIncomplete === bad && (bad || input.value === filters[field])) return;
+    if (wasIncomplete !== bad) {
       const next = new Set(incompleteFilters);
       if (bad) next.add(field);
       else next.delete(field);
@@ -728,7 +731,9 @@ function App({ embed }: { embed: boolean }) {
                         <input id={field} name={field} type={type} min={type === 'number' ? 0 : undefined}
                           step={type === 'number' ? 'any' : undefined}
                           value={incompleteFilters.has(field) ? '' : filters[field]}
-                          onInput={(event) => editFilter(field, event.currentTarget)} />
+                          onInput={(event) => editFilter(field, event.currentTarget)}
+                          onKeyUp={(event) => editFilter(field, event.currentTarget)}
+                          onBlur={(event) => editFilter(field, event.currentTarget)} />
                       </div>
                     ))}
                   </fieldset>
