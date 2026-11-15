@@ -1,6 +1,21 @@
 # Deploy Planet X and SPHEREx
 
-The container serves the Vite build and FastAPI from the same origin. Both deployment targets run one Uvicorn worker on one replica with CPU available between requests. Playback and spectrum jobs live in memory, so a restart or deployment clears active jobs.
+The container serves the Vite build and FastAPI from the same origin. Each deployment runs one Uvicorn worker on one replica with CPU available between requests. Playback and spectrum jobs live in memory, so a restart or deployment clears active jobs.
+
+## Render Free
+
+Create a [Free web service](https://render.com/docs/free) in a Hobby workspace with no payment method. Connect only the `sac26` repository, and choose its `main` branch and the Docker runtime. Set the health check path to `/`. Choose **After CI Checks Pass** for automatic deployment.
+
+Add `motion-detector.b64` as a [Render secret file](https://render.com/docs/docker-secrets) using the base64 output from these commands. Keep the output in the secret file editor.
+
+```sh
+bundle_dir=$(mktemp -d)
+bash deploy/package-motion.sh "$bundle_dir/motion-detector.tar.gz"
+openssl base64 -A -in "$bundle_dir/motion-detector.tar.gz"
+rm -r "$bundle_dir"
+```
+
+If the detector bundle changes, use **Clear build cache & deploy** so Docker extracts the new secret. Once the generated Render URL serves the viewer and API, add `phds-sac26.earth` under **Custom Domains** and apply the DNS records Render provides in Porkbun. Render adds the `www` redirect for an apex domain. Verify the managed certificate and both `/` and `/embed` over HTTPS. The Free instance has 512 MB of RAM and spins down after 15 minutes without traffic.
 
 ## Azure free trial
 

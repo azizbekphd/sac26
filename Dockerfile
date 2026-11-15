@@ -6,6 +6,18 @@ COPY index.html tsconfig.json vite.config.ts ./
 COPY src/ ./src/
 RUN npm run build
 
+FROM python:3.13-slim-bookworm AS detector
+RUN --mount=type=bind,target=/context --mount=type=secret,id=motion-detector_b64 \
+    set -eu; \
+    mkdir /detector; \
+    if [ -f /run/secrets/motion-detector_b64 ]; then \
+      base64 -d < /run/secrets/motion-detector_b64 > /tmp/detector.tar.gz; \
+      tar -xzf /tmp/detector.tar.gz -C /detector; \
+      rm /tmp/detector.tar.gz; \
+    else \
+      tar -xzf /context/motion-detector.tar.gz -C /detector; \
+    fi
+
 FROM python:3.13-slim-bookworm
 WORKDIR /app
 ENV HOME=/tmp \
@@ -16,7 +28,7 @@ ENV HOME=/tmp \
     SPHEREX_MOTION_EPHEMERAL_CACHE=1
 
 COPY requirements.txt ./
-ADD motion-detector.tar.gz /usr/local/share/spherex-motion-detector/
+COPY --from=detector /detector/ /usr/local/share/spherex-motion-detector/
 RUN pip install --no-cache-dir -r requirements.txt -r /usr/local/share/spherex-motion-detector/requirements.txt \
     && pip check
 COPY server/ ./server/
