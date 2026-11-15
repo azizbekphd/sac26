@@ -49,7 +49,7 @@ export function SharePatchDialog({ patch }: { patch: SubmittedPatch }) {
   const titleId = useId();
 
   return <>
-    <button ref={trigger} className="control" type="button" aria-haspopup="dialog"
+    <button ref={trigger} className="control share-patch-trigger" type="button" aria-haspopup="dialog"
       onClick={() => dialog.current?.showModal()}>Share patch</button>
     {createPortal(
       <dialog ref={dialog} className="share-patch-dialog" aria-labelledby={titleId}

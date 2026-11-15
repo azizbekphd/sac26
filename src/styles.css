@@ -129,7 +129,7 @@ form { display: grid; gap: 10px; }
 .patch-filter-range input { min-width: 0; }
 .error { color: #fff; font-size: 11px; line-height: 1.45; }
 .form-actions { display: grid; gap: 5px; }
-.form-actions .control { justify-content: flex-start; }
+.form-actions .control, .share-patch-trigger { justify-content: flex-start; }
 
 .share-patch-dialog {
   width: min(440px, calc(100% - 24px));
