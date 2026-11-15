@@ -1,6 +1,6 @@
 import '@fontsource/ibm-plex-mono/latin-400.css';
 import '@fontsource/ibm-plex-mono/latin-600.css';
-import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useEffectEvent, useMemo, useRef, useState, type FormEvent } from 'react';
 import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, positionInPatch, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
@@ -9,12 +9,13 @@ import { CompareImageControls, CompareMathImage, defaultVisitSelections, retainV
 import { MotionMarkers, MotionReview } from './MotionReview';
 import { PixelFlags } from './PixelFlags';
 import { Spectrum, spectrumDates } from './Spectrum';
-import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type ArchiveRelease, type MotionCandidate, type MotionResult,
-  type PlaybackPatch, type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
+import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type MotionCandidate, type MotionResult,
+  type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
+import { clearPatchQuery, draftQuery, emptyDraft, fieldSizes, filterProblem, patchQuery, readPatchQuery, submittedPatch,
+  type FilterField, type PatchDraft, type SubmittedPatch } from './patchQuery';
+import { SharePatch, SharePatchDialog } from './SharePatch';
 import './styles.css';
 
-const fieldSizes = [3, 6, 12, 24, 48] as const;
-const emptyFields: CoordinateFields = { ra: '', dec: '' };
 const presetStorageKey = 'sac26.target-preset';
 const axes = [
   { key: 'ra', name: 'Right ascension (RA)', example: '133.795129° or 08h55m10.831s', range: '0° to less than 360°' },
@@ -25,26 +26,45 @@ const filterRanges = [
   { label: 'Wavelength (µm)', fields: ['minWavelength', 'maxWavelength'], bounds: ['Minimum', 'Maximum'], type: 'number' },
   { label: 'Time between consecutive selected visits (days, Auto)', fields: ['minGapDays', 'maxGapDays'], bounds: ['Minimum', 'Maximum'], type: 'number' },
 ] as const;
-const emptyFilters = { startDate: '', endDate: '', minWavelength: '', maxWavelength: '', minGapDays: '', maxGapDays: '' };
-type FilterField = keyof typeof emptyFilters;
-
-type PatchDraft = { preset: string; fields: CoordinateFields };
-
 function restorePreset(): PatchDraft {
   try {
     const saved = window.sessionStorage.getItem(presetStorageKey);
     const selected = presets.find(({ name }) => name === saved);
-    if (selected) return { preset: selected.name, fields: selected.fields };
+    if (selected) return { ...emptyDraft, preset: selected.name, fields: selected.fields };
   } catch {
     // The picker is still usable when browser storage is blocked.
   }
-  return { preset: '', fields: emptyFields };
+  return emptyDraft;
 }
 
-type SubmittedPatch = PlaybackPatch & {
-  coordinates: CoordinateFields;
-  fieldSize: typeof fieldSizes[number];
-};
+function rememberPreset(preset: string) {
+  try {
+    if (preset) window.sessionStorage.setItem(presetStorageKey, preset);
+    else window.sessionStorage.removeItem(presetStorageKey);
+  } catch {
+    // The current selection stays in memory when browser storage is blocked.
+  }
+}
+
+function writePatchLocation(query: URLSearchParams, mode: 'draft' | 'applied', replace: boolean) {
+  const url = new URL(window.location.href);
+  clearPatchQuery(url);
+  for (const [key, value] of query) url.searchParams.set(key, value);
+  const state = { ...window.history.state, patchMode: mode };
+  if (replace) window.history.replaceState(state, '', url);
+  else window.history.pushState(state, '', url);
+}
+
+function recordDraft(draft: PatchDraft, replace = window.history.state?.patchMode === 'draft') {
+  writePatchLocation(draftQuery(draft), 'draft', replace);
+}
+
+function recordPatch(patch: SubmittedPatch) {
+  const current = readPatchQuery(new URLSearchParams(window.location.search));
+  const query = patchQuery(patch);
+  const samePatch = current.kind === 'query' && patchQuery(current.patch).toString() === query.toString();
+  writePatchLocation(query, 'applied', samePatch || window.history.state?.patchMode === 'draft');
+}
 
 type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
@@ -55,6 +75,7 @@ const comparisonTools = [
   { id: 'motion', label: 'Motion' },
   { id: 'spectrum', label: 'Spectrum' },
   { id: 'pixel-flags', label: 'Pixel Flags' },
+  { id: 'share', label: 'Share' },
 ] as const;
 type ComparisonTool = typeof comparisonTools[number]['id'];
 
@@ -92,14 +113,14 @@ const emptySearch: SequenceSearch = {
   frames: [], comparison: null, partial: false, sequences: [],
 };
 
-function App() {
+function App({ embed }: { embed: boolean }) {
   const [drawerOpen, setDrawerOpen] = useState(true);
-  const [{ preset, fields }, setDraft] = useState(restorePreset);
+  const [draft, setDraft] = useState(emptyDraft);
+  const { preset, fields, fieldSize, release, filters } = draft;
   const [errors, setErrors] = useState<Partial<CoordinateFields>>({});
-  const [fieldSizeIndex, setFieldSizeIndex] = useState(1);
-  const [release, setRelease] = useState<ArchiveRelease | null>(null);
-  const [hasFilters, setHasFilters] = useState(false);
+  const [queryError, setQueryError] = useState('');
   const [filterError, setFilterError] = useState('');
+  const [incompleteFilters, setIncompleteFilters] = useState<ReadonlySet<FilterField>>(() => new Set());
   const [view, setView] = useState<WorkspaceState | null>(null);
   const [search, setSearch] = useState<SequenceSearch | null>(null);
   const [manualResults, setManualResults] = useState<ManualResult[]>([]);
@@ -132,7 +153,7 @@ function App() {
   const formRef = useRef<HTMLFormElement>(null);
   const filtersRef = useRef<HTMLDetailsElement>(null);
   const draftPosition = useMemo(() => parsePosition(fields), [fields]);
-  const fieldSize = fieldSizes[fieldSizeIndex];
+  const draftPatch = draftPosition && submittedPatch(draft, draftPosition);
   const sequences = useMemo(() => availableSequences(search, manualResults), [search, manualResults]);
 
   const result = view?.result.status === 'ready' ? view.result : search;
@@ -167,15 +188,6 @@ function App() {
     ? markedMotion[motionJobId] : inspected?.candidates[0];
 
   useEffect(() => {
-    try {
-      if (preset) window.sessionStorage.setItem(presetStorageKey, preset);
-      else window.sessionStorage.removeItem(presetStorageKey);
-    } catch {
-      // The current selection stays in memory when browser storage is blocked.
-    }
-  }, [preset]);
-
-  useEffect(() => {
     if (workspaceOpen) backAction.current?.focus({ preventScroll: true });
   }, [workspaceOpen]);
 
@@ -190,16 +202,38 @@ function App() {
     selectionRef.current?.abort();
   }, []);
 
-  const pickPosition = useCallback((position: SkyPosition) => {
+  function editDraft(next: PatchDraft) {
+    if (view) resetComparison();
+    setDraft(next);
+    setQueryError('');
+    recordDraft(next);
+  }
+
+  function editFilter(field: FilterField, input: HTMLInputElement) {
+    const bad = input.validity.badInput;
+    if (incompleteFilters.has(field) !== bad) {
+      const next = new Set(incompleteFilters);
+      if (bad) next.add(field);
+      else next.delete(field);
+      setIncompleteFilters(next);
+    }
+    setFilterError('');
+    // Leave the last complete value in the draft and URL while the browser holds an incomplete entry.
+    if (!bad && input.value !== filters[field]) editDraft({ ...draft, filters: { ...filters, [field]: input.value } });
+  }
+
+  function pickPosition(position: SkyPosition) {
     if (requestRef.current) return;
-    setDraft({ preset: '', fields: formatPosition(position) });
+    rememberPreset('');
+    editDraft({ ...draft, preset: '', fields: formatPosition(position) });
     setErrors({});
     setDrawerOpen(true);
-  }, []);
+  }
 
   function selectPreset(name: string) {
     const selected = presets.find((item) => item.name === name);
-    setDraft((current) => ({ preset: selected?.name ?? '', fields: selected?.fields ?? current.fields }));
+    rememberPreset(selected?.name ?? '');
+    editDraft({ ...draft, preset: selected?.name ?? '', fields: selected?.fields ?? fields });
     if (selected) setErrors({});
   }
 
@@ -210,6 +244,7 @@ function App() {
     const controller = new AbortController();
     requestRef.current = controller;
     setDrawerOpen(true);
+    setManual(null);
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
@@ -322,7 +357,13 @@ function App() {
 
   function stopSearch() {
     const controller = requestRef.current;
-    if (!controller || !search?.jobId) return;
+    if (!controller) return;
+    if (!search?.jobId) {
+      controller.abort();
+      requestRef.current = null;
+      setSearch((current) => current && { ...current, status: 'cancelled', message: 'Search stopped.' });
+      return;
+    }
     setStoppingSearch(true);
     setStopError('');
     void stopPlayback(search.jobId).catch(() => {
@@ -351,59 +392,23 @@ function App() {
     if (!draftPosition) return;
     const submitter = (event.nativeEvent as SubmitEvent).submitter;
     const chooseManually = submitter instanceof HTMLButtonElement && submitter.value === 'manual';
-    const formData = new FormData(event.currentTarget);
-    const filters = { ...emptyFilters };
-    for (const { fields } of filterRanges) {
-      for (const field of fields) filters[field] = String(formData.get(field) ?? '');
-    }
-    const minWavelength = filters.minWavelength ? Number(filters.minWavelength) : null;
-    const maxWavelength = filters.maxWavelength ? Number(filters.maxWavelength) : null;
-    const minGapDays = filters.minGapDays ? Number(filters.minGapDays) : 0;
-    const maxGapDays = filters.maxGapDays ? Number(filters.maxGapDays) : null;
-    let invalidFilter: FilterField | undefined;
-    let message = '';
-    const badNumber = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('.patch-filters input[type="number"]'))
-      .find((input) => input.validity.badInput && (!chooseManually || !input.id.endsWith('GapDays')));
-    if (badNumber) {
-      invalidFilter = badNumber.id as FilterField;
-      message = 'Enter a valid number or leave the field blank.';
-    } else if (filters.startDate && filters.endDate && filters.startDate > filters.endDate) {
-      invalidFilter = 'endDate';
-      message = 'Enter an end date on or after the start date.';
-    } else if (minWavelength !== null && minWavelength <= 0) {
-      invalidFilter = 'minWavelength';
-      message = 'Enter a wavelength greater than zero.';
-    } else if (maxWavelength !== null && (maxWavelength <= 0 || maxWavelength < (minWavelength ?? 0))) {
-      invalidFilter = 'maxWavelength';
-      message = 'Enter a positive maximum wavelength at least as large as the minimum.';
-    } else if (!chooseManually && minGapDays < 0) {
-      invalidFilter = 'minGapDays';
-      message = 'Enter a minimum time gap of zero days or more.';
-    } else if (!chooseManually && maxGapDays !== null && maxGapDays < minGapDays) {
-      invalidFilter = 'maxGapDays';
-      message = 'Enter a maximum time gap at least as large as the minimum.';
-    }
-    setFilterError(message);
-    if (invalidFilter) {
+    const patch = submittedPatch(draft, draftPosition, chooseManually);
+    const incomplete = Array.from(event.currentTarget.querySelectorAll<HTMLInputElement>('.patch-filters input'))
+      .find((input) => (input.validity.badInput || incompleteFilters.has(input.id as FilterField)) &&
+        (!chooseManually || !input.id.endsWith('GapDays')));
+    const problem = incomplete ? { field: incomplete.id as FilterField, message: 'Complete this filter or clear it.' }
+      : filterProblem(patch);
+    setFilterError(problem?.message ?? '');
+    if (problem) {
       if (filtersRef.current) filtersRef.current.open = true;
-      formRef.current?.querySelector<HTMLInputElement>(`#${invalidFilter}`)?.focus();
+      formRef.current?.querySelector<HTMLInputElement>(`#${problem.field}`)?.focus();
       return;
     }
-    const patch: SubmittedPatch = {
-      position: draftPosition,
-      coordinates: { ra: fields.ra.trim(), dec: fields.dec.trim() },
-      fieldSize,
-      release,
-      startDate: filters.startDate || null,
-      endDate: filters.endDate || null,
-      minWavelength,
-      maxWavelength,
-      minGapDays: chooseManually ? 0 : minGapDays,
-      maxGapDays: chooseManually ? null : maxGapDays,
-    };
     if (chooseManually) {
       setManual({ patch });
     } else {
+      setQueryError('');
+      recordPatch(patch);
       loadComparison(patch);
     }
   }
@@ -446,12 +451,14 @@ function App() {
     const previous = manual.seed;
     const sameInputs = previous && previous.mode === result.mode && previous.frames.length === result.frames.length &&
       previous.frames.every((frame, index) => frame.key === result.frames[index].key);
+    setQueryError('');
+    recordPatch(selection.patch);
     openSequence(selection, !sameInputs);
     setManual(null);
     requestAnimationFrame(() => backAction.current?.focus({ preventScroll: true }));
   }
 
-  function backToSky() {
+  function resetComparison() {
     requestRef.current?.abort();
     requestRef.current = null;
     selectionRef.current?.abort();
@@ -472,8 +479,37 @@ function App() {
     setMotionResults({});
     setPlaying(false);
     setDrawerOpen(true);
+    setManual(null);
+  }
+
+  function backToSky() {
+    resetComparison();
+    recordDraft(draft, true);
     requestAnimationFrame(() => submitAction.current?.focus({ preventScroll: true }));
   }
+
+  const syncLocation = useEffectEvent(() => {
+    const location = readPatchQuery(new URLSearchParams(window.location.search), embed);
+    const editing = !embed && window.history.state?.patchMode === 'draft';
+    setDraft(location.kind === 'picker' ? restorePreset() : location.draft);
+    setErrors({});
+    setFilterError('');
+    for (const field of incompleteFilters) {
+      const input = formRef.current?.querySelector<HTMLInputElement>(`#${field}`);
+      if (input?.validity.badInput) input.value = '';
+    }
+    if (incompleteFilters.size) setIncompleteFilters(new Set());
+    setQueryError(location.kind === 'invalid' && !editing ? location.message : '');
+    if (location.kind === 'query' && !editing) loadComparison(location.patch);
+    else resetComparison();
+  });
+
+  useEffect(() => {
+    function navigate() { syncLocation(); }
+    navigate();
+    window.addEventListener('popstate', navigate);
+    return () => window.removeEventListener('popstate', navigate);
+  }, []);
 
   function stepFrame(direction: number) {
     setPlaying(false);
@@ -493,9 +529,32 @@ function App() {
   const backLabel = isLoading ? 'Cancel lookup' : 'Back to sky';
   const playbackLabel = playing ? 'Pause' : 'Play';
   const selectedSequenceId = pendingSequence ?? (canPlay ? result?.jobId : undefined);
+  const playbackControls = canPlay && !imageMathMode && (
+    <section className="exposure-toolbar" aria-label="Comparison playback">
+      <div className="playback-controls" role="group" aria-label="Playback controls">
+        <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
+          <span aria-hidden="true">⏮︎</span>
+        </button>
+        <button className="control symbol-control" type="button" aria-label={playbackLabel} title={playbackLabel}
+          onClick={() => setPlaying((active) => !active)}>
+          <span aria-hidden="true">{playing ? '⏸︎' : '▶︎'}</span>
+        </button>
+        <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={() => stepFrame(1)}>
+          <span aria-hidden="true">⏭︎</span>
+        </button>
+      </div>
+      <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
+        value={frameIndex} aria-label="Playback position" aria-valuetext={`Frame ${frameIndex + 1} of ${frameCount}`}
+        onChange={(event) => {
+          setPlaying(false);
+          setFrameIndex(event.currentTarget.valueAsNumber);
+        }} />
+      <span className="frame-count">{frameIndex + 1} / {frameCount} {exploratory ? 'frames' : 'visits'}</span>
+    </section>
+  );
   const sequenceControls = view && (
     <>
-      {sequences.length > 0 && (
+      {sequences.length > (embed ? 1 : 0) && (
         <div className="sequence-choice">
           <label htmlFor="sequence-choice">Sequence</label>
           <select id="sequence-choice" value={sequences.some((item) => item.id === selectedSequenceId) ? selectedSequenceId : ''} onChange={(event) => {
@@ -516,7 +575,7 @@ function App() {
           Retry loading sequence
         </button>
       )}
-      {(canPlay || sequences.length > 0 || (workspaceOpen && isSearching)) && search && (
+      {(embed || canPlay || sequences.length > 0 || (workspaceOpen && isSearching)) && search && (
         <>
           {(canPlay || sequences.length > 0) && (search.reconnecting || isSearching || search.message) && <p className="lookup-status" role="status">
             {search.reconnecting ? 'Reconnecting to the archive search…'
@@ -530,6 +589,39 @@ function App() {
       )}
     </>
   );
+
+  if (embed) {
+    const fullViewer = view ? `/?${patchQuery(view.patch)}` : `/${window.location.search}`;
+    return <main className="embed-viewer" aria-label="SPHEREx comparison">
+      <header className="embed-header">
+        <h1>SPHEREx comparison</h1>
+        <a className="control" href={fullViewer} target="_blank" rel="noopener">Open full viewer</a>
+      </header>
+      {view && <p className="embed-coordinates">
+        RA {view.patch.coordinates.ra}° · Dec {view.patch.coordinates.dec}° · {view.patch.fieldSize}′ × {view.patch.fieldSize}′
+      </p>}
+      <div className="embed-image">
+        {exposure && <img src={exposure.imageUrl}
+          alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />}
+      </div>
+      <div className="embed-controls">
+        {queryError && <p className="error" role="alert">{queryError}</p>}
+        {result?.message && !canPlay && sequences.length === 0 && (
+          <p className={result.status === 'error' ? 'error' : 'lookup-status'}
+            role={result.status === 'error' ? 'alert' : 'status'}>{result.message}</p>
+        )}
+        {exposure && <div className="frame-summary">
+          <time dateTime={exposure.observedAt}>{observationTime} UTC</time>
+          {exposure.wavelength !== null && <span>{exposure.wavelength.toFixed(3)} µm</span>}
+        </div>}
+        {playbackControls}
+        {sequenceControls}
+        {view && (canRetry || (!canPlay && search?.status === 'cancelled')) && (
+          <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
+        )}
+      </div>
+    </main>;
+  }
 
   return (
     <div className="app">
@@ -551,6 +643,7 @@ function App() {
         }}>
           <h2 id="patch-title">Choose a sky patch</h2>
           <form ref={formRef} onSubmit={applyPatch} noValidate>
+            {queryError && <p className="error" role="alert">{queryError}</p>}
             <div className="field">
               <label htmlFor="preset">Target preset</label>
               <div className="preset-select">
@@ -570,7 +663,8 @@ function App() {
                   aria-describedby={errors[key] ? `${key}-error` : undefined}
                   onChange={(event) => {
                     const value = event.target.value;
-                    setDraft((current) => ({ preset: '', fields: { ...current.fields, [key]: value } }));
+                    rememberPreset('');
+                    editDraft({ ...draft, preset: '', fields: { ...fields, [key]: value } });
                     setErrors({ ...errors, [key]: undefined });
                   }} />
                 {errors[key] && <span id={`${key}-error`} className="error">{errors[key]}</span>}
@@ -583,13 +677,16 @@ function App() {
                 <span>{fieldSize}′ × {fieldSize}′</span>
               </div>
               <input id="field-size" type="range" min={0} max={fieldSizes.length - 1} step={1}
-                value={fieldSizeIndex} disabled={isLoading} aria-valuetext={`${fieldSize} by ${fieldSize} arcminutes`}
-                onChange={(event) => setFieldSizeIndex(event.currentTarget.valueAsNumber)} />
+                value={fieldSizes.indexOf(fieldSize)} disabled={isLoading} aria-valuetext={`${fieldSize} by ${fieldSize} arcminutes`}
+                onChange={(event) => {
+                  const size = fieldSizes[event.currentTarget.valueAsNumber];
+                  editDraft({ ...draft, fieldSize: size });
+                }} />
             </div>
 
             <details className="patch-filters" ref={filtersRef}>
               <summary className="control details-toggle">
-                {release || hasFilters ? 'Filters (set)' : 'Filters'}
+                {release || Object.values(filters).some(Boolean) ? 'Filters (set)' : 'Filters'}
               </summary>
               <fieldset disabled={isLoading}>
                 <div className="field">
@@ -597,7 +694,7 @@ function App() {
                   <div className="preset-select">
                     <select id="patch-release" value={release ?? ''} onChange={(event) => {
                       const value = event.target.value;
-                      setRelease(archiveReleases.find((name) => name === value) ?? null);
+                      editDraft({ ...draft, release: archiveReleases.find((name) => name === value) ?? null });
                     }}>
                       <option value="">All releases</option>
                       {archiveReleases.map((name) => <option key={name} value={name}>{name.toUpperCase()}</option>)}
@@ -612,11 +709,8 @@ function App() {
                         <label htmlFor={field}>{bounds[index]}</label>
                         <input id={field} name={field} type={type} min={type === 'number' ? 0 : undefined}
                           step={type === 'number' ? 'any' : undefined}
-                          onInput={(event) => {
-                            const inputs = event.currentTarget.form?.querySelectorAll<HTMLInputElement>('.patch-filters input');
-                            setHasFilters(Array.from(inputs ?? []).some((input) => input.value !== ''));
-                            setFilterError('');
-                          }} />
+                          value={incompleteFilters.has(field) ? '' : filters[field]}
+                          onInput={(event) => editFilter(field, event.currentTarget)} />
                       </div>
                     ))}
                   </fieldset>
@@ -643,6 +737,8 @@ function App() {
               )}
             </div>
             {!workspaceOpen && sequenceControls}
+            {!workspaceOpen && drawerOpen && !queryError && !incompleteFilters.size && draftPatch &&
+              !filterProblem(draftPatch) && <SharePatchDialog patch={draftPatch} />}
           </form>
         </aside>
 
@@ -695,29 +791,7 @@ function App() {
                     </button>}
                   </div>
                 </div>
-                {canPlay && !imageMathMode && (
-                  <section className="exposure-toolbar" aria-label="Comparison playback">
-                    <div className="playback-controls" role="group" aria-label="Playback controls">
-                      <button className="control symbol-control" type="button" aria-label="Previous" title="Previous" onClick={() => stepFrame(-1)}>
-                        <span aria-hidden="true">⏮︎</span>
-                      </button>
-                      <button className="control symbol-control" type="button" aria-label={playbackLabel} title={playbackLabel}
-                        onClick={() => setPlaying((active) => !active)}>
-                        <span aria-hidden="true">{playing ? '⏸︎' : '▶︎'}</span>
-                      </button>
-                      <button className="control symbol-control" type="button" aria-label="Next" title="Next" onClick={() => stepFrame(1)}>
-                        <span aria-hidden="true">⏭︎</span>
-                      </button>
-                    </div>
-                    <input className="frame-slider" type="range" min={0} max={frameCount - 1} step={1}
-                      value={frameIndex} aria-label="Playback position" aria-valuetext={`Frame ${frameIndex + 1} of ${frameCount}`}
-                      onChange={(event) => {
-                        setPlaying(false);
-                        setFrameIndex(event.currentTarget.valueAsNumber);
-                      }} />
-                    <span className="frame-count">{frameIndex + 1} / {frameCount} {exploratory ? 'frames' : 'visits'}</span>
-                  </section>
-                )}
+                {playbackControls}
                 <aside className="exposure-panel" aria-label="Comparison tools">
                   <div className="comparison-rail">
                     <button ref={backAction} type="button" className="control comparison-back"
@@ -863,6 +937,9 @@ function App() {
                           onClick={() => pixelFlagTarget.current?.focus({ preventScroll: true })}>Inspect with arrow keys</button>
                       </> : <p className="lookup-status" role="status">Pixel flags are unavailable for this exposure.</p>}
                     </section>
+                    <section id="comparison-tool-share" className="comparison-tool" aria-label="Share" hidden={activeTool !== 'share'}>
+                      <SharePatch key={patchQuery(view.patch).toString()} patch={view.patch} />
+                    </section>
                   </div>
                 </aside>
               </div>
@@ -876,4 +953,4 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')!).render(<App />);
+createRoot(document.getElementById('root')!).render(<App embed={/^\/embed\/?$/.test(window.location.pathname)} />);

@@ -5,11 +5,14 @@ from collections import OrderedDict
 from contextlib import asynccontextmanager
 from datetime import date
 from functools import partial
+from pathlib import Path
 from time import monotonic
 from typing import Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
@@ -25,6 +28,7 @@ from .spectrum import SpectrumJob, run_spectrum
 
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
+VIEWER_BUILD = Path(__file__).resolve().parent.parent / "dist"
 
 
 class Patch(BaseModel):
@@ -435,3 +439,17 @@ async def exposure(patch: Patch, request: Request):
         )
 
     return await read_exposure(request, prepare, "No usable SPHEREx exposure covers this patch.")
+
+
+@app.get("/", include_in_schema=False)
+@app.get("/embed", include_in_schema=False)
+@app.get("/embed/", include_in_schema=False)
+def viewer(request: Request):
+    index = VIEWER_BUILD / "index.html"
+    if not index.is_file():
+        raise HTTPException(404, "Build the viewer with npm run build first.")
+    ancestors = "'self' https:" if request.url.path.rstrip("/") == "/embed" else "'none'"
+    return FileResponse(index, headers={"Content-Security-Policy": f"frame-ancestors {ancestors}"})
+
+
+app.mount("/assets", StaticFiles(directory=VIEWER_BUILD / "assets", check_dir=False), name="viewer-assets")

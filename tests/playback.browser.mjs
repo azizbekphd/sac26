@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
@@ -8,6 +9,7 @@ const origin = 'https://sac26.test';
 const dist = new URL('../dist/', import.meta.url);
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jPXQAAAAASUVORK5CYII=', 'base64');
 const base = { status: 'ready', message: '', frames: [], preview: null, comparison: null, partial: false };
+const embedParent = 'https://catalog.test';
 
 function exposure(index) {
   return {
@@ -35,6 +37,224 @@ function sequence(id, indices) {
     start: frames[0].observedAt, end: frames.at(-1).observedAt, bandpass: result.comparison.bandpass };
   return { result, summary };
 }
+
+async function routeCoordinateViewer(context, lookupStatus) {
+  const requests = [];
+  const match = sequence('coordinate-sequence', [0, 1]);
+  const alternative = sequence('other-sequence', [2, 3]);
+  await context.route('**/*', async (route) => {
+    const request = route.request();
+    const url = new URL(request.url());
+    if (url.origin === embedParent) {
+      const width = url.searchParams.get('width') ?? '800';
+      return route.fulfill({ contentType: 'text/html', body: `<iframe title="SPHEREx" width="${width}" height="560"
+        src="${origin}/embed?ra=127.69444&amp;dec=-39.1776&amp;fieldSize=6"></iframe>` });
+    }
+    if (url.origin !== origin) return route.abort();
+    if (url.pathname === '/api/playback') {
+      requests.push(request.postDataJSON());
+      return route.fulfill({ json: { id: String(requests.length) } });
+    }
+    if (url.pathname.startsWith('/api/playback/')) {
+      if (request.method() === 'DELETE') return route.fulfill({ status: 204 });
+      if (url.pathname.endsWith('.png')) return route.fulfill({ body: png, contentType: 'image/png' });
+      if (url.pathname.endsWith('/coordinate-sequence')) return route.fulfill({ json: match.result });
+      if (url.pathname.endsWith('/other-sequence')) return route.fulfill({ json: alternative.result });
+      const id = Number(url.pathname.split('/').at(-1));
+      const ready = { ...base, sequences: [match.summary, alternative.summary] };
+      const json = await lookupStatus(requests[id - 1], id, ready);
+      return route.fulfill({ json });
+    }
+    if (url.pathname === '/' || url.pathname === '/embed') {
+      const headers = { 'Content-Security-Policy': url.pathname === '/embed'
+        ? "frame-ancestors 'self' https:" : "frame-ancestors 'none'" };
+      return route.fulfill({ body: await readFile(new URL('index.html', dist)), contentType: 'text/html', headers });
+    }
+    return route.fulfill({ path: fileURLToPath(new URL(url.pathname.slice(1), dist)) });
+  });
+  return requests;
+}
+
+test('opens and shares coordinate searches and restores them across browser history', { timeout: 25_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  const staleLookup = Promise.withResolvers();
+  const stalePoll = Promise.withResolvers();
+  try {
+    const context = await browser.newContext();
+    await context.grantPermissions(['clipboard-read', 'clipboard-write'], { origin });
+    const page = await context.newPage();
+    page.setDefaultTimeout(6_000);
+    const currentParams = () => page.evaluate(() => Object.fromEntries(new URLSearchParams(location.search)));
+    async function checkCopyRows(surface) {
+      for (const name of ['Patch', 'Embed']) {
+        const button = surface.getByRole('button', { name: `Copy ${name.toLowerCase()} link` });
+        assert.equal(await button.textContent(), 'Copy');
+        const inputBox = await surface.getByLabel(`${name} URL`, { exact: true }).boundingBox();
+        const buttonBox = await button.boundingBox();
+        assert.ok(inputBox && buttonBox && buttonBox.x >= inputBox.x + inputBox.width);
+        assert.ok(buttonBox.y < inputBox.y + inputBox.height && inputBox.y < buttonBox.y + buttonBox.height);
+      }
+    }
+    await context.addInitScript(() => sessionStorage.setItem('sac26.target-preset', 'WISE 0855'));
+    const requests = await routeCoordinateViewer(context, async (patch, id, ready) => {
+      if (id === 3) {
+        stalePoll.resolve();
+        await staleLookup.promise;
+        return { ...base, status: 'error', message: 'Stale lookup error' };
+      }
+      return patch.ra === 0 ? { ...base, status: 'no-match', message: 'No comparable visits.' } : ready;
+    });
+    await page.goto(`${origin}/?ra=0&dec=-90&campaign=demo`);
+    await page.getByText('No comparable visits.', { exact: true }).waitFor();
+    assert.equal(requests.length, 1);
+    assert.equal(await page.locator('#ra').inputValue(), '0');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('sac26.target-preset')), 'WISE 0855');
+    assert.deepEqual(requests[0], {
+      ra: 0, dec: -90, fieldSize: 6, release: null, startDate: null, endDate: null,
+      minWavelength: null, maxWavelength: null, minGapDays: 0, maxGapDays: null,
+    });
+
+    await page.locator('#preset').selectOption('R Draconis');
+    assert.ok(Number((await currentParams()).ra) > 0);
+    await page.locator('#ra').fill('08h00m00s');
+    await page.locator('#dec').fill('');
+    assert.equal((await currentParams()).dec, undefined);
+    await page.locator('#dec').fill('+90d00m00s');
+    await page.locator('#field-size').press('ArrowRight');
+    await page.getByText('Filters', { exact: true }).click();
+    await page.locator('#patch-release').selectOption('qr3');
+    await page.locator('#startDate').fill('2024-02-29');
+    const wavelength = page.locator('#minWavelength');
+    await wavelength.fill('-1');
+    assert.equal((await currentParams()).minWavelength, '-1');
+    const picker = page.locator('#patch-drawer');
+    assert.equal(await picker.getByText('Share patch', { exact: true }).count(), 0);
+    await wavelength.fill('2');
+    await wavelength.press('End');
+    await wavelength.press('e');
+    assert.equal(await wavelength.evaluate((input) => input.validity.badInput), true);
+    assert.equal((await currentParams()).minWavelength, '2');
+    assert.equal(await picker.getByRole('button', { name: 'Share patch' }).count(), 0);
+    await page.getByRole('button', { name: 'Compare visits' }).click();
+    await picker.getByText('Complete this filter or clear it.').waitFor();
+    await wavelength.fill('1e-7');
+    await page.locator('#maxGapDays').fill('40');
+    assert.deepEqual(await currentParams(), {
+      campaign: 'demo', ra: '120', dec: '90', fieldSize: '12', release: 'qr3',
+      startDate: '2024-02-29', minWavelength: '0.0000001', maxGapDays: '40',
+    });
+    assert.equal(requests.length, 1);
+    const pickerShare = picker.getByRole('button', { name: 'Share patch' });
+    await pickerShare.click();
+    const dialog = page.getByRole('dialog', { name: 'Share patch' });
+    await checkCopyRows(dialog);
+    const draftEmbed = await dialog.getByLabel('Embed URL').inputValue();
+    await dialog.getByRole('button', { name: 'Copy embed link' }).click();
+    assert.equal(await page.evaluate(() => navigator.clipboard.readText()), draftEmbed);
+    assert.equal(new URL(draftEmbed).pathname, '/embed');
+    assert.equal(new URL(draftEmbed).searchParams.get('fieldSize'), '12');
+    await page.keyboard.press('Escape');
+    await dialog.waitFor({ state: 'hidden' });
+    await page.waitForFunction(() => document.activeElement?.textContent === 'Share patch');
+    await page.getByRole('button', { name: 'Compare visits' }).click();
+    await page.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    await page.setViewportSize({ width: 320, height: 720 });
+    await page.getByRole('group', { name: 'Active tool' }).getByRole('button', { name: 'Share', exact: true }).click();
+    const sharePanel = page.getByRole('region', { name: 'Share', exact: true });
+    await checkCopyRows(sharePanel);
+    const shared = await sharePanel.getByLabel('Patch URL').inputValue();
+    const markup = await sharePanel.getByLabel('Iframe HTML').inputValue();
+    assert.match(markup, /\/embed\?ra=120&amp;dec=90&amp;fieldSize=12/);
+    assert.equal(await sharePanel.getByLabel('Embed URL').inputValue(), draftEmbed);
+    assert.equal(new URL(shared).searchParams.get('minWavelength'), '0.0000001');
+    assert.deepEqual(requests[1], {
+      ...requests[0], ra: 120, dec: 90, fieldSize: 12, release: 'qr3', startDate: '2024-02-29', minWavelength: 1e-7, maxGapDays: 40,
+    });
+
+    await page.goBack();
+    await stalePoll.promise;
+    assert.equal(await page.locator('#ra').inputValue(), '0');
+    await page.goForward();
+    await page.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    staleLookup.resolve();
+    assert.equal(await page.getByText('Stale lookup error').count(), 0);
+    assert.deepEqual(requests[3], requests[1]);
+
+    const receiver = await context.newPage();
+    await receiver.goto(shared);
+    await receiver.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    assert.deepEqual(requests[4], requests[1]);
+    await receiver.getByRole('button', { name: 'Back to sky' }).click();
+    assert.equal(new URL(receiver.url()).search, new URL(shared).search);
+    assert.equal(await receiver.locator('#ra').inputValue(), '120');
+    await receiver.reload();
+    await receiver.getByRole('button', { name: 'Compare visits' }).waitFor();
+    assert.equal(await receiver.locator('#ra').inputValue(), '120');
+    for (const [query, diagnostic] of [
+      ['ra=20', 'dec'], ['ra=&dec=0', 'ra'], ['ra=1&ra=2&dec=0', 'ra'],
+      ['ra=Infinity&dec=0', 'ra'], ['ra=360&dec=0', 'ra'], ['ra=1&dec=91', 'dec'],
+      ['ra=1&dec=0&fieldSize=4', 'fieldSize'], ['ra=1&dec=0&startDate=2026-02-29', 'startDate'],
+      ['ra=1&dec=0&minGapDays=2&maxGapDays=1', 'maxGapDays'],
+    ]) {
+      await receiver.goto(`${origin}/?${query}`);
+      assert.match(await receiver.getByRole('alert').textContent(), new RegExp(diagnostic));
+    }
+    assert.equal(requests.length, 5);
+    await receiver.goto(`${origin}/?ra=359.99999999999994&dec=%2B0`);
+    await receiver.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    assert.equal(requests[5].ra, 359.99999999999994);
+  } finally {
+    staleLookup.resolve();
+    await browser.close();
+  }
+});
+
+test('plays a fixed sky patch inside a different origin', { timeout: 25_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  try {
+    const context = await browser.newContext();
+    const requests = await routeCoordinateViewer(context, (_patch, id, ready) => id === 1
+      ? { ...base, status: 'no-match', partial: true, message: 'Search incomplete.' } : ready);
+    const page = await context.newPage();
+    page.setDefaultTimeout(6_000);
+    const atlasRequests = [];
+    context.on('request', (request) => {
+      if (request.url().includes('aladin') || request.url().includes('Allsky.jpg')) atlasRequests.push(request.url());
+    });
+    for (const width of [320, 800]) {
+      await page.goto(`${embedParent}/?width=${width}`);
+      const player = page.frameLocator('iframe');
+      if (width === 320) {
+        await player.getByText('Search incomplete.').waitFor();
+        await player.getByRole('button', { name: 'Retry', exact: true }).click();
+      }
+      await player.getByText('1 / 2 visits', { exact: true }).waitFor();
+      assert.deepEqual(await player.getByRole('main').evaluate((element) => ({
+        horizontalOverflow: element.scrollWidth - element.clientWidth,
+        verticalOverflow: element.scrollHeight - element.clientHeight,
+      })), { horizontalOverflow: 0, verticalOverflow: 0 });
+      assert.equal(await player.getByRole('combobox', { name: 'Sequence' }).inputValue(), 'coordinate-sequence');
+      const play = player.getByRole('button', { name: 'Play', exact: true });
+      await play.click();
+      await player.getByRole('button', { name: 'Pause', exact: true }).click();
+      await player.getByRole('button', { name: 'Next' }).click();
+      await player.getByText('2 / 2 visits', { exact: true }).waitFor();
+      await player.getByText('2025-01-02 00:00:00 UTC', { exact: true }).waitFor();
+      const link = player.getByRole('link', { name: 'Open full viewer' });
+      assert.equal(await link.getAttribute('href'), '/?ra=127.69444&dec=-39.1776&fieldSize=6');
+      assert.equal(await link.getAttribute('target'), '_blank');
+    }
+    assert.equal(atlasRequests.length, 0);
+    assert.equal(requests.length, 3);
+    await page.goto(`${origin}/embed?ra=2&dec=-91`);
+    await page.getByRole('alert').filter({ hasText: 'Set dec' }).waitFor();
+    const link = page.getByRole('link', { name: 'Open full viewer' });
+    assert.equal(await link.getAttribute('href'), '/?ra=2&dec=-91');
+    assert.equal(requests.length, 3);
+  } finally {
+    await browser.close();
+  }
+});
 
 test('keeps playback, details and motion scoped while Auto and Manual overlap', { timeout: 35_000 }, async () => {
   const channel = process.env.SAC26_BROWSER_CHANNEL;
@@ -210,6 +430,10 @@ test('keeps playback, details and motion scoped while Auto and Manual overlap', 
     assert.deepEqual(await choices(), ['manual', 'lookup.3']);
     assert.equal(requests.inventorySeed, 'lookup.2');
     assert.deepEqual(requests.manualKeys, ['e0', 'e1', 'e2', 'e3', 'e4']);
+    await button('Share').click();
+    assert.equal(await page.getByRole('region', { name: 'Share', exact: true }).getByLabel('Patch URL').inputValue(),
+      `${origin}/?ra=10&dec=20&fieldSize=6`);
+    await button('Compare').click();
     await checkFrame('manual', 0, 0);
     await markers.waitFor({ state: 'hidden' });
     await button('Motion').click();
@@ -508,9 +732,9 @@ test('opens Pixel Flags from the tool rail and inspects each exposure', { timeou
     await flagsTool.tap();
     await overlay.waitFor();
     const toolBoxes = await Promise.all((await rail.getByRole('button').all()).map((tool) => tool.boundingBox()));
-    assert.equal(toolBoxes.length, 4);
+    assert.equal(toolBoxes.length, 5);
     for (const tool of toolBoxes) {
-      assert.equal(tool.y, toolBoxes[0].y, 'All four tools fit on the mobile row');
+      assert.equal(tool.y, toolBoxes[0].y, 'All five tools fit on the mobile row');
       assert.ok(tool.x >= 0 && tool.x + tool.width <= 320);
     }
     const mobileImage = await target.boundingBox();

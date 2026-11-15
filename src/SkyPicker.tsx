@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useEffectEvent, useRef, useState } from 'react';
 import type { SkyPosition } from './coordinates';
 
 const survey = 'https://irsa.ipac.caltech.edu/data/hips/CDS/DSS2/color';
@@ -30,6 +30,7 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
   const atlasRef = useRef<ReturnType<typeof import('aladin-lite').default.aladin> | null>(null);
   const markRef = useRef<((position: SkyPosition | null, size: number) => void) | null>(null);
   const [status, setStatus] = useState<'loading' | 'ready' | 'unavailable'>('loading');
+  const pick = useEffectEvent(onPick);
 
   useEffect(() => {
     const atlas = atlasRef.current;
@@ -115,7 +116,7 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
         atlas.on('click', ({ ra, dec, isDragging }) => {
           if (isDragging || !Number.isFinite(ra) || !Number.isFinite(dec)) return;
           const position = { ra: ((ra % 360) + 360) % 360, dec };
-          onPick(position);
+          pick(position);
         });
         setStatus('ready');
       } catch {
@@ -128,7 +129,7 @@ export function SkyPicker({ active, presetPosition, draftPosition, fieldSize, on
       controller.abort();
       atlasRef.current?.off('click');
     };
-  }, [onPick]);
+  }, []);
 
   return (
     <section className="sky-picker" data-active={active} aria-label="Sky map" inert={!active}>
