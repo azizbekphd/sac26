@@ -1,0 +1,19 @@
+version: "1"
+projects:
+  - name: My project
+    environments:
+      - name: Production
+        services:
+          - type: web
+            name: sac26
+            runtime: docker
+            repo: https://github.com/azizbekphd/sac26
+            branch: main
+            plan: free
+            region: virginia
+            healthCheckPath: /
+            dockerContext: .
+            dockerfilePath: ./Dockerfile
+            autoDeployTrigger: checksPass
+            domains:
+              - phds-sac26.earth
