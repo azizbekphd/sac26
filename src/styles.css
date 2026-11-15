@@ -192,6 +192,7 @@ form { display: grid; gap: 10px; }
 .spectrum-target, .pixel-flag-target {
   position: absolute;
   inset: 0;
+  z-index: 1;
   border: 0;
   background: transparent;
   cursor: crosshair;
@@ -207,6 +208,7 @@ form { display: grid; gap: 10px; }
 }
 .pixel-flag-marker {
   position: absolute;
+  z-index: 2;
   width: 9px;
   height: 9px;
   transform: translate(-50%, -50%);
@@ -215,23 +217,32 @@ form { display: grid; gap: 10px; }
   pointer-events: none;
 }
 .pixel-flag-readout {
-  display: grid;
-  justify-items: start;
-  gap: 6px;
+  position: absolute;
+  inset: auto 6px 6px;
+  z-index: 2;
+  width: fit-content;
+  max-width: min(280px, calc(100% - 12px));
+  max-height: calc(100% - 12px);
+  overflow: auto;
   padding: 8px;
   border: 1px solid var(--line);
   border-radius: 2px;
-  background: #171717;
+  background: #171717f5;
+  font-size: 11px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+  pointer-events: none;
 }
+.pixel-flag-readout[data-side='top'] { inset-block: 6px auto; }
+.pixel-flag-readout[data-selected] { max-height: calc(50% - 6px); }
+.pixel-flag-readout[data-scrollable] { pointer-events: auto; overscroll-behavior: contain; }
+.pixel-flag-readout .control { pointer-events: auto; }
+.pixel-flag-content { display: grid; justify-items: start; gap: 6px; }
 .pixel-flag-location { font-weight: 600; }
 .pixel-flag-readout ul { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; }
 .pixel-flag-readout li span { display: block; color: var(--muted); }
-.pixel-flags-help { display: grid; gap: 4px; }
 .pixel-flags-legend { display: flex; align-items: center; gap: 6px; }
 .pixel-flags-legend span { width: 9px; height: 9px; background: #ffb747; }
-.pixel-flags-focus { align-self: start; }
 .spectrum-marker {
   position: absolute;
   width: 15px;
@@ -245,6 +256,7 @@ form { display: grid; gap: 10px; }
 .motion-markers {
   position: absolute;
   inset: 0;
+  z-index: 1;
   width: 100%;
   height: 100%;
   overflow: hidden;
@@ -301,6 +313,12 @@ form { display: grid; gap: 10px; }
   background: #292929;
   box-shadow: inset 0 -2px #dedede;
   color: #fff;
+}
+.comparison-tools .control.pixel-flags-toggle[aria-pressed='true'] {
+  border-color: #8f7347;
+  background: #34291a;
+  box-shadow: none;
+  color: #ffd38c;
 }
 .compare-modes .control[aria-pressed='true'] {
   background: #dedede;

@@ -1,5 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode, type Ref } from 'react';
-import { createPortal } from 'react-dom';
+import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react';
 
 type Point = { x: number; y: number };
 type FlagMap = {
@@ -39,7 +38,7 @@ function clamp(value: number, size: number) {
   return Math.max(0, Math.min(size - 1, value));
 }
 
-function imagePoint(event: MouseEvent<HTMLButtonElement> | PointerEvent<HTMLButtonElement>): Point {
+function imagePoint(event: MouseEvent<HTMLElement> | PointerEvent<HTMLElement>): Point {
   const box = event.currentTarget.getBoundingClientRect();
   return { x: (event.clientX - box.left) / box.width, y: (event.clientY - box.top) / box.height };
 }
@@ -51,20 +50,22 @@ function pixelAt(point: Point, map: FlagMap): Point {
   };
 }
 
-type Props = { url: string; targetRef: Ref<HTMLButtonElement>; readoutHost: HTMLDivElement };
+type Props = { url?: string; sourceSelection?: Point | null; children: ReactNode };
 
-export function PixelFlags({ url, targetRef, readoutHost }: Props) {
+export function PixelFlags({ url, sourceSelection, children }: Props) {
   const [loaded, setLoaded] = useState<{ url: string; map: FlagMap | null }>();
   const [attempt, setAttempt] = useState(0);
   const [hovered, setHovered] = useState<Point | null>(null);
   const [pinned, setPinned] = useState<Point | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
-  const current = loaded?.url === url ? loaded : undefined;
+  const readoutPanel = useRef<HTMLDivElement>(null);
+  const current = url && loaded?.url === url ? loaded : undefined;
   const map = current?.map;
-  const point = hovered ?? pinned;
+  const point = hovered ?? sourceSelection ?? pinned;
   const selected = point && map && pixelAt(point, map);
 
   useEffect(() => {
+    if (!url) return;
     const controller = new AbortController();
     void loadFlags(url, controller.signal).then((map) => {
       if (!controller.signal.aborted) setLoaded({ url, map });
@@ -86,7 +87,24 @@ export function PixelFlags({ url, targetRef, readoutHost }: Props) {
     context.putImageData(overlay, 0, 0);
   }, [map]);
 
-  let readout: ReactNode = <p className="lookup-status">No pixel selected.</p>;
+  useEffect(() => {
+    const panel = readoutPanel.current;
+    if (!url || !panel?.firstElementChild) return;
+    const observer = new ResizeObserver(() => {
+      panel.toggleAttribute('data-scrollable', panel.scrollHeight > panel.clientHeight);
+    });
+    observer.observe(panel);
+    observer.observe(panel.firstElementChild);
+    return () => observer.disconnect();
+  }, [url]);
+
+  useEffect(() => {
+    if (readoutPanel.current) readoutPanel.current.scrollTop = 0;
+  }, [url, selected?.x, selected?.y]);
+
+  let readout: ReactNode = <p className="lookup-status">{sourceSelection === undefined
+    ? 'Hover for details. Click or tap to pin a pixel.'
+    : 'Hover for details or select a source.'}</p>;
   let marker = null;
   if (!map) {
     readout = current ? <>
@@ -108,7 +126,7 @@ export function PixelFlags({ url, targetRef, readoutHost }: Props) {
     marker = <span className="pixel-flag-marker" aria-hidden="true"
       style={{ left: `${(x + .5) / map.width * 100}%`, top: `${(y + .5) / map.height * 100}%` }} />;
     readout = <>
-      <p className="pixel-flag-location">Pixel {x + 1}, {y + 1}{!hovered && ' · Pinned'}</p>
+      <p className="pixel-flag-location">Pixel {x + 1}, {y + 1}{!hovered && (sourceSelection ? ' · Source' : ' · Pinned')}</p>
       {statusLabels[status] && <p>{statusLabels[status]}</p>}
       {active.length > 0 ? <ul>{active.map(({ bit, definition: [name, description] }) => (
         <li key={bit}><strong>{name}</strong>{description && <span>{description}</span>}</li>
@@ -117,15 +135,22 @@ export function PixelFlags({ url, targetRef, readoutHost }: Props) {
   }
 
   return (
-    <>
+    <div className="exposure-image"
+      onPointerMove={url ? (event) => {
+        if (event.pointerType !== 'touch') setHovered(imagePoint(event));
+      } : undefined}
+      onPointerLeave={() => setHovered(null)}
+      onPointerCancel={() => setHovered(null)}
+      onClickCapture={url && sourceSelection !== undefined ? (event) => {
+        if (!readoutPanel.current?.contains(event.target as Node)) setHovered(null);
+      } : undefined}
+      onKeyDownCapture={url && sourceSelection !== undefined ? (event) => {
+        if (directions[event.key] && !readoutPanel.current?.contains(event.target as Node)) setHovered(null);
+      } : undefined}>
+      {children}
       {map && <canvas className="pixel-flag-overlay" ref={canvas} width={map.width} height={map.height} aria-hidden="true" />}
-      <button className="pixel-flag-target" type="button" ref={targetRef}
-        aria-label="Inspect pixel flags" aria-describedby="pixel-flags-help"
-        onPointerMove={(event) => {
-          if (event.pointerType !== 'touch') setHovered(imagePoint(event));
-        }}
-        onPointerLeave={() => setHovered(null)}
-        onPointerCancel={() => setHovered(null)}
+      {url && sourceSelection === undefined && <button className="pixel-flag-target" type="button"
+        aria-label="Inspect pixel flags" aria-description="Use arrow keys to move between pixels."
         onClick={(event) => {
           setPinned(event.detail === 0 ? pinned ?? { x: .5, y: .5 } : imagePoint(event));
           setHovered(null);
@@ -144,12 +169,18 @@ export function PixelFlags({ url, targetRef, readoutHost }: Props) {
           const y = clamp(pixel.y + direction.y, map.height);
           setPinned({ x: (x + .5) / map.width, y: (y + .5) / map.height });
           setHovered(null);
-        }} />
+        }} />}
       {marker}
-      {createPortal(
-        <div className="pixel-flag-readout" aria-live={hovered ? 'off' : 'polite'}>{readout}</div>,
-        readoutHost,
-      )}
-    </>
+      {url && <div id="pixel-flag-readout" className="pixel-flag-readout" ref={readoutPanel}
+        data-side={map && point && point.y >= .5 ? 'top' : 'bottom'} data-selected={selected ? '' : undefined}
+        aria-live={hovered ? 'off' : 'polite'}
+        onPointerMove={(event) => event.stopPropagation()}
+        tabIndex={selected ? 0 : undefined}>
+        <div className="pixel-flag-content">
+          {!selected && <p className="pixel-flags-legend"><span aria-hidden="true" /> Amber marks warnings</p>}
+          {readout}
+        </div>
+      </div>}
+    </div>
   );
 }

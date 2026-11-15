@@ -70,14 +70,14 @@ type WorkspaceState = { patch: SubmittedPatch; result: PlaybackUpdate; autoSelec
 type ManualState = { patch: SubmittedPatch; seed?: PlaybackUpdate; autoSelectedSources?: ReadonlySet<string> };
 type ManualResult = WorkspaceState & { result: PlaybackUpdate & { jobId: string } };
 type SpectrumPick = { id: number; x: number; y: number; position: SkyPosition; dates: ReturnType<typeof spectrumDates> };
-const comparisonTools = [
+const workspaceTools = [
   { id: 'compare', label: 'Compare' },
   { id: 'motion', label: 'Motion' },
   { id: 'spectrum', label: 'Spectrum' },
   { id: 'pixel-flags', label: 'Pixel Flags' },
   { id: 'share', label: 'Share' },
 ] as const;
-type ComparisonTool = typeof comparisonTools[number]['id'];
+type ComparisonTool = Exclude<typeof workspaceTools[number]['id'], 'pixel-flags'>;
 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
@@ -136,7 +136,7 @@ function App({ embed }: { embed: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [activeTool, setActiveTool] = useState<ComparisonTool>('compare');
   const [compareMode, setCompareMode] = useState<CompareMode>('blink');
-  const [pixelFlagReadout, setPixelFlagReadout] = useState<HTMLDivElement | null>(null);
+  const [showPixelFlags, setShowPixelFlags] = useState(false);
   const [visitSelections, setVisitSelections] = useState(defaultVisitSelections);
   const hasOpenedSequence = useRef(false);
   const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
@@ -148,7 +148,6 @@ function App({ embed }: { embed: boolean }) {
   const submitAction = useRef<HTMLButtonElement>(null);
   const backAction = useRef<HTMLButtonElement>(null);
   const detailsAction = useRef<HTMLButtonElement>(null);
-  const pixelFlagTarget = useRef<HTMLButtonElement>(null);
   const spectrumTarget = useRef<HTMLButtonElement>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const filtersRef = useRef<HTMLDetailsElement>(null);
@@ -178,6 +177,9 @@ function App({ embed }: { embed: boolean }) {
       ? 'Stack and Difference require a matched sequence.' : '';
   const imageMathMode = activeTool === 'compare' && compareMode !== 'blink' ? compareMode : null;
   const imageMathKeys = imageMathMode && visitSelections[imageMathMode];
+  const flagUnavailable = imageMathMode ? 'Pixel flags are available on individual exposures.'
+    : !exposure?.flagsUrl ? 'Pixel flags are unavailable for this exposure.' : undefined;
+  const flagsUrl = !flagUnavailable && showPixelFlags ? exposure?.flagsUrl : undefined;
   const motionJobId = canPlay && result?.motionAvailable && !withdrawn ? result.jobId : undefined;
   const motionUnavailableReason = withdrawn
     ? 'New archive metadata changed the visit grouping. Choose a current sequence to check for motion.'
@@ -750,7 +752,7 @@ function App({ embed }: { embed: boolean }) {
             <div className="image-stage">
               <div className="exposure-layout">
                 <div className="exposure-frame">
-                  <div className="exposure-image">
+                  <PixelFlags url={flagsUrl} sourceSelection={activeTool === 'spectrum' ? spectrumPick : undefined}>
                     {imageMathMode ? (
                       !imageMathUnavailable && result?.jobId && imageMathKeys && imageMathKeys.length >= 2 && imageMathKeys.every(Boolean)
                         ? <CompareMathImage key={JSON.stringify([result.jobId, imageMathMode, imageMathKeys])}
@@ -762,8 +764,6 @@ function App({ embed }: { embed: boolean }) {
                       <img className="sky-frame" src={exposure.imageUrl}
                         alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
                     )}
-                    {activeTool === 'pixel-flags' && exposure.flagsUrl && pixelFlagReadout &&
-                      <PixelFlags url={exposure.flagsUrl} targetRef={pixelFlagTarget} readoutHost={pixelFlagReadout} />}
                     {activeTool === 'motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
                     {activeTool === 'spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
                       aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
@@ -789,7 +789,7 @@ function App({ embed }: { embed: boolean }) {
                       {spectrumPick && <span className="spectrum-marker" aria-hidden="true"
                         style={{ left: `${spectrumPick.x * 100}%`, top: `${spectrumPick.y * 100}%` }} />}
                     </button>}
-                  </div>
+                  </PixelFlags>
                 </div>
                 {playbackControls}
                 <aside className="exposure-panel" aria-label="Comparison tools">
@@ -798,8 +798,15 @@ function App({ embed }: { embed: boolean }) {
                       aria-label={backLabel} title={backLabel} onClick={backToSky}>
                       {isLoading ? 'Cancel' : 'Back'}
                     </button>
-                    <div className="comparison-tools" role="group" aria-label="Active tool">
-                      {comparisonTools.map(({ id, label }) => (
+                    <div className="comparison-tools" role="group" aria-label="Workspace tools">
+                      {workspaceTools.map(({ id, label }) => id === 'pixel-flags' ? (
+                        <button key={id} className="control pixel-flags-toggle" type="button" aria-pressed={Boolean(flagsUrl)}
+                          aria-controls={flagsUrl ? 'pixel-flag-readout' : undefined}
+                          disabled={Boolean(flagUnavailable)} title={flagUnavailable ?? 'Highlight pixel warnings'}
+                          onClick={() => setShowPixelFlags((visible) => !visible)}>
+                          {label}
+                        </button>
+                      ) : (
                         <button key={id} type="button" className="control" aria-pressed={activeTool === id}
                           aria-controls={`comparison-tool-${id}`} onClick={() => {
                             if (id === 'compare' && compareMode !== 'blink') setPlaying(false);
@@ -924,18 +931,6 @@ function App({ embed }: { embed: boolean }) {
                           setSpectrumPick(null);
                           spectrumTarget.current?.focus({ preventScroll: true });
                         }} />}
-                    </section>
-                    <section id="comparison-tool-pixel-flags" className="comparison-tool" aria-label="Pixel Flags"
-                      hidden={activeTool !== 'pixel-flags'}>
-                      {exposure.flagsUrl ? <>
-                        <div className="pixel-flags-help" id="pixel-flags-help">
-                          <p className="pixel-flags-legend"><span aria-hidden="true" /> Amber marks warnings</p>
-                          <p className="lookup-status">Hover to inspect a pixel. Click or tap to pin it as you change visits.</p>
-                        </div>
-                        <div ref={setPixelFlagReadout} />
-                        <button className="control pixel-flags-focus" type="button"
-                          onClick={() => pixelFlagTarget.current?.focus({ preventScroll: true })}>Inspect with arrow keys</button>
-                      </> : <p className="lookup-status" role="status">Pixel flags are unavailable for this exposure.</p>}
                     </section>
                     <section id="comparison-tool-share" className="comparison-tool" aria-label="Share" hidden={activeTool !== 'share'}>
                       <SharePatch key={patchQuery(view.patch).toString()} patch={view.patch} />

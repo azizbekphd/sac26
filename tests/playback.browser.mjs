@@ -159,7 +159,7 @@ test('opens and shares coordinate searches and restores them across browser hist
     await page.getByRole('button', { name: 'Compare visits' }).click();
     await page.getByRole('button', { name: 'Play', exact: true }).waitFor();
     await page.setViewportSize({ width: 320, height: 720 });
-    await page.getByRole('group', { name: 'Active tool' }).getByRole('button', { name: 'Share', exact: true }).click();
+    await page.getByRole('group', { name: 'Workspace tools' }).getByRole('button', { name: 'Share', exact: true }).click();
     const sharePanel = page.getByRole('region', { name: 'Share', exact: true });
     await checkCopyRows(sharePanel);
     const shared = await sharePanel.getByLabel('Patch URL').inputValue();
@@ -626,7 +626,7 @@ test('keeps Stack and Difference inputs synchronized with the active sequence', 
   }
 });
 
-test('opens Pixel Flags from the tool rail and inspects each exposure', { timeout: 25_000 }, async () => {
+test('toggles Pixel Flags alongside the active workspace tool', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   const secondMap = Promise.withResolvers();
   try {
@@ -660,19 +660,20 @@ test('opens Pixel Flags from the tool rail and inspects each exposure', { timeou
       }
       if (path.includes('/flags/')) {
         requests.push(path);
+        if (requests.length === 1) return route.fulfill({ status: 503 });
         const first = path.endsWith('frame-0');
         if (!first) await secondMap.promise;
         return route.fulfill({ json: flagMap(first
           ? [[1 << 10, 1], [1 << 21, 2], [0, 0], [0, 2]]
-          : [[1 << 25, 2], [0, 2], [0, 0], [0, 3]]) });
+          : [[1 << 25, 2], [0xffffffff, 2], [0, 0], [0, 3]]) });
       }
       return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
     });
 
     const button = (name) => page.getByRole('button', { name, exact: true });
-    const panel = page.getByRole('region', { name: 'Pixel Flags', exact: true });
-    const rail = page.getByRole('group', { name: 'Active tool' });
-    const readout = panel.locator('.pixel-flag-readout');
+    const compare = page.getByRole('region', { name: 'Compare', exact: true });
+    const rail = page.getByRole('group', { name: 'Workspace tools' });
+    const readout = page.locator('.pixel-flag-readout');
     const overlay = page.locator('.pixel-flag-overlay');
     const target = button('Inspect pixel flags');
     await page.goto(origin);
@@ -681,21 +682,21 @@ test('opens Pixel Flags from the tool rail and inspects each exposure', { timeou
     await button('Compare visits').click();
     const flagsTool = rail.getByRole('button', { name: 'Pixel Flags', exact: true });
     await flagsTool.waitFor();
+    assert.deepEqual(await rail.getByRole('button').allTextContents(),
+      ['Compare', 'Motion', 'Spectrum', 'Pixel Flags', 'Share']);
     assert.deepEqual(requests, []);
-    await button('Stack').click();
-    const stack = page.getByRole('img', { name: /North-up average/ });
-    await stack.waitFor();
     await flagsTool.press('Enter');
+    await button('Retry flags').click();
     await overlay.waitFor();
     assert.equal(await flagsTool.getAttribute('aria-pressed'), 'true');
-    await stack.waitFor({ state: 'hidden' });
-    await panel.getByRole('button', { name: 'Inspect with arrow keys' }).press('Enter');
-    assert.equal(await target.evaluate((element) => element === document.activeElement), true);
+    assert.equal(await button('Compare').getAttribute('aria-pressed'), 'true');
     const box = await target.boundingBox();
     const railBox = await rail.boundingBox();
-    const panelBox = await panel.boundingBox();
+    const panelBox = await compare.boundingBox();
     assert.ok(railBox.x + railBox.width <= panelBox.x, 'The tool rail sits to the left of the panel');
     assert.ok(panelBox.x + panelBox.width <= box.x, 'The sidebar sits to the left of the image');
+    const shareTool = rail.getByRole('button', { name: 'Share', exact: true });
+    assert.ok((await shareTool.boundingBox()).y > (await flagsTool.boundingBox()).y);
     await page.mouse.move(box.x + box.width / 4, box.y + box.height / 4);
     await readout.getByText('HOT', { exact: true }).waitFor();
     await readout.getByText('Masked in this exposure', { exact: true }).waitFor();
@@ -723,23 +724,53 @@ test('opens Pixel Flags from the tool rail and inspects each exposure', { timeou
     await page.mouse.move(0, 0);
     await readout.getByText('Pixel 2, 2 · Pinned', { exact: true }).waitFor();
     await readout.getByText('Masked in this comparison', { exact: true }).waitFor();
-    await button('Spectrum').click();
-    await overlay.waitFor({ state: 'hidden' });
-    await button('Compare').click();
-    await stack.waitFor();
-    await overlay.waitFor({ state: 'hidden' });
-    await page.setViewportSize({ width: 320, height: 680 });
-    await flagsTool.tap();
+    await button('Motion').click();
     await overlay.waitFor();
+    assert.equal(await button('Motion').getAttribute('aria-pressed'), 'true');
+    await button('Spectrum').click();
+    const spectrumTarget = button('Select a source for spectrum');
+    const spectrumBox = await spectrumTarget.boundingBox();
+    await page.touchscreen.tap(spectrumBox.x + spectrumBox.width / 4, spectrumBox.y + spectrumBox.height / 4);
+    await button('Show spectrum').waitFor();
+    await readout.getByText('Pixel 1, 1 · Source', { exact: true }).waitFor();
+    await readout.getByText('STREAK', { exact: true }).waitFor();
+    await flagsTool.click();
+    await overlay.waitFor({ state: 'hidden' });
+    await button('Show spectrum').waitFor();
+    assert.equal(await button('Spectrum').getAttribute('aria-pressed'), 'true');
+    await button('Compare').click();
+    await flagsTool.click();
+    await overlay.waitFor();
+    await button('Stack').click();
+    await page.getByRole('img', { name: /North-up average/ }).waitFor();
+    await overlay.waitFor({ state: 'hidden' });
+    assert.equal(await flagsTool.isDisabled(), true);
+    await button('Blink').click();
+    await overlay.waitFor();
+    assert.equal(await flagsTool.getAttribute('aria-pressed'), 'true');
+    await page.setViewportSize({ width: 320, height: 680 });
     const toolBoxes = await Promise.all((await rail.getByRole('button').all()).map((tool) => tool.boundingBox()));
     assert.equal(toolBoxes.length, 5);
     for (const tool of toolBoxes) {
       assert.equal(tool.y, toolBoxes[0].y, 'All five tools fit on the mobile row');
       assert.ok(tool.x >= 0 && tool.x + tool.width <= 320);
     }
+    assert.ok((await shareTool.boundingBox()).x > (await flagsTool.boundingBox()).x);
     const mobileImage = await target.boundingBox();
     await page.touchscreen.tap(mobileImage.x + mobileImage.width / 4, mobileImage.y + mobileImage.height / 4);
     await readout.getByText('STREAK', { exact: true }).waitFor();
+    await page.setViewportSize({ width: 320, height: 360 });
+    const compactImage = await target.boundingBox();
+    await page.touchscreen.tap(compactImage.x + compactImage.width * 3 / 4, compactImage.y + compactImage.height / 4);
+    await readout.getByText('Pixel 2, 1 · Pinned', { exact: true }).waitFor();
+    assert.ok((await readout.boundingBox()).y >= compactImage.y + compactImage.height / 2,
+      'The readout leaves the half of the image with the pinned pixel clear');
+    await readout.hover();
+    await page.mouse.wheel(0, 400);
+    await page.waitForFunction(() => document.getElementById('pixel-flag-readout').scrollTop > 0);
+    await readout.getByText('Pixel 2, 1 · Pinned', { exact: true }).waitFor();
+    await page.touchscreen.tap(compactImage.x + compactImage.width / 4, compactImage.y + compactImage.height / 4);
+    await readout.getByText('Pixel 1, 1 · Pinned', { exact: true }).waitFor();
   } finally {
     secondMap.resolve();
     await browser.close();
