@@ -1,14 +1,16 @@
 from contextlib import closing
 from pathlib import Path
+import runpy
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 import httpx
+from astropy.io import fits
 
 from .exposure import ArchiveFilters, search, sky_grid
-from .exposure_index import FOOTPRINT, SCHEMA, SCHEMA_VERSION, cap_box
+from .exposure_index import FOOTPRINT, SCHEMA, SCHEMA_VERSION, cap_box, snapshot_info
 from .playback import PlaybackJob, PlaybackSearch
 from .spectrum import discover_spectrum
 
@@ -67,3 +69,50 @@ class ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([row.key for row in rows], ["dr1/north"])
             self.assertFalse(truncated)
             self.assertEqual(await search(client, (), region="CIRCLE 0 -90 0"), ([], False))
+
+
+class S3ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
+    builder = runpy.run_path(str(Path(__file__).resolve().parents[1] / "deploy" / "build-spherex-s3-index.py"))
+
+    async def test_scans_paginated_current_reductions_and_joins_complete_periods(self):
+        def key(release, processing):
+            return f"{release}/level2/2025W18_1B/{processing}/1/level2_2025W18_1B_0100_1D1_spx_{processing}.fits"
+
+        def gateway(request):
+            if prefix := request.url.params.get("prefix"):
+                release = prefix.split("/")[0]
+                next_page = bool(request.url.params.get("continuation-token"))
+                obj = key(release, "l2b_retry-v27-2026-197" if next_page else "l2b-v27-2026-196")
+                tail = "<IsTruncated>false</IsTruncated>" if next_page else (
+                    "<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>"
+                )
+                return httpx.Response(200, text=f"<ListBucketResult><Contents><Key>{obj}</Key></Contents>"
+                                      f"{tail}</ListBucketResult>")
+            self.assertIn("l2b_retry-v27-2026-197", request.url.path)
+            self.assertEqual(request.headers["Range"], "bytes=0-28799")
+            return httpx.Response(206, content=payload, headers={"Content-Range": "bytes 0-28799/65000000"})
+
+        hdu = fits.Header({
+            "XTENSION": "IMAGE", "EXTNAME": "IMAGE", "BITPIX": -32, "NAXIS": 2, "NAXIS1": 2040, "NAXIS2": 2040,
+            "PCOUNT": 0, "GCOUNT": 1, "OBSID": "2025W18_1B_0100_1", "DETECTOR": 1, "MJD-BEG": 60800.125,
+            "RADESYS": "ICRS", "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN", "CUNIT1": "deg", "CUNIT2": "deg",
+            "CRPIX1": 1020.5, "CRPIX2": 1020.5, "CRVAL1": 0, "CRVAL2": 0, "CDELT1": -.0017, "CDELT2": .0017,
+        })
+        payload = (fits.PrimaryHDU().header.tostring() + hdu.tostring()).encode("ascii").ljust(28800, b" ")
+        periods = ["dr1/level2/2025W18_1B/", "qr3/level2/2025W18_1B/"]
+        with TemporaryDirectory() as temp:
+            destination = Path(temp) / "snapshot.sqlite3"
+            shards = [Path(temp) / f"{i}.sqlite3" for i in range(2)]
+            async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as client:
+                for period, shard in zip(periods, shards):
+                    await self.builder["scan"](client, shard, [period], {"dr11": (.74, 1.13), "qr31": (.74, 1.13)}, 4)
+                with self.assertRaisesRegex(Exception, "inventory does not match"):
+                    self.builder["join_shards"](destination, shards[:1], periods)
+                self.assertFalse(destination.exists())
+                self.builder["join_shards"](destination, shards, periods)
+                self.assertEqual(snapshot_info(destination)["counts"], {"dr1": 1, "qr3": 1})
+                with patch.dict("os.environ", SPHEREX_INDEX_PATH=str(destination)):
+                    items, partial = await search(client, (), region="CIRCLE 0 0 0", filters=ArchiveFilters(release="qr3"))
+                self.assertFalse(partial)
+                self.assertEqual([(row.key, row.mjd, row.wavelength_bounds) for row in items],
+                                 [(key("qr3", "l2b_retry-v27-2026-197"), 60800.125, (.74, 1.13))])

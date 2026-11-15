@@ -50,38 +50,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: spherex-index-v1-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          python - <<'PY'
-          from base64 import b64encode
-          from hashlib import file_digest
-          import json
-          import os
-          from pathlib import Path
-          import sqlite3
-          import subprocess
-
-          temp = Path(os.environ["RUNNER_TEMP"])
-          with (temp / "spherex.sqlite3.gz").open("rb") as archive:
-              digest = file_digest(archive, "sha256").hexdigest()
-          with sqlite3.connect(temp / "spherex.sqlite3") as db:
-              built_at, dr1, qr3 = db.execute("SELECT built_at, dr1, qr3 FROM snapshot").fetchone()
-          lock = {"tag": os.environ["TAG"], "sha256": digest, "builtAt": built_at,
-                  "counts": {"dr1": dr1, "qr3": qr3}}
-          encoded = (json.dumps(lock, indent=2) + "\n").encode()
-          (temp / "spherex-index.lock").write_bytes(encoded)
-          sha = subprocess.check_output(["git", "rev-parse", "HEAD:deploy/spherex-index.lock"], text=True).strip()
-          (temp / "index-commit.json").write_text(json.dumps({
-              "message": "Refresh SPHEREx exposure index",
-              "content": b64encode(encoded).decode(), "sha": sha, "branch": "main",
-          }))
-          PY
-          gh release create "$TAG" "$RUNNER_TEMP/spherex.sqlite3.gz" --target "$GITHUB_SHA" \
-            --title "SPHEREx exposure index $TAG" --notes "IRSA DR1 and QR3 Level 2 search metadata." \
-            --prerelease --latest=false
-          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/deploy/spherex-index.lock" \
-            --input "$RUNNER_TEMP/index-commit.json" --jq '.commit.sha'
-          # A push made with GITHUB_TOKEN does not start the usual push workflow.
-          gh workflow run deploy.yml --ref main -f refresh_index=true
+        run: bash deploy/publish-spherex-index.sh "IRSA SIA"
       - name: Verify the snapshot and an S3 preview on Render
         if: steps.age.outputs.refresh == 'true'
         run: python deploy/verify-spherex-render.py "$RUNNER_TEMP/spherex-index.lock"

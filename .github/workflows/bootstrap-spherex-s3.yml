@@ -1,0 +1,109 @@
+name: Bootstrap SPHEREx exposure index from S3
+
+on: workflow_dispatch
+
+permissions:
+  contents: read
+
+concurrency:
+  group: spherex-index-production
+  cancel-in-progress: false
+
+env:
+  PYTHONPATH: .
+  OPENBLAS_NUM_THREADS: 1
+
+jobs:
+  inventory:
+    if: github.repository == 'azizbekphd/sac26' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      manifest: ${{ steps.collect.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check that the first snapshot is still needed
+        run: jq -e 'length == 0' deploy/spherex-index.lock
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Inventory S3 observing periods and calibrations
+        id: collect
+        run: |
+          python -u deploy/build-spherex-s3-index.py manifest "$RUNNER_TEMP/manifest.json"
+          echo "manifest=$(cat "$RUNNER_TEMP/manifest.json")" >> "$GITHUB_OUTPUT"
+
+  headers:
+    needs: inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - name: Index FITS header ranges
+        env:
+          MANIFEST: ${{ needs.inventory.outputs.manifest }}
+          SHARD: ${{ matrix.shard }}
+        run: |
+          printf '%s\n' "$MANIFEST" > "$RUNNER_TEMP/manifest.json"
+          python -u deploy/build-spherex-s3-index.py scan "$RUNNER_TEMP/shard-$SHARD.sqlite3" \
+            "$RUNNER_TEMP/manifest.json" --shard "$SHARD" --shards 8
+      - uses: actions/upload-artifact@v7
+        with:
+          name: exposure-index-shard-${{ matrix.shard }}
+          path: ${{ runner.temp }}/shard-${{ matrix.shard }}.sqlite3
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: true
+
+  publish:
+    needs: [inventory, headers]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: exposure-index-shard-*
+          path: ${{ runner.temp }}/shards
+          merge-multiple: true
+      - name: Validate the complete SQLite index
+        env:
+          MANIFEST: ${{ needs.inventory.outputs.manifest }}
+        run: |
+          printf '%s\n' "$MANIFEST" > "$RUNNER_TEMP/manifest.json"
+          python -u deploy/build-spherex-s3-index.py join "$RUNNER_TEMP/spherex.sqlite3" \
+            "$RUNNER_TEMP/manifest.json" "$RUNNER_TEMP"/shards/shard-*.sqlite3
+          gzip -1 -c "$RUNNER_TEMP/spherex.sqlite3" > "$RUNNER_TEMP/spherex.sqlite3.gz"
+      - name: Publish the first snapshot for Render
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: spherex-index-v1-${{ github.run_id }}-${{ github.run_attempt }}
+        run: bash deploy/publish-spherex-index.sh "public S3 FITS headers"
+      - name: Verify the snapshot and an S3 preview on Render
+        run: python deploy/verify-spherex-render.py "$RUNNER_TEMP/spherex-index.lock"
