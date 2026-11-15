@@ -10,8 +10,10 @@ import { CompareImageControls, CompareMathImage, defaultVisitSelections, retainV
 import { MotionMarkers, MotionReview } from './MotionReview';
 import { PixelFlags } from './PixelFlags';
 import { Spectrum, spectrumDates } from './Spectrum';
-import { archiveReleases, countVisits, exposureIdentity, loadSequence, stopPlayback, watchPlayback, type MotionCandidate, type MotionResult,
+import { archiveReleases, checkPlaybackJob, countVisits, exposureIdentity, fetchLookup, inspectMotion, loadImageMath, loadSequence,
+  LookupExpiredError, stopPlayback, watchPlayback, type MotionCandidate, type MotionResult,
   type PlaybackUpdate, type SequenceSearch, type SequenceSummary } from './exposure';
+import { correspondingExposure, LookupRecovery, restoreComparison } from './lookupRecovery';
 import { clearPatchQuery, draftQuery, emptyDraft, fieldSizes, filterProblem, patchQuery, readPatchQuery, submittedPatch,
   type FilterField, type PatchDraft, type SubmittedPatch } from './patchQuery';
 import { SharePatch, SharePatchDialog } from './SharePatch';
@@ -145,6 +147,10 @@ function App({ embed }: { embed: boolean }) {
   const [spectrumPick, setSpectrumPick] = useState<SpectrumPick | null>(null);
   const [markedMotion, setMarkedMotion] = useState<Record<string, MotionCandidate | null>>({});
   const [motionResults, setMotionResults] = useState<Record<string, MotionResult>>({});
+  const [recoveryStatus, setRecoveryStatus] = useState({ restoring: false });
+  const [recovery] = useState(() => new LookupRecovery<PlaybackUpdate>((restoring) => setRecoveryStatus({ restoring })));
+  const [imageFailure, setImageFailure] = useState('');
+  const recoveringImage = useRef<string | null>(null);
   const requestRef = useRef<AbortController | null>(null);
   const selectionRef = useRef<AbortController | null>(null);
   const drawerToggle = useRef<HTMLButtonElement>(null);
@@ -164,6 +170,9 @@ function App({ embed }: { embed: boolean }) {
   const canPlay = view?.result.status === 'ready';
   const frameCount = result?.frames.length ?? 0;
   const exposure = result?.frames[frameIndex] ?? result?.preview;
+  const restored = recovery.get(result?.jobId);
+  const displayExposure = exposure && ((restored && correspondingExposure(restored, exposure)) ?? exposure);
+  const comparison = (restored ?? view?.result)?.comparison;
   const catalogPatch = !embed && exposure ? view?.patch : undefined;
   const gaia = useCatalogOverlay('gaia', catalogPatch);
   const wise = useCatalogOverlay('wise', catalogPatch);
@@ -176,8 +185,8 @@ function App({ embed }: { embed: boolean }) {
   const canRetry = result?.status === 'error' || (result?.status === 'no-match' && result.partial);
   const exploratory = result?.mode === 'exploratory';
   const withdrawn = result?.jobId && search?.withdrawnSequenceIds?.includes(result.jobId);
-  const activeAutoVisits = (search?.sequenceCandidates ?? search?.sequences)
-    ?.find(({ id }) => id === result?.jobId)?.visits;
+  const activeAutoVisits = !restored ? (search?.sequenceCandidates ?? search?.sequences)
+    ?.find(({ id }) => id === result?.jobId)?.visits : undefined;
   const imageMathUnavailable = withdrawn
     ? 'New archive metadata changed the visit grouping. Open a current matched sequence to stack or subtract visits.'
     : !canPlay || result?.mode !== 'matched' || !result.jobId
@@ -209,7 +218,8 @@ function App({ embed }: { embed: boolean }) {
   useEffect(() => () => {
     requestRef.current?.abort();
     selectionRef.current?.abort();
-  }, []);
+    recovery.reset();
+  }, [recovery]);
 
   function editDraft(next: PatchDraft) {
     if (view) resetComparison();
@@ -250,6 +260,9 @@ function App({ embed }: { embed: boolean }) {
   }
 
   function loadComparison(patch: SubmittedPatch) {
+    recovery.reset();
+    setImageFailure('');
+    recoveringImage.current = null;
     requestRef.current?.abort();
     selectionRef.current?.abort();
     selectionRef.current = null;
@@ -275,8 +288,10 @@ function App({ embed }: { embed: boolean }) {
     setManualResults([]);
     setMarkedMotion({});
     setMotionResults({});
+    let hasCurrentSequences = false;
     const update = (result: SequenceSearch) => {
       if (controller.signal.aborted) return;
+      hasCurrentSequences = Boolean(result.sequences?.length);
       if (result.status !== 'searching') {
         requestRef.current = null;
         setStoppingSearch(false);
@@ -285,6 +300,15 @@ function App({ embed }: { embed: boolean }) {
       setSearch(result);
     };
     void watchPlayback(patch, controller.signal, update).catch((error: unknown) => {
+      controller.signal.throwIfAborted();
+      if (!(error instanceof LookupExpiredError)) throw error;
+      if (!hasCurrentSequences) return watchPlayback(patch, controller.signal, update);
+      requestRef.current = null;
+      setStoppingSearch(false);
+      setSearch((current) => current && {
+        ...current, status: 'ready', message: '', reconnecting: false,
+      });
+    }).catch((error: unknown) => {
       if (controller.signal.aborted) return;
       requestRef.current = null;
       setStoppingSearch(false);
@@ -295,6 +319,7 @@ function App({ embed }: { embed: boolean }) {
   }
 
   function openSequence(next: WorkspaceState, resetVisits = true) {
+    setImageFailure('');
     setFrameIndex(0);
     setPlaying(false);
     setDetailsOpen(false);
@@ -312,8 +337,12 @@ function App({ embed }: { embed: boolean }) {
     setSequenceError('');
     setFailedSequence(undefined);
     const existing = manualResults.find((item) => item.result.jobId === id);
-    void (existing ? Promise.resolve(existing) : loadSequence(id, controller.signal).then((result) => ({
-      patch, result, autoSelectedSources: new Set(result.frames.map((frame) => frame.sourceUrl)),
+    const keys = (search?.sequenceCandidates ?? search?.sequences)?.find((item) => item.id === id)?.keys;
+    void (existing ? Promise.resolve(existing) : recovery.run(id, controller.signal,
+      (replacement) => replacement ? Promise.resolve(replacement) : loadSequence(id, controller.signal),
+      (signal) => keys ? restoreComparison(patch, keys, 'matched', true, signal)
+        : Promise.reject(new LookupExpiredError())).then((result) => ({
+      patch, result: { ...result, jobId: id }, autoSelectedSources: new Set(result.frames.map((frame) => frame.sourceUrl)),
     }))).then((next) => {
       if (controller.signal.aborted) return;
       if (automatic && hasOpenedSequence.current) {
@@ -335,6 +364,43 @@ function App({ embed }: { embed: boolean }) {
       if (selectionRef.current !== controller) return;
       selectionRef.current = null;
       setPendingSequence(undefined);
+    });
+  }
+
+  function runComparisonAction<T>(signal: AbortSignal, action: (current: PlaybackUpdate, jobId: string) => Promise<T>) {
+    const id = result?.jobId;
+    if (!view || !result || !id) return Promise.reject(new Error('The comparison is unavailable.'));
+    const isAuto = !manualResults.some((item) => item.result.jobId === id);
+    return recovery.run(id, signal, (replacement) => {
+      const current = replacement ?? result;
+      return action(current, current.jobId ?? id);
+    }, async (restoreSignal) => {
+      if (result.frames.length) {
+        return restoreComparison(view.patch, result.frames.map((frame) => frame.key), result.mode, isAuto, restoreSignal);
+      }
+      const refreshed = await watchPlayback(view.patch, restoreSignal, () => {});
+      if (result.preview && refreshed.preview?.key === result.preview.key) return refreshed;
+      throw new Error('The original exposure could not be restored.');
+    });
+  }
+
+  function recoverDisplayedImage() {
+    if (!exposure || !result?.jobId) return;
+    const image = `${result.jobId}/${exposure.key}`;
+    if (recoveringImage.current === image) {
+      setImageFailure('Could not load the exposure image.');
+      return;
+    }
+    recoveringImage.current = image;
+    const signal = AbortSignal.timeout(300_000);
+    void runComparisonAction(signal, (_, id) => checkPlaybackJob(id, signal)).then(() => {
+      if (recoveringImage.current === image && recovery.get(result.jobId) === restored) {
+        setImageFailure('Could not load the exposure image.');
+      }
+    }).catch((error: unknown) => {
+      if (recoveringImage.current === image) {
+        setImageFailure(error instanceof Error ? error.message : 'Could not load the exposure image.');
+      }
     });
   }
 
@@ -431,7 +497,7 @@ function App({ embed }: { embed: boolean }) {
     selectionRef.current = null;
     setPendingSequence(undefined);
     setPlaying(false);
-    setManual({ patch: view.patch, seed: result, autoSelectedSources: view.autoSelectedSources });
+    setManual({ patch: view.patch, seed: restored ?? result, autoSelectedSources: view.autoSelectedSources });
   }
 
   function applySelection(result: PlaybackUpdate) {
@@ -471,6 +537,9 @@ function App({ embed }: { embed: boolean }) {
   }
 
   function resetComparison() {
+    recovery.reset();
+    setImageFailure('');
+    recoveringImage.current = null;
     requestRef.current?.abort();
     requestRef.current = null;
     selectionRef.current?.abort();
@@ -610,6 +679,13 @@ function App({ embed }: { embed: boolean }) {
       )}
     </>
   );
+  const recoveryNotice = recoveryStatus.restoring
+    ? <p className="lookup-status comparison-recovery" role="status">Restoring comparison…</p>
+    : imageFailure ? <p className="lookup-status comparison-recovery" role="alert">{imageFailure}</p> : null;
+  const exposureImage = displayExposure && <img className={embed ? undefined : 'sky-frame'} src={displayExposure.imageUrl}
+    alt={`North-up SPHEREx detector ${displayExposure.detector} exposure of the selected sky patch`}
+    onLoad={() => { recoveringImage.current = null; if (imageFailure) setImageFailure(''); }}
+    onError={recoverDisplayedImage} />;
 
   if (embed) {
     const fullViewer = view ? `/?${patchQuery(view.patch)}` : `/${window.location.search}`;
@@ -622,10 +698,10 @@ function App({ embed }: { embed: boolean }) {
         RA {view.patch.coordinates.ra}° · Dec {view.patch.coordinates.dec}° · {view.patch.fieldSize}′ × {view.patch.fieldSize}′
       </p>}
       <div className="embed-image">
-        {exposure && <img src={exposure.imageUrl}
-          alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />}
+        {exposureImage}
       </div>
       <div className="embed-controls">
+        {recoveryNotice}
         {queryError && <p className="error" role="alert">{queryError}</p>}
         {result?.message && !canPlay && sequences.length === 0 && (
           <p className={result.status === 'error' ? 'error' : 'lookup-status'}
@@ -770,18 +846,24 @@ function App({ embed }: { embed: boolean }) {
             <div className="image-stage">
               <div className="exposure-layout">
                 <div className="exposure-frame">
-                  <PixelFlags url={flagsUrl} sourceSelection={activeTool === 'spectrum' ? spectrumPick : undefined}>
+                  <PixelFlags url={flagsUrl} sourceSelection={activeTool === 'spectrum' ? spectrumPick : undefined}
+                    request={(signal) => runComparisonAction(signal, (current, id) => {
+                      const url = exposure && correspondingExposure(current, exposure)?.flagsUrl;
+                      if (!url) throw new Error('Pixel flags are unavailable for this exposure.');
+                      return fetchLookup(id, signal, () => fetch(url, {
+                        signal: AbortSignal.any([signal, AbortSignal.timeout(90_000)]),
+                      }));
+                    })}>
                     {imageMathMode ? (
                       !imageMathUnavailable && result?.jobId && imageMathKeys && imageMathKeys.length >= 2 && imageMathKeys.every(Boolean)
                         ? <CompareMathImage key={JSON.stringify([result.jobId, imageMathMode, imageMathKeys])}
-                            jobId={result.jobId} operation={imageMathMode} keys={imageMathKeys} />
+                            operation={imageMathMode} keys={imageMathKeys} fallback={recoveryStatus.restoring ? exposureImage : undefined}
+                            load={(signal) => runComparisonAction(signal, (_, id) =>
+                              loadImageMath(id, imageMathMode, imageMathKeys, signal))} />
                         : <div className="sky-frame image-math-placeholder" role="status">
                             {imageMathUnavailable || `Choose ${imageMathMode === 'stack' ? 'at least two visits to stack' : 'two visits to subtract'}.`}
                           </div>
-                    ) : (
-                      <img className="sky-frame" src={exposure.imageUrl}
-                        alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
-                    )}
+                    ) : exposureImage}
                     <CatalogMarkers layers={catalogLayers} />
                     {activeTool === 'motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
                     {activeTool === 'spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
@@ -809,6 +891,7 @@ function App({ embed }: { embed: boolean }) {
                         style={{ left: `${spectrumPick.x * 100}%`, top: `${spectrumPick.y * 100}%` }} />}
                     </button>}
                   </PixelFlags>
+                  {recoveryNotice}
                 </div>
                 {playbackControls}
                 <aside className="exposure-panel" aria-label="Comparison tools">
@@ -849,7 +932,7 @@ function App({ embed }: { embed: boolean }) {
                           detailsAction.current?.focus();
                         }
                       }}>
-                      <CompareImageControls mode={compareMode} frames={result?.frames ?? []} visits={activeAutoVisits}
+                      <CompareImageControls mode={compareMode} frames={(restored ?? result)?.frames ?? []} visits={activeAutoVisits}
                         selections={visitSelections}
                         unavailable={imageMathUnavailable} onSelect={setVisitSelections} onMode={(mode) => {
                           if (mode !== 'blink') {
@@ -911,26 +994,26 @@ function App({ embed }: { embed: boolean }) {
                               {exposure.bandwidth != null && (
                                 <tr><th scope="row">Bandwidth</th><td>{exposure.bandwidth.toFixed(4)} µm at center</td></tr>
                               )}
-                              {exposure.visit != null && view.result.comparison?.coverageIncludesBandpass !== undefined && (
-                                <tr><th scope="row">Visit</th><td>{exposure.visit}</td></tr>
+                              {displayExposure?.visit != null && comparison?.coverageIncludesBandpass !== undefined && (
+                                <tr><th scope="row">Visit</th><td>{displayExposure.visit}</td></tr>
                               )}
-                              {(!view.result.comparison || view.result.comparison.coverageIncludesBandpass !== undefined) && (
-                                <tr><th scope="row">Valid area</th><td>{(100 * exposure.coverage).toFixed(1)}%</td></tr>
+                              {(!comparison || comparison.coverageIncludesBandpass !== undefined) && (
+                                <tr><th scope="row">Valid area</th><td>{(100 * (displayExposure ?? exposure).coverage).toFixed(1)}%</td></tr>
                               )}
                             </tbody>
                           </table>
-                          {view.result.comparison && (
+                          {comparison && (
                             <table>
                               <caption>{exploratory ? 'Comparison' : 'Match'}</caption>
                               <tbody>
-                                <tr><th scope="row">Time span</th><td>{view.result.comparison.days < 1
-                                  ? `${(view.result.comparison.days * 1440).toFixed(1)} minutes`
-                                  : `${view.result.comparison.days.toFixed(2)} days`}</td></tr>
-                                {view.result.comparison.overlap !== null && (
-                                  <tr><th scope="row">Center overlap</th><td>{(100 * view.result.comparison.overlap).toFixed(1)}%</td></tr>
+                                <tr><th scope="row">Time span</th><td>{comparison.days < 1
+                                  ? `${(comparison.days * 1440).toFixed(1)} minutes`
+                                  : `${comparison.days.toFixed(2)} days`}</td></tr>
+                                {comparison.overlap !== null && (
+                                  <tr><th scope="row">Center overlap</th><td>{(100 * comparison.overlap).toFixed(1)}%</td></tr>
                                 )}
-                                <tr><th scope="row">{view.result.comparison.coverageIncludesBandpass === false
-                                  ? 'Shared valid area' : 'Shared matched area'}</th><td>{(100 * view.result.comparison.coverage).toFixed(1)}%</td></tr>
+                                <tr><th scope="row">{comparison.coverageIncludesBandpass === false
+                                  ? 'Shared valid area' : 'Shared matched area'}</th><td>{(100 * comparison.coverage).toFixed(1)}%</td></tr>
                               </tbody>
                             </table>
                           )}
@@ -940,7 +1023,8 @@ function App({ embed }: { embed: boolean }) {
                     </section>
                     <section id="comparison-tool-motion" className="comparison-tool" aria-label="Motion" hidden={activeTool !== 'motion'}>
                       {activeTool === 'motion' && sequenceControls}
-                      {motionJobId && result ? <MotionReview key={motionJobId} jobId={motionJobId} frames={result.frames} exploratory={exploratory}
+                      {motionJobId && result ? <MotionReview key={motionJobId} frames={(restored ?? result).frames} exploratory={exploratory}
+                        inspect={(signal) => runComparisonAction(signal, (_, id) => inspectMotion(id, signal))}
                         inspected={inspected} selectedCandidate={motionMarker} sequenceLoading={Boolean(pendingSequence)}
                         onResult={(motionResult) => setMotionResults((items) => ({ ...items, [motionJobId]: motionResult }))}
                         onCandidate={(candidate) => setMarkedMotion((items) => ({ ...items, [motionJobId]: candidate }))} /> :

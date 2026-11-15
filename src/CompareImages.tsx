@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react';
-import { loadImageMath, type Exposure, type ImageMathOperation, type PlaybackUpdate } from './exposure';
+import { useEffect, useEffectEvent, useState, type ReactNode } from 'react';
+import type { Exposure, ImageMathOperation, PlaybackUpdate } from './exposure';
 
 const modes = { blink: 'Blink', stack: 'Stack', difference: 'Difference' } as const;
 export type CompareMode = keyof typeof modes;
@@ -104,13 +104,19 @@ export function CompareImageControls({ mode, frames, visits, selections, unavail
 
 type ImageState = { url: string } | { error: string } | null;
 
-export function CompareMathImage({ jobId, operation, keys }: { jobId: string; operation: ImageMathOperation; keys: string[] }) {
+export function CompareMathImage({ operation, keys, load, fallback }: {
+  operation: ImageMathOperation;
+  keys: string[];
+  load: (signal: AbortSignal) => Promise<Blob>;
+  fallback?: ReactNode;
+}) {
   const [image, setImage] = useState<ImageState>(null);
   const [attempt, setAttempt] = useState(0);
+  const request = useEffectEvent(load);
   useEffect(() => {
     const controller = new AbortController();
     let url: string | undefined;
-    void loadImageMath(jobId, operation, keys, controller.signal).then(async (blob) => {
+    void request(controller.signal).then(async (blob) => {
       controller.signal.throwIfAborted();
       url = URL.createObjectURL(blob);
       const preview = new Image();
@@ -127,7 +133,7 @@ export function CompareMathImage({ jobId, operation, keys }: { jobId: string; op
       controller.abort();
       if (url) URL.revokeObjectURL(url);
     };
-  }, [jobId, operation, keys, attempt]);
+  }, [operation, keys, attempt]);
 
   if (image && 'url' in image) {
     const alt = operation === 'stack' ? `North-up average of ${keys.length} SPHEREx visits`
@@ -145,5 +151,5 @@ export function CompareMathImage({ jobId, operation, keys }: { jobId: string; op
       </div>
     );
   }
-  return <div className="sky-frame image-math-placeholder" role="status">Calculating {modes[operation].toLowerCase()}…</div>;
+  return fallback ?? <div className="sky-frame image-math-placeholder" role="status">Calculating {modes[operation].toLowerCase()}…</div>;
 }

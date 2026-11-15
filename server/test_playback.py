@@ -224,6 +224,7 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(invalid.status_code, 422)
                 expired = await client.post("/api/playback/expired/image-math", json=pair)
                 self.assertEqual(expired.status_code, 404)
+                self.assertEqual(expired.headers["x-lookup-expired"], "1")
 
     async def test_search_continues_after_reaching_the_visit_limit(self):
         items = [exposure(str(index), 60000 + index) for index in range(13)]

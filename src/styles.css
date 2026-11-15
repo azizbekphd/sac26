@@ -183,11 +183,21 @@ form { display: grid; gap: 10px; }
 }
 .exposure-frame {
   grid-area: image;
+  position: relative;
   display: grid;
   place-items: center;
   min-width: 0;
   min-height: 0;
   container-type: size;
+}
+.exposure-frame > .comparison-recovery {
+  position: absolute;
+  z-index: 2;
+  bottom: 6px;
+  margin: 0 6px;
+  padding: 4px 8px;
+  background: #161616;
+  color: #eee;
 }
 .sky-frame {
   display: block;

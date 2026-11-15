@@ -33,7 +33,8 @@ function sequence(id, indices) {
     message: exploratory ? 'Some exposures are from the same visit.' : '',
     comparison: { days: 3, overlap: 1, coverage: .95, bandpass: [4.18, 4.22],
       ...(exploratory ? { coverageIncludesBandpass: true } : {}) } };
-  const summary = { id, count: frames.length, exposureIds: frames.map((f) => `${f.observationId}:D${f.detector}`),
+  const summary = { id, count: frames.length, keys: frames.map((f) => f.key),
+    exposureIds: frames.map((f) => `${f.observationId}:D${f.detector}`),
     start: frames[0].observedAt, end: frames.at(-1).observedAt, bandpass: result.comparison.bandpass };
   return { result, summary };
 }
@@ -681,6 +682,161 @@ test('keeps Stack and Difference inputs synchronized with the active sequence', 
     await browser.close();
   }
 });
+
+for (const mode of ['Auto', 'Manual']) {
+  test(`restores ${mode} exposures and retries the same Difference after a restart`, { timeout: 25_000 }, async () => {
+    const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+    const rebuilding = Promise.withResolvers();
+    try {
+      const page = await browser.newPage();
+      page.setDefaultTimeout(6_000);
+      const original = mode === 'Auto' ? 'before.1' : 'manual-2';
+      const replacement = mode === 'Auto' ? 'after.2' : 'manual-3';
+      const frames = [0, 1, 2];
+      const old = sequence(original, frames);
+      const provisional = sequence('interrupted.1', [0, 2]);
+      const exact = sequence(replacement, frames);
+      const other = sequence('after.1', frames);
+      other.summary.keys[0] = 'a-different-product-of-the-same-exposure';
+      const patches = [];
+      const inventories = [];
+      const selections = [];
+      const calculations = [];
+      let stale = false;
+      let inventoryExpired = false;
+      let gateway = mode === 'Auto';
+      let initialPolls = 0;
+      let probeDropped = false;
+      let replacementUnavailable = false;
+
+      await page.route('**/*', async (route) => {
+        const request = route.request();
+        const url = new URL(request.url());
+        if (url.origin !== origin) return route.abort();
+        const path = url.pathname;
+        const json = (body) => route.fulfill({ json: body });
+        const expired = () => route.fulfill({ status: 404, headers: { 'X-Lookup-Expired': '1' },
+          json: { detail: 'This lookup has expired. Submit the patch again.' } });
+        if (path === '/api/playback') {
+          patches.push(request.postDataJSON());
+          return json({ id: ['interrupted', 'before'][patches.length - 1] ?? 'after' });
+        }
+        if (path === '/api/playback/interrupted') {
+          const poll = initialPolls++;
+          if (poll > 1) return expired();
+          return json({ ...base, status: 'searching', preview: provisional.result.frames[0],
+            sequences: poll === 0 ? [provisional.summary] : [],
+            withdrawnSequenceIds: poll === 0 ? [] : [provisional.summary.id] });
+        }
+        if (path === '/api/playback/interrupted.1') return json(provisional.result);
+        if (path === '/api/playback/before') return stale ? expired() : json({ ...base, sequences: [old.summary] });
+        if (path === '/api/playback/after') {
+          await rebuilding.promise;
+          return json({ ...base, sequences: [other.summary], sequenceCandidates: [other.summary, exact.summary] });
+        }
+        if (path === '/api/manual/inventory') {
+          inventories.push(request.postDataJSON());
+          return json({ id: `inventory-${inventories.length}` });
+        }
+        if (/^\/api\/playback\/inventory-\d+$/.test(path)) {
+          if (path.endsWith('-3')) await rebuilding.promise;
+          return json({ ...base, exposures: frames.map(exposure) });
+        }
+        if (path.endsWith('/calibration')) return json({});
+        if (path.endsWith('/comparison')) {
+          const id = path.split('/')[3];
+          selections.push({ id, keys: request.postDataJSON().keys });
+          if (id === 'inventory-1' && inventoryExpired) return expired();
+          return json({ id: id.replace('inventory', 'manual') });
+        }
+        if (path.endsWith('/image-math')) {
+          const id = path.split('/')[3];
+          calculations.push({ id, ...request.postDataJSON() });
+          if (id === original && stale) {
+            if (!gateway) return route.abort('failed');
+            gateway = false;
+            return route.fulfill({ status: 503, contentType: 'text/html', body: 'Waking up' });
+          }
+          if (id === replacement && replacementUnavailable) return expired();
+          return route.fulfill({ body: png, contentType: 'image/png' });
+        }
+        if (path.endsWith('.png')) return route.fulfill({ body: png, contentType: 'image/png' });
+        if (path === `/api/playback/${original}`) {
+          if (!stale) return json(old.result);
+          if (mode === 'Auto' && !probeDropped) {
+            probeDropped = true;
+            return route.abort('failed');
+          }
+          return expired();
+        }
+        if (path === `/api/playback/${replacement}`) return json(exact.result);
+        return route.fulfill({ path: fileURLToPath(new URL(path === '/' ? 'index.html' : path.slice(1), dist)) });
+      });
+
+      const button = (name) => page.getByRole('button', { name, exact: true });
+      const difference = page.getByRole('img', { name: /North-up SPHEREx difference/ });
+      const earlier = page.getByLabel('Earlier visit', { exact: true });
+      const later = page.getByLabel('Later visit', { exact: true });
+      await page.goto(origin);
+      await page.getByLabel('Right ascension (RA)').fill('10');
+      await page.getByLabel('Declination (Dec)').fill('20');
+      if (mode === 'Auto') {
+        await button('Compare visits').click();
+      } else {
+        await button('Choose exposures manually').click();
+        for (const index of frames) {
+          await page.getByRole('dialog').getByRole('checkbox', { name: new RegExp(`obs-${index}`) }).check();
+        }
+        inventoryExpired = true;
+        await button('Apply selection').click();
+      }
+      await page.getByText('1 / 3 visits', { exact: true }).waitFor();
+      await button('Difference').click();
+      await difference.waitFor();
+      await later.selectOption('e1');
+      await difference.waitFor();
+      await button('Blink').click();
+      await button('Next').click();
+      const start = calculations.length;
+      stale = true;
+      await button('Difference').click();
+      await page.getByText('Restoring comparison…', { exact: true }).waitFor();
+      await page.getByRole('img', { name: /North-up SPHEREx detector/ }).waitFor();
+      rebuilding.resolve();
+      await difference.waitFor();
+      assert.equal(await earlier.inputValue(), 'e0');
+      assert.equal(await later.inputValue(), 'e1');
+      assert.deepEqual(calculations.slice(start), [original, replacement].map((id) =>
+        ({ id, operation: 'difference', keys: ['e0', 'e1'] })));
+      await button('Blink').click();
+      await page.locator(`img[src="/api/playback/${replacement}/images/frame-1.png"]`).waitFor();
+      if (mode === 'Auto') {
+        assert.deepEqual(patches, [patches[0], patches[0], patches[0]]);
+        assert.equal(initialPolls, 3);
+        assert.deepEqual(inventories, []);
+      } else {
+        assert.deepEqual(patches, []);
+        assert.deepEqual(inventories, [inventories[0], inventories[0], inventories[0]]);
+        assert.deepEqual(selections, [1, 2, 3].map((index) =>
+          ({ id: `inventory-${index}`, keys: ['e0', 'e1', 'e2'] })));
+      }
+
+      if (mode === 'Auto') {
+        // A second expiry can start a new recovery. If the retried action also
+        // expires, it stops and leaves the selection available for a user retry.
+        replacementUnavailable = true;
+        await button('Difference').click();
+        await page.getByRole('alert').filter({ hasText: 'The archive lookup expired.' }).waitFor();
+        assert.equal(patches.length, 4);
+        assert.deepEqual(calculations.slice(-2).map(({ id }) => id), [replacement, replacement]);
+        assert.equal(await later.inputValue(), 'e1');
+      }
+    } finally {
+      rebuilding.resolve();
+      await browser.close();
+    }
+  });
+}
 
 test('overlays Gaia and WISE sources independently on the current sky patch', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });

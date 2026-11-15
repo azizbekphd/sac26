@@ -66,9 +66,13 @@ async def exposure_preview(client, patch, item):
     return render_png(pixels.image, pixels.valid)
 
 
-async def render_selection(runner, selected, *, archive_visit_dates=None):
+async def render_selection(runner, selected, *, archive_visit_dates=None, auto_match=False):
     job = runner.job
     job.records = tuple(item for item, _ in selected)
+    if auto_match and any(not job.accepts_gap(later.mjd - earlier.mjd) for earlier, later in pairwise(job.records)):
+        job.status = "no-match"
+        job.message = "The original exposures no longer meet the time gap filter."
+        return
 
     async def read_image(item):
         try:
@@ -87,7 +91,8 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
     for batch in batches(selected, 4):
         images, calibration = await asyncio.gather(
             asyncio.gather(*(read_image(item) for item, _ in batch)),
-            asyncio.gather(*(runner.archive_read(runner.center, item, visit, minimum_area=0)
+            asyncio.gather(*(runner.auto_center(item, visit) if auto_match else
+                             runner.archive_read(runner.center, item, visit, minimum_area=0)
                              for item, visit in batch)),
         )
         pixels.extend(images)
@@ -95,6 +100,10 @@ async def render_selection(runner, selected, *, archive_visit_dates=None):
     if job.exposure_issues:
         job.status = "error" if "read-failed" in job.exposure_issues.values() else "no-match"
         job.message = "Review the marked exposures in your selection."
+        return
+    if auto_match and any(center is None or not job.filters.overlaps_band(*center.band) for center in centers):
+        job.status = "no-match"
+        job.message = "The original exposures no longer meet the Auto wavelength and coverage requirements."
         return
 
     masks = [frame.valid for frame in pixels]

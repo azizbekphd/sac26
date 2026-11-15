@@ -114,6 +114,52 @@ class ManualTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(manual.mode, "exploratory")
                 self.assertIn("same visit", manual.message)
 
+    async def test_restored_auto_selection_preserves_gap_and_center_wavelength_filters(self):
+        early, _, later, _ = fixture()
+
+        async def discover(runner):
+            yield [later, early], False, True
+
+        image = np.ones((3, 3), dtype=np.float32)
+        pixels = ExposurePixels(image, np.ones(image.shape, dtype=bool), None, image.shape)
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            with (
+                patch.object(PlaybackSearch, "discover", discover),
+                patch.object(PlaybackSearch, "center", AsyncMock(
+                    side_effect=lambda item, visit, **_: Center(item, visit, 1.5, .25))),
+                patch.object(PlaybackSearch, "image_pixels", AsyncMock(return_value=pixels)),
+                patch.object(PlaybackSearch, "field_bandpass", AsyncMock(return_value=(image * 1.5, image * .25))),
+            ):
+                async def submit(path, payload):
+                    response = await client.post(path, json=payload)
+                    response.raise_for_status()
+                    job = app.state.playback[response.json()["id"]]
+                    await asyncio.wait_for(job.task, 2)
+                    return job
+
+                geometry = {"ra": 10, "dec": 20, "fieldSize": 6}
+                selected = {"keys": [early.key, later.key]}
+                inventory = await submit("/api/manual/inventory", {**geometry, "maxWavelength": 1.3})
+                path = f"/api/manual/{inventory.id}/comparison"
+                manual = await submit(path, selected)
+                self.assertEqual((manual.status, manual.mode), ("ready", "matched"))
+                wrong_gap = await submit(path, {**selected, "autoMatch": {"maxGapDays": .5}})
+                self.assertEqual(wrong_gap.status, "no-match")
+                self.assertIn("time gap", wrong_gap.message)
+                wrong_band = await submit(path, {**selected, "autoMatch": {"minGapDays": 1, "maxGapDays": 1}})
+                self.assertEqual(wrong_band.status, "no-match")
+                self.assertIn("wavelength", wrong_band.message)
+
+                inventory = await submit("/api/manual/inventory", {**geometry, "maxWavelength": 1.5})
+                restored = await submit(f"/api/manual/{inventory.id}/comparison", {
+                    **selected, "autoMatch": {"minGapDays": 1, "maxGapDays": 1},
+                })
+                self.assertEqual((restored.status, restored.mode), ("ready", "matched"))
+                self.assertEqual([frame["key"] for frame in restored.frames], selected["keys"])
+
     async def test_inventory_and_comparison_use_exact_exposures(self):
         early, nearby, later, last = fixture()
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react';
+import { useEffect, useEffectEvent, useRef, useState, type MouseEvent, type PointerEvent, type ReactNode } from 'react';
 
 type Point = { x: number; y: number };
 type FlagMap = {
@@ -18,8 +18,7 @@ const directions: Record<string, Point> = {
   ArrowUp: { x: 0, y: -1 }, ArrowDown: { x: 0, y: 1 },
 };
 
-async function loadFlags(url: string, signal: AbortSignal): Promise<FlagMap> {
-  const response = await fetch(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]) });
+async function readFlags(response: Response): Promise<FlagMap> {
   if (!response.ok) throw new Error('Pixel flags unavailable');
   const { width, height, definitions, samples } = await response.json() as FlagResponse;
   const decoded = atob(samples);
@@ -50,9 +49,10 @@ function pixelAt(point: Point, map: FlagMap): Point {
   };
 }
 
-type Props = { url?: string; sourceSelection?: Point | null; children: ReactNode };
+type Props = { url?: string; sourceSelection?: Point | null; children: ReactNode;
+  request: (signal: AbortSignal) => Promise<Response> };
 
-export function PixelFlags({ url, sourceSelection, children }: Props) {
+export function PixelFlags({ url, sourceSelection, children, request }: Props) {
   const [loaded, setLoaded] = useState<{ url: string; map: FlagMap | null }>();
   const [attempt, setAttempt] = useState(0);
   const [hovered, setHovered] = useState<Point | null>(null);
@@ -63,11 +63,12 @@ export function PixelFlags({ url, sourceSelection, children }: Props) {
   const map = current?.map;
   const point = hovered ?? sourceSelection ?? pinned;
   const selected = point && map && pixelAt(point, map);
+  const load = useEffectEvent(request);
 
   useEffect(() => {
     if (!url) return;
     const controller = new AbortController();
-    void loadFlags(url, controller.signal).then((map) => {
+    void load(controller.signal).then(readFlags).then((map) => {
       if (!controller.signal.aborted) setLoaded({ url, map });
     }).catch(() => {
       if (!controller.signal.aborted) setLoaded({ url, map: null });

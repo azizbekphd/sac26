@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { countVisits, inspectMotion, type Exposure, type MotionCandidate, type MotionResult } from './exposure';
+import { countVisits, type Exposure, type MotionCandidate, type MotionResult } from './exposure';
 
 export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate; frame: number }) {
   const points = candidate.measurements.map(({ frameIndex, imagePosition: [x, y] }) =>
@@ -17,13 +17,13 @@ export function MotionMarkers({ candidate, frame }: { candidate: MotionCandidate
   );
 }
 
-export function MotionReview({ jobId, frames, exploratory, inspected, selectedCandidate, sequenceLoading, onResult, onCandidate }: {
-  jobId: string;
+export function MotionReview({ frames, exploratory, inspected, selectedCandidate, sequenceLoading, inspect, onResult, onCandidate }: {
   frames: Exposure[];
   exploratory: boolean;
   inspected?: MotionResult;
   selectedCandidate?: MotionCandidate | null;
   sequenceLoading: boolean;
+  inspect: (signal: AbortSignal) => Promise<MotionResult>;
   onResult: (result: MotionResult) => void;
   onCandidate: (candidate: MotionCandidate | null) => void;
 }) {
@@ -49,7 +49,7 @@ export function MotionReview({ jobId, frames, exploratory, inspected, selectedCa
     setState('loading');
     onCandidate(null);
     setError('');
-    void inspectMotion(jobId, controller.signal).then((result) => {
+    void inspect(controller.signal).then((result) => {
       if (controller.signal.aborted) return;
       setState(result);
       setIndex(0);

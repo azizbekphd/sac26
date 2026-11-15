@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { useEffect, useEffectEvent, useRef, useState, type FormEvent } from 'react';
 import {
-  exposureIdentity, loadBandpasses, loadExposurePreview, maxManualFrames, watchInventory, watchSelection,
+  exposureIdentity, loadBandpasses, loadExposurePreview, LookupExpiredError, maxManualFrames, watchInventory, watchSelection,
   type ArchiveExposure, type ArchivePatch, type Bandpass, type ExposureIssue, type InventoryUpdate, type PlaybackUpdate,
 } from './exposure';
+import { LookupRecovery, requireInventoryKeys, restoreInventory } from './lookupRecovery';
 
 const pageSize = 12;
 const networkError = 'The playback service is unavailable. Try again.';
@@ -40,9 +41,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error && !(error instanceof TypeError) ? error.message : networkError;
 }
 
-function ExposurePreview({ exposure, source, onClose }: {
+function ExposurePreview({ exposure, source, load, onClose }: {
   exposure: ArchiveExposure;
   source: PreviewSource;
+  load: typeof loadExposurePreview;
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -55,6 +57,7 @@ function ExposurePreview({ exposure, source, onClose }: {
   const inventoryId = source.archive?.inventoryId;
   const key = source.archive?.key;
   const previewError = error || (playbackFailed && !inventoryId ? 'Could not display this exposure preview.' : '');
+  const request = useEffectEvent(load);
 
   useEffect(() => { dialog.current?.showModal(); }, []);
 
@@ -62,7 +65,7 @@ function ExposurePreview({ exposure, source, onClose }: {
     if (playback || !inventoryId || !key) return;
     const controller = new AbortController();
     let objectUrl: string | undefined;
-    void loadExposurePreview(inventoryId, key, controller.signal).then((png) => {
+    void request(inventoryId, key, controller.signal).then((png) => {
       if (controller.signal.aborted) return;
       objectUrl = URL.createObjectURL(png);
       setArchiveUrl(objectUrl);
@@ -131,6 +134,8 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
   const [exposureIssues, setExposureIssues] = useState<Record<string, ExposureIssue>>({});
   const [exploratory, setExploratory] = useState<PlaybackUpdate | null>(null);
   const [preview, setPreview] = useState<ArchiveExposure | null>(null);
+  const [restoring, setRestoring] = useState(false);
+  const [recovery] = useState(() => new LookupRecovery<InventoryUpdate>(setRestoring));
 
   const exposures = listing?.exposures ?? [];
   const inventoryId = listing?.status === 'ready' ? listing.jobId : undefined;
@@ -171,10 +176,20 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
       aria-label={`Preview ${item.release} detector ${item.detector} exposure at ${observationTime(item)}`}>Preview</button>;
   }
 
+  function runInventoryAction<T>(id: string, keys: string[], signal: AbortSignal, action: (id: string) => Promise<T>) {
+    return recovery.run(id, signal, (replacement) => {
+      requireInventoryKeys(replacement, keys);
+      return action(replacement?.jobId ?? id);
+    }, (restoreSignal) => restoreInventory(patch, restoreSignal));
+  }
+
   useEffect(() => {
     dialog.current?.showModal();
-    return () => request.current?.abort();
-  }, []);
+    return () => {
+      request.current?.abort();
+      recovery.reset();
+    };
+  }, [recovery]);
 
   useEffect(() => {
     if (!listJump) return;
@@ -185,9 +200,14 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
 
   useEffect(() => {
     const controller = new AbortController();
-    void watchInventory(patch, seed?.jobId, controller.signal, (update) => {
+    const updateListing = (update: InventoryUpdate) => {
       setListing(update);
       if (update.status === 'error') setListingError(update.message);
+    };
+    void watchInventory(patch, seed?.jobId, controller.signal, updateListing).catch((error: unknown) => {
+      controller.signal.throwIfAborted();
+      if (!(error instanceof LookupExpiredError)) throw error;
+      return watchInventory(patch, undefined, controller.signal, updateListing);
     }).catch((error: unknown) => {
       if (!controller.signal.aborted) setListingError(errorMessage(error));
     });
@@ -199,7 +219,7 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
     const keys = (JSON.parse(calibrationKeys) as string[]).filter((key) => !(key in bands));
     if (!keys.length) return;
     const controller = new AbortController();
-    void loadBandpasses(inventoryId, keys, controller.signal).then((values) => {
+    void runInventoryAction(inventoryId, keys, controller.signal, (id) => loadBandpasses(id, keys, controller.signal)).then((values) => {
       if (controller.signal.aborted) return;
       setBands((current) => ({ ...current, ...Object.fromEntries(keys.map((key) => [key, values[key] ?? null])) }));
     }).catch(() => {
@@ -244,7 +264,7 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
     setFailure('');
     setExploratory(null);
     setStatus('Preparing selected exposures…');
-    void watchSelection(inventoryId, keys, controller.signal, (update) => {
+    void runInventoryAction(inventoryId, keys, controller.signal, (id) => watchSelection(id, keys, controller.signal, (update) => {
       if (update.status === 'searching') return;
       setExposureIssues((current) => {
         const issues = { ...current };
@@ -254,7 +274,7 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
       if (update.status !== 'ready') setFailure(update.message);
       else if (update.mode === 'exploratory') setExploratory(update);
       else onApply(update);
-    }).catch((error: unknown) => {
+    })).catch((error: unknown) => {
       if (!controller.signal.aborted) setFailure(errorMessage(error));
     }).finally(() => {
       request.current = null;
@@ -393,6 +413,7 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
         </section>
         {unavailable && <p role="alert">Remove exposures that are missing from this archive listing, or reopen the picker.</p>}
         {failure && <p className="manual-issue" role="alert">{failure}</p>}
+        {restoring && <p role="status">Restoring exposure list…</p>}
         {status && <p role="status">{status}</p>}
         {exploratory && (
           <div className="manual-playback-notice" role="status">
@@ -407,7 +428,9 @@ export function ManualPicker({ patch, seed, autoSelectedSources, onClose, onAppl
         </div>
       </form>
       {preview && activePreview && (
-        <ExposurePreview exposure={preview} source={activePreview} onClose={() => setPreview(null)} />
+        <ExposurePreview exposure={preview} source={activePreview}
+          load={(id, key, signal) => runInventoryAction(id, [key], signal, (current) => loadExposurePreview(current, key, signal))}
+          onClose={() => setPreview(null)} />
       )}
     </dialog>
   );

@@ -63,16 +63,19 @@ class Patch(BaseModel):
         )
 
 
-class PlaybackPatch(Patch):
+class PlaybackGap(BaseModel):
     minGapDays: float = Field(default=0, ge=0, allow_inf_nan=False)
     maxGapDays: float | None = Field(default=None, ge=0, allow_inf_nan=False)
-    requireSnapshot: bool = False
 
     @model_validator(mode="after")
     def check_gap(self):
         if self.maxGapDays is not None and self.minGapDays > self.maxGapDays:
             raise ValueError("Minimum time gap must be at most maximum time gap.")
         return self
+
+
+class PlaybackPatch(Patch, PlaybackGap):
+    requireSnapshot: bool = False
 
 
 class InventoryPatch(Patch):
@@ -85,6 +88,7 @@ class CalibrationRequest(BaseModel):
 
 class ManualSelection(BaseModel):
     keys: list[str] = Field(min_length=2, max_length=MAX_FRAMES)
+    autoMatch: PlaybackGap | None = None
 
 
 class ImageMathRequest(BaseModel):
@@ -212,7 +216,8 @@ def find_playback(jobs, job_id):
 def playback_job(request: Request, job_id: str):
     job = find_playback(request.app.state.playback, job_id)
     if job is None:
-        raise HTTPException(404, "This lookup has expired. Submit the patch again.")
+        raise HTTPException(404, "This lookup has expired. Submit the patch again.",
+                            headers={"X-Lookup-Expired": "1", "Cache-Control": "no-store"})
     return job
 
 
@@ -274,8 +279,11 @@ async def start_manual_comparison(job_id: str, selection: ManualSelection, reque
     job, records = inventory_selection(request, job_id, selection.keys)
     if len({item.identity for item, _ in records}) != len(records):
         raise HTTPException(422, "Choose one archive product per detector exposure.")
-    render = partial(render_selection, archive_visit_dates=visit_dates_by_key(group_visits(job.records)))
-    return register_job(request, job.patch, run_manual, render, records, filters=job.filters)
+    gap = selection.autoMatch
+    render = partial(render_selection, archive_visit_dates=visit_dates_by_key(group_visits(job.records)),
+                     auto_match=gap is not None)
+    return register_job(request, job.patch, run_manual, render, records, filters=job.filters,
+                        min_gap=gap.minGapDays if gap else 0, max_gap=gap.maxGapDays if gap else None)
 
 
 @app.get("/api/manual/{job_id}/preview")

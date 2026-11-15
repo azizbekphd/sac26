@@ -11,7 +11,8 @@ export type ArchivePatch = {
   minWavelength: number | null;
   maxWavelength: number | null;
 };
-export type PlaybackPatch = ArchivePatch & { minGapDays: number; maxGapDays: number | null };
+type PlaybackGap = { minGapDays: number; maxGapDays: number | null };
+export type PlaybackPatch = ArchivePatch & PlaybackGap;
 
 export type ArchiveExposure = {
   key: string;
@@ -57,6 +58,7 @@ export type SequenceSummary = {
   count: number;
   visitCount?: number | null;
   exposureIds: string[];
+  keys?: string[];
   visits?: number[];
   start: string;
   end: string;
@@ -73,7 +75,8 @@ export type SequenceSearch = PlaybackUpdate & {
 export type ImageMathOperation = 'stack' | 'difference';
 
 export async function loadImageMath(jobId: string, operation: ImageMathOperation, keys: string[], signal: AbortSignal) {
-  const response = await post(`/api/playback/${encodeURIComponent(jobId)}/image-math`, { operation, keys }, signal);
+  const response = await fetchLookup(jobId, signal, () =>
+    post(`/api/playback/${encodeURIComponent(jobId)}/image-math`, { operation, keys }, signal));
   if (!response.ok) await jsonResponse(response, 'Image comparison is unavailable.', 'Could not calculate the image. Try again.');
   return response.blob();
 }
@@ -100,7 +103,7 @@ export type MotionResult =
 
 export async function inspectMotion(jobId: string, signal: AbortSignal) {
   return jsonResponse<MotionResult>(
-    await post(`/api/playback/${encodeURIComponent(jobId)}/motion`, {}, signal),
+    await fetchLookup(jobId, signal, () => post(`/api/playback/${encodeURIComponent(jobId)}/motion`, {}, signal)),
     'Motion analysis is unavailable for this comparison.',
   );
 }
@@ -176,8 +179,19 @@ async function pollSpectrum(path: string, signal: AbortSignal, update: (result: 
 
 export const maxManualFrames = 12;
 
+export class LookupExpiredError extends Error {
+  constructor() { super('The archive lookup expired. Try the action again.'); }
+}
+
+function checkLookup(response: Response) {
+  if (response.status === 404 && response.headers.get('X-Lookup-Expired') === '1') {
+    throw new LookupExpiredError();
+  }
+}
+
 async function jsonResponse<T>(response: Response, missingEndpoint?: string,
   fallback = 'The playback service is unavailable. Try again.'): Promise<T> {
+  checkLookup(response);
   if (!response.ok) {
     const body = await response.json().catch(() => null);
     if (missingEndpoint && response.status === 404 && (!body?.detail || body.detail === 'Not Found')) {
@@ -209,18 +223,56 @@ function post(path: string, body: object, signal?: AbortSignal) {
   });
 }
 
-async function decodeFrames(result: PlaybackUpdate, signal: AbortSignal) {
+// Render can answer with a loading page or gateway response before FastAPI is ready.
+function waking(response: Response) {
+  const type = response.headers.get('Content-Type') ?? '';
+  return type.includes('text/html') || ([502, 503, 504].includes(response.status) && !type.includes('json'));
+}
+
+export async function checkPlaybackJob(id: string, signal: AbortSignal) {
+  const waiting = AbortSignal.any([signal, AbortSignal.timeout(90_000)]);
+  const path = `/api/playback/${encodeURIComponent(id)}`;
+  for (;;) {
+    const response = await fetch(path, { signal: waiting, cache: 'no-store' }).catch((error: unknown) => {
+      waiting.throwIfAborted();
+      if (!(error instanceof TypeError)) throw error;
+      return null;
+    });
+    if (response && !waking(response)) {
+      checkLookup(response);
+      return;
+    }
+    await nextPoll(waiting);
+  }
+}
+
+export async function fetchLookup(id: string, signal: AbortSignal, request: () => Promise<Response>) {
+  const response = await request().catch(async (error: unknown) => {
+    // Only replay a dropped request if the probe confirms the old job is gone.
+    if (error instanceof TypeError && !signal.aborted) await checkPlaybackJob(id, signal);
+    throw error;
+  });
+  if (waking(response)) await checkPlaybackJob(id, signal);
+  checkLookup(response);
+  return response;
+}
+
+async function decodeFrames(result: PlaybackUpdate, id: string, signal: AbortSignal) {
   await Promise.all(result.frames.map(async (frame) => {
     const image = new Image();
     image.src = frame.imageUrl;
     await image.decode();
-  })).catch(() => { throw new Error('Could not load the comparison images. Try again.'); });
+  })).catch(async () => {
+    if (!signal.aborted) await checkPlaybackJob(id, signal);
+    throw new Error('Could not load the comparison images. Try again.');
+  });
   signal.throwIfAborted();
 }
 
 export async function loadSequence(id: string, signal: AbortSignal) {
-  const result = await jsonResponse<PlaybackUpdate>(await fetch(`/api/playback/${encodeURIComponent(id)}`, { signal }));
-  await decodeFrames(result, signal);
+  const result = await jsonResponse<PlaybackUpdate>(await fetchLookup(id, signal, () =>
+    fetch(`/api/playback/${encodeURIComponent(id)}`, { signal })));
+  await decodeFrames(result, id, signal);
   return { ...result, jobId: id };
 }
 
@@ -230,21 +282,22 @@ export async function stopPlayback(id: string) {
 }
 
 async function watchJob<T extends PlaybackUpdate>(
-  start: string, body: object, signal: AbortSignal, update: (result: T) => void, missingEndpoint?: string,
+  start: () => Promise<Response>, signal: AbortSignal, update: (result: T) => void, missingEndpoint?: string,
 ) {
   // Read the job ID even if the visitor cancels before the POST response arrives.
-  const { id } = await jsonResponse<{ id: string }>(await post(start, body), missingEndpoint);
+  const { id } = await jsonResponse<{ id: string }>(await start(), missingEndpoint);
   const path = `/api/playback/${encodeURIComponent(id)}`;
   let finished = false;
   try {
     for (;;) {
-      const result = await jsonResponse<T>(await fetch(path, { signal }));
-      if (result.status === 'ready') await decodeFrames(result, signal);
+      const result = await jsonResponse<T>(await fetchLookup(id, signal, () => fetch(path, { signal })));
+      if (result.status === 'ready') await decodeFrames(result, id, signal);
       signal.throwIfAborted();
-      update({ ...result, jobId: id });
+      const latest = { ...result, jobId: id };
+      update(latest);
       if (result.status !== 'searching') {
         finished = true;
-        return;
+        return latest;
       }
       await nextPoll(signal);
     }
@@ -270,7 +323,7 @@ export async function watchPlayback(
         if (!(error instanceof TypeError)) throw error;
         return null;
       });
-      if (!response || response.status >= 500) {
+      if (!response || response.status >= 500 || waking(response)) {
         update(previous ? { ...previous, reconnecting: true } : {
           status: 'searching', message: 'Reconnecting to the archive search…', preview: null,
           frames: [], comparison: null, partial: false, sequences: [], reconnecting: true, jobId: id,
@@ -280,7 +333,7 @@ export async function watchPlayback(
         signal.throwIfAborted();
         previous = { ...result, jobId: id };
         update(previous);
-        if (result.status !== 'searching') return;
+        if (result.status !== 'searching') return previous;
       }
       await nextPoll(signal);
     }
@@ -294,27 +347,28 @@ export function watchInventory(
   fromPlayback: string | undefined, signal: AbortSignal,
   update: (result: InventoryUpdate) => void,
 ) {
-  return watchJob('/api/manual/inventory', {
+  return watchJob<InventoryUpdate>(() => post('/api/manual/inventory', {
     ...position, fieldSize, release, startDate, endDate, minWavelength, maxWavelength, fromPlayback,
-  }, signal, update,
+  }), signal, update,
     'This server version cannot list exposures for Manual. Restart or update the API server, then retry.');
 }
 
 export function watchSelection(
-  id: string, keys: string[], signal: AbortSignal, update: (result: PlaybackUpdate) => void,
+  id: string, keys: string[], signal: AbortSignal, update: (result: PlaybackUpdate) => void, autoMatch?: PlaybackGap,
 ) {
-  return watchJob(`/api/manual/${encodeURIComponent(id)}/comparison`, { keys }, signal, update);
+  return watchJob(() => fetchLookup(id, signal, () =>
+    post(`/api/manual/${encodeURIComponent(id)}/comparison`, { keys, autoMatch })), signal, update);
 }
 
 export async function loadBandpasses(id: string, keys: string[], signal: AbortSignal) {
   return jsonResponse<Record<string, Bandpass | null>>(
-    await post(`/api/manual/${encodeURIComponent(id)}/calibration`, { keys }, signal),
+    await fetchLookup(id, signal, () => post(`/api/manual/${encodeURIComponent(id)}/calibration`, { keys }, signal)),
   );
 }
 
 export async function loadExposurePreview(id: string, key: string, signal: AbortSignal) {
   const query = new URLSearchParams({ key });
-  const response = await fetch(`/api/manual/${encodeURIComponent(id)}/preview?${query}`, { signal });
+  const response = await fetchLookup(id, signal, () => fetch(`/api/manual/${encodeURIComponent(id)}/preview?${query}`, { signal }));
   if (!response.ok) {
     await jsonResponse(response, 'Exposure previews are unavailable on this server.');
   }
