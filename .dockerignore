@@ -17,3 +17,5 @@ server/test_*.py
 !src/**
 !public/
 !public/**
+
+!deploy/render-index-smoke.py
