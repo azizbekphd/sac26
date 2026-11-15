@@ -581,7 +581,7 @@ function App({ embed }: { embed: boolean }) {
     }
     if (incompleteFilters.size) setIncompleteFilters(new Set());
     setQueryError(location.kind === 'invalid' && !editing ? location.message : '');
-    if (location.kind === 'query' && !editing) loadComparison(location.patch);
+    if (embed && location.kind === 'query') loadComparison(location.patch);
     else resetComparison();
   });
 

@@ -76,7 +76,7 @@ async function routeCoordinateViewer(context, lookupStatus) {
   return requests;
 }
 
-test('opens and shares coordinate searches and restores them across browser history', { timeout: 25_000 }, async () => {
+test('prefills shared patches and browser history without starting a comparison', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   const staleLookup = Promise.withResolvers();
   const stalePoll = Promise.withResolvers();
@@ -106,9 +106,13 @@ test('opens and shares coordinate searches and restores them across browser hist
       return patch.ra === 0 ? { ...base, status: 'no-match', message: 'No comparable visits.' } : ready;
     });
     await page.goto(`${origin}/?ra=0&dec=-90&campaign=demo`);
+    assert.equal(await page.locator('#ra').inputValue(), '0');
+    assert.equal(await page.locator('#dec').inputValue(), '-90');
+    assert.equal(await page.getByRole('button', { name: 'Play', exact: true }).count(), 0);
+    assert.equal(requests.length, 0);
+    await page.getByRole('button', { name: 'Compare visits' }).click();
     await page.getByText('No comparable visits.', { exact: true }).waitFor();
     assert.equal(requests.length, 1);
-    assert.equal(await page.locator('#ra').inputValue(), '0');
     assert.equal(await page.evaluate(() => sessionStorage.getItem('sac26.target-preset')), 'WISE 0855');
     assert.deepEqual(requests[0], {
       ra: 0, dec: -90, fieldSize: 6, release: null, startDate: null, endDate: null,
@@ -173,24 +177,38 @@ test('opens and shares coordinate searches and restores them across browser hist
     });
 
     await page.goBack();
-    await stalePoll.promise;
     assert.equal(await page.locator('#ra').inputValue(), '0');
+    assert.equal(await page.getByRole('button', { name: 'Play', exact: true }).count(), 0);
+    assert.equal(requests.length, 2);
+    await page.getByRole('button', { name: 'Compare visits' }).click();
+    await stalePoll.promise;
     await page.goForward();
-    await page.getByRole('button', { name: 'Play', exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Compare visits' }).waitFor();
+    assert.equal(await page.locator('#ra').inputValue(), '120');
+    assert.equal(await page.locator('#maxGapDays').inputValue(), '40');
     staleLookup.resolve();
     assert.equal(await page.getByText('Stale lookup error').count(), 0);
-    assert.deepEqual(requests[3], requests[1]);
+    assert.equal(requests.length, 3);
 
     const receiver = await context.newPage();
     await receiver.goto(shared);
+    assert.equal(await receiver.locator('#ra').inputValue(), '120');
+    assert.equal(await receiver.locator('#dec').inputValue(), '90');
+    assert.equal(await receiver.locator('#patch-release').inputValue(), 'qr3');
+    assert.equal(await receiver.locator('#startDate').inputValue(), '2024-02-29');
+    assert.equal(await receiver.locator('#minWavelength').inputValue(), '0.0000001');
+    assert.equal(await receiver.getByRole('button', { name: 'Play', exact: true }).count(), 0);
+    assert.equal(requests.length, 3);
+    await receiver.getByRole('button', { name: 'Compare visits' }).click();
     await receiver.getByRole('button', { name: 'Play', exact: true }).waitFor();
-    assert.deepEqual(requests[4], requests[1]);
+    assert.deepEqual(requests[3], requests[1]);
     await receiver.getByRole('button', { name: 'Back to sky' }).click();
     assert.equal(new URL(receiver.url()).search, new URL(shared).search);
     assert.equal(await receiver.locator('#ra').inputValue(), '120');
     await receiver.reload();
     await receiver.getByRole('button', { name: 'Compare visits' }).waitFor();
     assert.equal(await receiver.locator('#ra').inputValue(), '120');
+    assert.equal(requests.length, 4);
     for (const [query, diagnostic] of [
       ['ra=20', 'dec'], ['ra=&dec=0', 'ra'], ['ra=1&ra=2&dec=0', 'ra'],
       ['ra=Infinity&dec=0', 'ra'], ['ra=360&dec=0', 'ra'], ['ra=1&dec=91', 'dec'],
@@ -200,10 +218,13 @@ test('opens and shares coordinate searches and restores them across browser hist
       await receiver.goto(`${origin}/?${query}`);
       assert.match(await receiver.getByRole('alert').textContent(), new RegExp(diagnostic));
     }
-    assert.equal(requests.length, 5);
+    assert.equal(requests.length, 4);
     await receiver.goto(`${origin}/?ra=359.99999999999994&dec=%2B0`);
+    assert.equal(await receiver.locator('#ra').inputValue(), '359.99999999999994');
+    assert.equal(requests.length, 4);
+    await receiver.getByRole('button', { name: 'Compare visits' }).click();
     await receiver.getByRole('button', { name: 'Play', exact: true }).waitFor();
-    assert.equal(requests[5].ra, 359.99999999999994);
+    assert.equal(requests[4].ra, 359.99999999999994);
   } finally {
     staleLookup.resolve();
     await browser.close();
@@ -867,6 +888,7 @@ test('overlays Gaia and WISE sources independently on the current sky patch', { 
 
     await page.goto(`${origin}/?ra=10&dec=20&fieldSize=6`);
     const button = (name) => page.getByRole('button', { name, exact: true });
+    await button('Compare visits').click();
     const gaiaToggle = button('Gaia');
     const wiseToggle = button('WISE');
     const gaiaDetails = button('Gaia catalog details');

@@ -24,7 +24,7 @@ export function SharePatch({ patch }: { patch: SubmittedPatch }) {
   }
 
   return <div className="share-patch-fields">
-    <p className="lookup-status">Links and embeds run Auto for this patch and its search filters.</p>
+    <p className="lookup-status">Patch links prefill the form. Embed links start an Auto comparison.</p>
     {([['Patch', viewer.href], ['Embed', embed.href]] as const).map(([name, url]) => {
       const id = `${linkId}-${name}`;
       return <div className="share-link-field" key={name}>
