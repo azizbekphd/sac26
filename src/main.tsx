@@ -5,6 +5,7 @@ import { createRoot } from 'react-dom/client';
 import { formatPosition, parseCoordinate, parsePosition, positionInPatch, presets, type CoordinateFields, type SkyPosition } from './coordinates';
 import { SkyPicker } from './SkyPicker';
 import { ManualPicker } from './ManualPicker';
+import { CatalogMarkers, CatalogToggle, useCatalogOverlay } from './CatalogOverlays';
 import { CompareImageControls, CompareMathImage, defaultVisitSelections, retainVisitSelections, type CompareMode } from './CompareImages';
 import { MotionMarkers, MotionReview } from './MotionReview';
 import { PixelFlags } from './PixelFlags';
@@ -75,9 +76,11 @@ const workspaceTools = [
   { id: 'motion', label: 'Motion' },
   { id: 'spectrum', label: 'Spectrum' },
   { id: 'pixel-flags', label: 'Pixel Flags' },
+  { id: 'gaia' },
+  { id: 'wise' },
   { id: 'share', label: 'Share' },
 ] as const;
-type ComparisonTool = Exclude<typeof workspaceTools[number]['id'], 'pixel-flags'>;
+type ComparisonTool = Exclude<typeof workspaceTools[number]['id'], 'pixel-flags' | 'gaia' | 'wise'>;
 
 function summarizeSelection(result: PlaybackUpdate, id: string): SequenceSummary {
   return {
@@ -161,6 +164,10 @@ function App({ embed }: { embed: boolean }) {
   const canPlay = view?.result.status === 'ready';
   const frameCount = result?.frames.length ?? 0;
   const exposure = result?.frames[frameIndex] ?? result?.preview;
+  const catalogPatch = !embed && exposure ? view?.patch : undefined;
+  const gaia = useCatalogOverlay('gaia', catalogPatch);
+  const wise = useCatalogOverlay('wise', catalogPatch);
+  const catalogLayers = [gaia, wise];
   useEffect(() => {
     currentFrame.current = exposure ? exposureIdentity(exposure) : undefined;
   }, [exposure]);
@@ -764,6 +771,7 @@ function App({ embed }: { embed: boolean }) {
                       <img className="sky-frame" src={exposure.imageUrl}
                         alt={`North-up SPHEREx detector ${exposure.detector} exposure of the selected sky patch`} />
                     )}
+                    <CatalogMarkers layers={catalogLayers} />
                     {activeTool === 'motion' && motionMarker && <MotionMarkers candidate={motionMarker} frame={frameIndex} />}
                     {activeTool === 'spectrum' && <button className="spectrum-target" type="button" ref={spectrumTarget}
                       aria-label="Select a source for spectrum" aria-describedby="spectrum-pick-help"
@@ -799,22 +807,27 @@ function App({ embed }: { embed: boolean }) {
                       {isLoading ? 'Cancel' : 'Back'}
                     </button>
                     <div className="comparison-tools" role="group" aria-label="Workspace tools">
-                      {workspaceTools.map(({ id, label }) => id === 'pixel-flags' ? (
-                        <button key={id} className="control pixel-flags-toggle" type="button" aria-pressed={Boolean(flagsUrl)}
-                          aria-controls={flagsUrl ? 'pixel-flag-readout' : undefined}
-                          disabled={Boolean(flagUnavailable)} title={flagUnavailable ?? 'Highlight pixel warnings'}
-                          onClick={() => setShowPixelFlags((visible) => !visible)}>
-                          {label}
-                        </button>
-                      ) : (
-                        <button key={id} type="button" className="control" aria-pressed={activeTool === id}
-                          aria-controls={`comparison-tool-${id}`} onClick={() => {
-                            if (id === 'compare' && compareMode !== 'blink') setPlaying(false);
-                            setActiveTool(id);
-                          }}>
-                          {label}
-                        </button>
-                      ))}
+                      {workspaceTools.map((tool) => {
+                        const { id } = tool;
+                        if (id === 'gaia' || id === 'wise') return <CatalogToggle key={id} layer={id === 'gaia' ? gaia : wise} />;
+                        const { label } = tool;
+                        return id === 'pixel-flags' ? (
+                          <button key={id} className="control pixel-flags-toggle" type="button" aria-pressed={Boolean(flagsUrl)}
+                            aria-controls={flagsUrl ? 'pixel-flag-readout' : undefined}
+                            disabled={Boolean(flagUnavailable)} title={flagUnavailable ?? 'Highlight pixel warnings'}
+                            onClick={() => setShowPixelFlags((visible) => !visible)}>
+                            {label}
+                          </button>
+                        ) : (
+                          <button key={id} type="button" className="control" aria-pressed={activeTool === id}
+                            aria-controls={`comparison-tool-${id}`} onClick={() => {
+                              if (id === 'compare' && compareMode !== 'blink') setPlaying(false);
+                              setActiveTool(id);
+                            }}>
+                            {label}
+                          </button>
+                        );
+                      })}
                     </div>
                   </div>
                   <div className="comparison-tool-content">

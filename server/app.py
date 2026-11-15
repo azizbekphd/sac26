@@ -7,16 +7,17 @@ from datetime import date
 from functools import partial
 from pathlib import Path
 from time import monotonic
-from typing import Literal
+from typing import Annotated, Literal, get_args
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
+from .catalogs import Catalog, catalog_sources
 from .exposure import ArchiveError, ArchiveFilters, NoExposure, Release, find_exposure
 from .manual import (
     CALIBRATION_BATCH, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
@@ -29,12 +30,13 @@ from .spectrum import SpectrumJob, run_spectrum
 JOB_RETENTION = 30 * 60
 MJD_EPOCH = date(1858, 11, 17)
 VIEWER_BUILD = Path(__file__).resolve().parent.parent / "dist"
+FieldSize = Literal[3, 6, 12, 24, 48]
 
 
 class Patch(BaseModel):
     ra: float = Field(ge=0, lt=360)
     dec: float = Field(ge=-90, le=90)
-    fieldSize: Literal[3, 6, 12, 24, 48]
+    fieldSize: FieldSize
     release: Release | None = None
     startDate: date | None = None
     endDate: date | None = None
@@ -109,6 +111,7 @@ async def lifespan(app):
         app.state.lookups = asyncio.Semaphore(4)
         app.state.motion = asyncio.Semaphore(1)
         app.state.image_math = asyncio.Semaphore(2)
+        app.state.catalogs = asyncio.Semaphore(2)
         app.state.playback = {}
         app.state.previews = OrderedDict()
         app.state.spectra = {}
@@ -401,7 +404,7 @@ async def wait_for_disconnect(request: Request):
         pass
 
 
-async def read_exposure(request, prepare, no_exposure, *, timeout=75, limit=None):
+async def read_exposure(request, prepare, no_exposure, *, timeout=75, limit=None, archive="SPHEREx archive"):
     deadline = asyncio.get_running_loop().time() + timeout
     limit = request.app.state.lookups if limit is None else limit
 
@@ -420,11 +423,11 @@ async def read_exposure(request, prepare, no_exposure, *, timeout=75, limit=None
     except NoExposure:
         raise HTTPException(404, no_exposure) from None
     except (TimeoutError, httpx.TimeoutException):
-        raise HTTPException(504, "The SPHEREx archive took too long to respond. Try again.") from None
+        raise HTTPException(504, f"The {archive} took too long to respond. Try again.") from None
     except ArchiveError as exc:
         raise HTTPException(502, str(exc)) from exc
     except (httpx.HTTPError, OSError, ValueError, KeyError):
-        raise HTTPException(502, "The SPHEREx archive could not complete the lookup. Try again.") from None
+        raise HTTPException(502, f"The {archive} could not complete the lookup. Try again.") from None
     finally:
         lookup.cancel()
         disconnect.cancel()
@@ -439,6 +442,25 @@ async def exposure(patch: Patch, request: Request):
         )
 
     return await read_exposure(request, prepare, "No usable SPHEREx exposure covers this patch.")
+
+
+@app.get("/api/catalogs/{catalog}")
+async def catalog_overlay(
+    catalog: Catalog, request: Request, response: Response,
+    ra: Annotated[float, Query(ge=0, lt=360)], dec: Annotated[float, Query(ge=-90, le=90)], fieldSize: int,
+):
+    if fieldSize not in get_args(FieldSize):
+        raise HTTPException(422, "Choose a supported field size.")
+
+    state = request.app.state
+
+    async def prepare(_deadline):
+        return await catalog_sources(state.archive, catalog, ra, dec, fieldSize)
+
+    result = await read_exposure(request, prepare, "No catalog sources cover this patch.", timeout=16,
+                                 limit=state.catalogs, archive="catalog service")
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return result
 
 
 @app.get("/", include_in_schema=False)

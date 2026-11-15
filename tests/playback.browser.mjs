@@ -626,6 +626,152 @@ test('keeps Stack and Difference inputs synchronized with the active sequence', 
   }
 });
 
+test('overlays Gaia and WISE sources independently on the current sky patch', { timeout: 25_000 }, async () => {
+  const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
+  const stack = Promise.withResolvers();
+  const gaiaResponse = Promise.withResolvers();
+  try {
+    const context = await browser.newContext();
+    await routeCoordinateViewer(context, (_patch, _id, ready) => ready);
+    const page = await context.newPage();
+    page.setDefaultTimeout(6_000);
+    const requests = [];
+    await page.route('**/api/catalogs/**', async (route) => {
+      const url = new URL(route.request().url());
+      const catalog = url.pathname.split('/').at(-1);
+      requests.push([catalog, Object.fromEntries(url.searchParams)]);
+      if (catalog === 'wise' && requests.filter(([name]) => name === 'wise').length === 1) {
+        return route.fulfill({ status: 502 });
+      }
+      if (catalog === 'gaia') await gaiaResponse.promise;
+      const sources = url.searchParams.get('ra') !== '10' ? [] : catalog === 'gaia'
+        ? [{ x: .25, y: .35 }] : [{ x: .75, y: .65 }];
+      return route.fulfill({ json: { sources, limited: false } });
+    });
+    await page.route('**/api/playback/**/image-math', async (route) => {
+      await stack.promise;
+      return route.fulfill({ body: png, contentType: 'image/png' });
+    });
+
+    await page.goto(`${origin}/?ra=10&dec=20&fieldSize=6`);
+    const button = (name) => page.getByRole('button', { name, exact: true });
+    const gaiaToggle = button('Gaia');
+    const wiseToggle = button('WISE');
+    const gaiaDetails = button('Gaia catalog details');
+    const wiseDetails = button('WISE catalog details');
+    const gaiaPopup = page.getByRole('region', { name: 'Gaia DR3 · G band', exact: true });
+    const wisePopup = page.getByRole('region', { name: 'AllWISE · W2 (4.6 µm)', exact: true });
+    const gaia = page.locator('.catalog-markers[data-catalog="gaia"]');
+    const wise = page.locator('.catalog-markers[data-catalog="wise"]');
+    const wiseControl = page.locator('.catalog-toggle[data-catalog="wise"]');
+    const background = (locator) => locator.evaluate((element) => getComputedStyle(element).backgroundColor);
+    await gaiaToggle.waitFor();
+    assert.deepEqual(requests, []);
+    assert.equal(await gaiaToggle.getAttribute('aria-pressed'), 'false');
+    const idleBackground = await background(wiseControl);
+    await wiseToggle.hover();
+    assert.notEqual(await background(wiseControl), idleBackground);
+    assert.deepEqual(await wiseToggle.boundingBox(), await wiseControl.boundingBox());
+    await gaiaToggle.press('Enter');
+    const loading = button('Loading Gaia catalog');
+    await loading.locator('[data-state="loading"]').waitFor();
+    assert.equal(await loading.getAttribute('aria-disabled'), 'true');
+    const [labelBox, statusBox] = await Promise.all([gaiaToggle.boundingBox(), loading.boundingBox()]);
+    assert.equal(labelBox.x + labelBox.width, statusBox.x);
+    assert.equal(labelBox.y, statusBox.y);
+    gaiaResponse.resolve();
+    await gaia.waitFor();
+    await gaiaDetails.locator('[data-state="ready"]').waitFor();
+    await gaiaDetails.press('Enter');
+    await gaiaPopup.getByText('1 source', { exact: true }).waitFor();
+    await page.waitForFunction(() => document.activeElement?.matches('.catalog-details'));
+    const [gaiaIcon, gaiaBox] = await Promise.all([gaiaDetails.boundingBox(), gaiaPopup.boundingBox()]);
+    assert.ok(gaiaBox.x >= gaiaIcon.x + gaiaIcon.width && gaiaBox.x <= gaiaIcon.x + gaiaIcon.width + 8);
+    assert.equal(gaiaBox.y, gaiaIcon.y);
+    await page.keyboard.press('Escape');
+    await gaiaPopup.waitFor({ state: 'hidden' });
+    assert.equal(await gaiaDetails.evaluate((element) => element === document.activeElement), true);
+    const { offsetX, offsetY } = await gaia.locator('circle').evaluate((marker) => {
+      const bounds = marker.getBoundingClientRect();
+      const image = marker.ownerSVGElement.ownerSVGElement.getBoundingClientRect();
+      return { offsetX: (bounds.x + bounds.width / 2 - image.x) / image.width,
+        offsetY: (bounds.y + bounds.height / 2 - image.y) / image.height };
+    });
+    assert.ok(Math.abs(offsetX - .25) < .002 && Math.abs(offsetY - .35) < .002);
+    assert.equal(await button('Compare').getAttribute('aria-pressed'), 'true');
+
+    await wiseToggle.click();
+    const retryWise = button('Retry WISE');
+    await retryWise.locator('[data-state="failed"]').waitFor();
+    await retryWise.click();
+    await wise.locator('path').waitFor();
+    await wiseDetails.waitFor();
+    assert.equal(await wiseToggle.getAttribute('aria-pressed'), 'true');
+    await button('Compare').hover();
+    const activeBackground = await background(wiseControl);
+    await wiseToggle.hover();
+    const hoverBackground = await background(wiseControl);
+    assert.notEqual(hoverBackground, activeBackground);
+    await wiseDetails.hover();
+    assert.equal(await background(wiseControl), hoverBackground);
+    assert.equal(await background(wiseDetails), 'rgba(0, 0, 0, 0)');
+    await page.setViewportSize({ width: 320, height: 680 });
+    const bounds = await Promise.all([gaiaDetails.boundingBox(), wiseDetails.boundingBox()]);
+    assert.ok(bounds.every((box) => box && box.x >= 0 && box.x + box.width <= 320));
+    await wiseDetails.click();
+    await page.waitForFunction(() => document.activeElement?.matches('.catalog-details'));
+    const wiseBox = await wisePopup.boundingBox();
+    assert.ok(wiseBox.x >= 0 && wiseBox.x + wiseBox.width <= 320 && wiseBox.y >= 0);
+    assert.ok(wiseBox.y >= bounds[1].y + bounds[1].height && wiseBox.y <= bounds[1].y + bounds[1].height + 16,
+      'The popup sits just below WISE and leaves the tool rows clear');
+    await button('Motion').click();
+    await wisePopup.waitFor({ state: 'hidden' });
+    assert.equal(await button('Motion').getAttribute('aria-pressed'), 'true');
+    await button('Compare').click();
+    await page.setViewportSize({ width: 390, height: 650 });
+    const phoneBounds = await Promise.all([gaiaDetails.boundingBox(), wiseDetails.boundingBox(), button('Share').boundingBox()]);
+    assert.ok(phoneBounds.every((box) => box && box.x >= 0 && box.x + box.width <= 390));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await gaia.waitFor();
+    await button('Next').click();
+    await page.getByRole('slider', { name: 'Playback position' }).getAttribute('aria-valuetext').then((text) => {
+      assert.equal(text, 'Frame 2 of 2');
+    });
+    await gaia.waitFor();
+    await wise.waitFor();
+    assert.equal(requests.length, 3);
+    assert.deepEqual(requests[0], ['gaia', { ra: '10', dec: '20', fieldSize: '6' }]);
+
+    await button('Spectrum').click();
+    await button('Select a source for spectrum').click();
+    await button('Show spectrum').waitFor();
+    await button('Compare').click();
+    await button('Stack').click();
+    await page.getByText('Calculating stack…').waitFor();
+    await gaia.waitFor({ state: 'hidden' });
+    stack.resolve();
+    await page.getByRole('img', { name: /North-up average/ }).waitFor();
+    await gaia.waitFor();
+    await wise.waitFor();
+    await wiseToggle.click();
+    await wise.waitFor({ state: 'hidden' });
+    await gaia.waitFor();
+
+    await button('Back to sky').click();
+    await page.getByLabel('Right ascension (RA)').fill('30');
+    await button('Compare visits').click();
+    await gaiaDetails.click();
+    await gaiaPopup.getByText('No sources in this patch', { exact: true }).waitFor();
+    await gaia.waitFor({ state: 'hidden' });
+    assert.deepEqual(requests.at(-1), ['gaia', { ra: '30', dec: '20', fieldSize: '6' }]);
+    assert.equal(requests.length, 4);
+  } finally {
+    gaiaResponse.resolve();
+    stack.resolve();
+    await browser.close();
+  }
+});
+
 test('toggles Pixel Flags alongside the active workspace tool', { timeout: 25_000 }, async () => {
   const browser = await chromium.launch({ channel: process.env.SAC26_BROWSER_CHANNEL, chromiumSandbox: true });
   const secondMap = Promise.withResolvers();
@@ -683,7 +829,7 @@ test('toggles Pixel Flags alongside the active workspace tool', { timeout: 25_00
     const flagsTool = rail.getByRole('button', { name: 'Pixel Flags', exact: true });
     await flagsTool.waitFor();
     assert.deepEqual(await rail.getByRole('button').allTextContents(),
-      ['Compare', 'Motion', 'Spectrum', 'Pixel Flags', 'Share']);
+      ['Compare', 'Motion', 'Spectrum', 'Pixel Flags', 'Gaia', 'WISE', 'Share']);
     assert.deepEqual(requests, []);
     await flagsTool.press('Enter');
     await button('Retry flags').click();
@@ -750,12 +896,11 @@ test('toggles Pixel Flags alongside the active workspace tool', { timeout: 25_00
     assert.equal(await flagsTool.getAttribute('aria-pressed'), 'true');
     await page.setViewportSize({ width: 320, height: 680 });
     const toolBoxes = await Promise.all((await rail.getByRole('button').all()).map((tool) => tool.boundingBox()));
-    assert.equal(toolBoxes.length, 5);
+    assert.equal(toolBoxes.length, 7);
+    assert.equal(new Set(toolBoxes.map(({ y }) => y)).size, 2, 'The tools wrap to two rows on a narrow screen');
     for (const tool of toolBoxes) {
-      assert.equal(tool.y, toolBoxes[0].y, 'All five tools fit on the mobile row');
       assert.ok(tool.x >= 0 && tool.x + tool.width <= 320);
     }
-    assert.ok((await shareTool.boundingBox()).x > (await flagsTool.boundingBox()).x);
     const mobileImage = await target.boundingBox();
     await page.touchscreen.tap(mobileImage.x + mobileImage.width / 4, mobileImage.y + mobileImage.height / 4);
     await readout.getByText('STREAK', { exact: true }).waitFor();
