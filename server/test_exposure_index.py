@@ -4,7 +4,7 @@ import runpy
 import sqlite3
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from astropy.io import fits
@@ -84,6 +84,16 @@ class ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
 class S3ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
     builder = runpy.run_path(str(Path(__file__).resolve().parents[1] / "deploy" / "build-spherex-s3-index.py"))
 
+    @staticmethod
+    def fits_header(observation, ra=0):
+        hdu = fits.Header({
+            "XTENSION": "IMAGE", "EXTNAME": "IMAGE", "BITPIX": -32, "NAXIS": 2, "NAXIS1": 2040, "NAXIS2": 2040,
+            "PCOUNT": 0, "GCOUNT": 1, "OBSID": observation, "DETECTOR": 1, "MJD-BEG": 60800.125,
+            "RADESYS": "ICRS", "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN", "CUNIT1": "deg", "CUNIT2": "deg",
+            "CRPIX1": 1020.5, "CRPIX2": 1020.5, "CRVAL1": ra, "CRVAL2": 0, "CDELT1": -.0017, "CDELT2": .0017,
+        })
+        return (fits.PrimaryHDU().header.tostring() + hdu.tostring()).encode("ascii").ljust(28800, b" ")
+
     async def test_scans_paginated_current_reductions_and_joins_complete_periods(self):
         def key(release, processing):
             return f"{release}/level2/2025W18_1B/{processing}/1/level2_2025W18_1B_0100_1D1_spx_{processing}.fits"
@@ -96,19 +106,15 @@ class S3ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
                 tail = "<IsTruncated>false</IsTruncated>" if next_page else (
                     "<IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken>"
                 )
-                return httpx.Response(200, text=f"<ListBucketResult><Contents><Key>{obj}</Key></Contents>"
-                                      f"{tail}</ListBucketResult>")
+                return httpx.Response(200, text=f"<ListBucketResult><Contents><Key>{obj}</Key>"
+                                      '<ETag>"tag"</ETag><LastModified>2026-11-01T00:00:00Z</LastModified>'
+                                      f"<Size>65000000</Size></Contents>{tail}</ListBucketResult>")
             self.assertIn("l2b_retry-v27-2026-197", request.url.path)
             self.assertEqual(request.headers["Range"], "bytes=0-28799")
+            self.assertEqual(request.headers["If-Match"], '"tag"')
             return httpx.Response(206, content=payload, headers={"Content-Range": "bytes 0-28799/65000000"})
 
-        hdu = fits.Header({
-            "XTENSION": "IMAGE", "EXTNAME": "IMAGE", "BITPIX": -32, "NAXIS": 2, "NAXIS1": 2040, "NAXIS2": 2040,
-            "PCOUNT": 0, "GCOUNT": 1, "OBSID": "2025W18_1B_0100_1", "DETECTOR": 1, "MJD-BEG": 60800.125,
-            "RADESYS": "ICRS", "CTYPE1": "RA---TAN", "CTYPE2": "DEC--TAN", "CUNIT1": "deg", "CUNIT2": "deg",
-            "CRPIX1": 1020.5, "CRPIX2": 1020.5, "CRVAL1": 0, "CRVAL2": 0, "CDELT1": -.0017, "CDELT2": .0017,
-        })
-        payload = (fits.PrimaryHDU().header.tostring() + hdu.tostring()).encode("ascii").ljust(28800, b" ")
+        payload = self.fits_header("2025W18_1B_0100_1")
         periods = ["dr1/level2/2025W18_1B/", "qr3/level2/2025W18_1B/"]
         with TemporaryDirectory() as temp:
             destination = Path(temp) / "snapshot.sqlite3"
@@ -126,3 +132,68 @@ class S3ExposureIndexTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(partial)
                 self.assertEqual([(row.key, row.mjd, row.wavelength_bounds) for row in items],
                                  [(key("qr3", "l2b_retry-v27-2026-197"), 60800.125, (.74, 1.13))])
+
+    async def test_refresh_reads_only_new_versions_and_keeps_original_on_failure(self):
+        def obj(release, number, etag):
+            obs = f"2025W18_1B_{number:04d}_1"
+            key = f"{release}/level2/2025W18_1B/l2b-v27-2026-196/1/level2_{obs}D1_spx_l2b-v27-2026-196.fits"
+            return self.builder["S3Object"](key, f'"{etag}"', "2026-11-01T00:00:00Z", 65_000_000)
+
+        unchanged, old, dropped, qr3 = (obj("dr1", 1, "same"), obj("dr1", 2, "old"),
+                                       obj("dr1", 3, "old"), obj("qr3", 1, "same"))
+        changed, added = obj("dr1", 2, "changed"), obj("dr1", 4, "new")
+        periods = [f"{release}/level2/2025W18_1B/" for release in ("dr1", "qr3")]
+        bands = {"dr11": (.74, 1.13), "qr31": (.74, 1.13)}
+        requests = []
+        fail_read = True
+
+        def gateway(request):
+            key = request.url.path.lstrip("/")
+            self.assertIn(key, (changed.key, added.key))
+            item = changed if key == changed.key else added
+            self.assertEqual(request.headers["If-Match"], item.etag)
+            requests.append(item)
+            if fail_read and item == changed:
+                return httpx.Response(412)
+            observation = self.builder["S3_KEY"].fullmatch(key)["observation"]
+            return httpx.Response(206, content=self.fits_header(observation, ra=30),
+                                  headers={"Content-Range": "bytes 0-28799/65000000"})
+
+        async def listing(client, prefix):
+            return [unchanged, changed, added] if prefix == periods[0] else [qr3]
+
+        refresh = self.builder["refresh"]
+        with TemporaryDirectory() as temp:
+            original, target = (Path(temp) / name for name in ("original.sqlite3", "next.sqlite3"))
+            with closing(self.builder["create_index"](original)) as db, db:
+                db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                db.execute('INSERT INTO snapshot VALUES ("old",3,1)')
+                for item in (unchanged, old, dropped, qr3):
+                    match = self.builder["S3_KEY"].fullmatch(item.key)
+                    header = self.builder["image_header"](self.fits_header(match["observation"]))
+                    values, bounds = self.builder["header_record"](item.key, header, (.74, 1.13))
+                    row = db.execute("INSERT INTO exposure VALUES (NULL,?,?,?,?,?,?,?,?)", values).lastrowid
+                    db.execute("INSERT INTO sky VALUES (?,?,?,?,?,?,?)", (row, *bounds))
+                    db.execute("INSERT INTO s3_object VALUES (?,?,?,?)", (row, *item.version))
+            source_bytes = original.read_bytes()
+            with patch.dict(refresh.__globals__, observing_periods=AsyncMock(return_value=periods),
+                            selected_objects=listing, refresh_bands=AsyncMock(return_value=(bands, 0))):
+                async with httpx.AsyncClient(transport=httpx.MockTransport(gateway)) as client:
+                    with self.assertRaises(httpx.HTTPStatusError):
+                        await refresh(client, original, target, None, 4)
+                    self.assertFalse(target.exists())
+                    self.assertEqual(original.read_bytes(), source_bytes)
+                    fail_read = False
+                    requests.clear()
+                    result = await refresh(client, original, target, None, 4)
+                    self.assertEqual({name: result[name] for name in ("reused", "added", "changed", "removed", "headersRead")},
+                                     {"reused": 2, "added": 1, "changed": 1, "removed": 1, "headersRead": 2})
+                    self.assertEqual(requests, [changed, added])
+                    with patch.dict("os.environ", SPHEREX_INDEX_PATH=str(target)):
+                        items, _ = await search(client, (), region="CIRCLE 30 0 0")
+                    self.assertEqual({item.key for item in items}, {changed.key, added.key})
+                    self.assertEqual(original.read_bytes(), source_bytes)
+                    requests.clear()
+                    result = await refresh(client, target, original.with_name("noop.sqlite3"), None, 4)
+                    self.assertFalse(result["publish"])
+                    self.assertFalse(requests)

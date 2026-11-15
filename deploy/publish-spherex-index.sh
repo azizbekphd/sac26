@@ -1,6 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ ${1:-} == --restore ]]; then
+  candidate="$RUNNER_TEMP/spherex-index.lock"
+  [[ -s "$candidate" ]] || exit 3
+  gh api "repos/$GITHUB_REPOSITORY/contents/deploy/spherex-index.lock?ref=main" > "$RUNNER_TEMP/current-lock.json"
+  python - <<'PY'
+from base64 import b64decode, b64encode
+import json
+import os
+from pathlib import Path
+
+temp = Path(os.environ["RUNNER_TEMP"])
+candidate = (temp / "spherex-index.lock").read_bytes()
+current = json.loads((temp / "current-lock.json").read_text())
+if b64decode(current["content"]) == candidate:
+    previous = Path("deploy/spherex-index.lock").read_bytes()
+    (temp / "restore-lock.json").write_text(json.dumps({
+        "message": "Restore the last verified SPHEREx exposure index",
+        "content": b64encode(previous).decode(), "sha": current["sha"], "branch": "main",
+    }))
+PY
+  [[ -s "$RUNNER_TEMP/restore-lock.json" ]] || exit 3
+  gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/deploy/spherex-index.lock" \
+    --input "$RUNNER_TEMP/restore-lock.json" --jq '.commit.sha'
+  gh workflow run deploy.yml --ref main -f refresh_index=true
+  exit 0
+fi
+
 python - <<'PY'
 from base64 import b64encode
 from hashlib import file_digest

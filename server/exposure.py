@@ -338,9 +338,11 @@ async def search(client, corners, limit=SEARCH_LIMIT, *, region=None, compact=Fa
     return sorted(exposures.values(), key=lambda exposure: (-exposure.mjd, exposure.key)), truncated
 
 
-async def fits_range(client, key, start, length):
+async def fits_range(client, key, start, length, *, etag=None):
     end = start + length - 1
     headers = {"Range": f"bytes={start}-{end}"}
+    if etag is not None:
+        headers["If-Match"] = etag
     async with client.stream("GET", S3 + quote(key, safe="/"), headers=headers) as response:
         response.raise_for_status()
         content_range = response.headers.get("Content-Range", "")

@@ -60,4 +60,5 @@ if __name__ == "__main__":
     lock = json.loads(Path(sys.argv[1]).read_text())
     with httpx.Client(base_url=ORIGIN, timeout=25) as client:
         wait_for_snapshot(client, {key: lock[key] for key in ("builtAt", "counts")})
-        check_preview(client)
+        check_preview(client, 127.7117, -39.1852, "dr1")
+        check_preview(client, 337.7831, -5.6072, "qr3")

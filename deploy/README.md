@@ -19,17 +19,23 @@ If the detector bundle changes, use **Clear build cache & deploy** so Docker ext
 
 ### SPHEREx exposure snapshot
 
-Run **Refresh SPHEREx exposure index** from GitHub Actions on `main` for an on-demand snapshot. The workflow checks daily and exports a new snapshot about once a week. It retries daily when the initial export or a scheduled refresh fails. It exports DR1 and QR3 Level 2 footprints from IRSA, including the deep surveys, and builds a SQLite R-tree. It publishes the compressed database as a versioned asset on this repository's GitHub Releases and updates [the lock file](spherex-index.lock) only after the asset uploads. Keep Render's auto-deploy mode set to **After CI Checks Pass**. The refresh dispatches the verification workflow for the updated lock, then checks the live snapshot timestamp and counts and requests a new S3 exposure preview on Render.
+Run **Refresh SPHEREx exposure index** from GitHub Actions on `main` for an on-demand check. The workflow checks daily and refreshes snapshots that are about a week old. It downloads the pinned SQLite snapshot, lists the public DR1 and QR3 Level 2 objects on S3, and requests FITS header ranges only for newly selected or changed objects. It identifies changes using the object key, ETag, modification time, and size. If the selected files and calibration maps are unchanged, the workflow keeps the current snapshot without rebuilding the image.
 
-If IRSA search is unavailable and the lock is still empty, run **Bootstrap SPHEREx exposure index from S3**. It lists the public DR1 and QR3 Level 2 keys, reads the FITS header ranges, and derives observation times and footprints from the files. It computes detector wavelength bounds from the shared calibration maps. The workflow partitions the observing periods across eight runners and publishes only after every period is indexed. Failed jobs can be rerun on the same workflow run. Playback continues to fetch FITS pixels from S3.
+When there are changes, the workflow builds and validates a separate SQLite file. It publishes the compressed database as a versioned GitHub Release asset and updates [the lock file](spherex-index.lock). Keep Render's auto-deploy mode set to **After CI Checks Pass**. The workflow checks the live timestamp and counts and requests DR1 and QR3 previews with IRSA fallback disabled. If publishing or verification fails after the new lock was selected, the workflow restores the previous lock and checks the restored version on Render. A failed S3 scan leaves the active snapshot untouched.
+
+If the lock is empty, run **Bootstrap SPHEREx exposure index from S3** to seed the first snapshot. It derives observation times and footprints from the FITS headers and detector wavelength bounds from the shared calibration maps. The workflow partitions the observing periods across eight runners and publishes only after every period is indexed. Failed jobs can be rerun on the same workflow run. Playback fetches FITS pixels from S3.
 
 Docker verifies the asset against the lock file and bundles the uncompressed SQLite file into the image. Render reads it from disk on each lookup, including after spin-down. The previous image and release asset remain available when an export, validation, or build fails. With an empty lock, the viewer uses live IRSA metadata. Check `GET /api/archive-index` for the bundled snapshot timestamp and row counts.
 
 For a local refresh and lookup:
 
 ```sh
-PYTHONPATH=. python deploy/build-spherex-index.py .cache/spherex.sqlite3
-SPHEREX_INDEX_PATH="$PWD/.cache/spherex.sqlite3" python -m uvicorn server.app:app
+python deploy/install-spherex-index.py deploy/spherex-index.lock .cache/spherex.sqlite3
+PYTHONPATH=. python deploy/build-spherex-s3-index.py refresh .cache/spherex-next.sqlite3 \
+  .cache/spherex.sqlite3 deploy/spherex-index.lock
+snapshot_path="$PWD/.cache/spherex.sqlite3"
+if [ -f .cache/spherex-next.sqlite3 ]; then snapshot_path="$PWD/.cache/spherex-next.sqlite3"; fi
+SPHEREX_INDEX_PATH="$snapshot_path" python -m uvicorn server.app:app
 ```
 
 ## Azure free trial
