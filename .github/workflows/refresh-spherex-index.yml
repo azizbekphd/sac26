@@ -2,7 +2,7 @@ name: Refresh SPHEREx exposure index
 
 on:
   schedule:
-    - cron: '23 6 * * 6'
+    - cron: '23 6 * * *'
   workflow_dispatch:
 
 permissions:
@@ -22,12 +22,23 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Check snapshot age
+        id: age
+        run: |
+          timestamp=$(jq -r '.builtAt // empty' deploy/spherex-index.lock)
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch || -z "$timestamp" ]] ||
+            (( $(date -u +%s) - $(date -ud "$timestamp" +%s) >= 6*86400+12*3600 )); then
+            echo 'refresh=true' >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/setup-python@v7
+        if: steps.age.outputs.refresh == 'true'
         with:
           python-version: '3.13'
           cache: pip
       - run: python -m pip install -r requirements.txt
+        if: steps.age.outputs.refresh == 'true'
       - name: Build and validate metadata snapshot
+        if: steps.age.outputs.refresh == 'true'
         env:
           PYTHONPATH: .
         run: |
@@ -35,6 +46,7 @@ jobs:
           python -u deploy/build-spherex-index.py "$RUNNER_TEMP/spherex.sqlite3" --previous-counts "$previous"
           gzip -1 -c "$RUNNER_TEMP/spherex.sqlite3" > "$RUNNER_TEMP/spherex.sqlite3.gz"
       - name: Publish snapshot and select it for the next Render build
+        if: steps.age.outputs.refresh == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: spherex-index-v1-${{ github.run_id }}-${{ github.run_attempt }}
@@ -71,4 +83,5 @@ jobs:
           # A push made with GITHUB_TOKEN does not start the usual push workflow.
           gh workflow run deploy.yml --ref main -f refresh_index=true
       - name: Verify the snapshot and an S3 preview on Render
+        if: steps.age.outputs.refresh == 'true'
         run: python deploy/verify-spherex-render.py "$RUNNER_TEMP/spherex-index.lock"
