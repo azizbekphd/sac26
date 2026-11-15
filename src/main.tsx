@@ -755,9 +755,6 @@ function App({ embed }: { embed: boolean }) {
                 {isLoading ? 'Cancel' : 'Compare visits'}
               </button>
               {!isLoading && <button className="control" type="submit" value="manual">Choose exposures manually</button>}
-              {view && canRetry && !workspaceOpen && (
-                <button type="button" className="control" onClick={() => loadComparison(view.patch)}>Retry</button>
-              )}
             </div>
             {!workspaceOpen && sequenceControls}
             {!workspaceOpen && drawerOpen && !queryError && !incompleteFilters.size && draftPatch &&
