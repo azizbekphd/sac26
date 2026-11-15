@@ -31,8 +31,10 @@ class MotionError(Exception):
     pass
 
 
-def motion_timeout(frame_count):
-    return min(MAX_MOTION_SECONDS, max(120, 20 * frame_count))
+def temporary_cache(prefix):
+    if os.environ.get("SPHEREX_MOTION_EPHEMERAL_CACHE") == "1":
+        return TemporaryDirectory(prefix=prefix)
+    return nullcontext()
 
 
 class Candidate(BaseModel):
@@ -144,7 +146,7 @@ def format_result(report, patch, frame_count=2, visit_ids=None):
     return {"status": "partial" if any(visits) else "inspected", "candidates": candidates, "visits": visits}
 
 
-async def analyze(job):
+async def analyze(job, *, calibration_cache=None):
     command = detector_command(len(job.frames))
     if command is None:
         raise MotionError("The motion detector is not installed on this server.")
@@ -169,12 +171,13 @@ async def analyze(job):
     if command[1:] == ("-m", "server.motion_adapter"):
         if visit_ids is not None:
             payload["visits"] = visit_ids
-        if os.environ.get("SPHEREX_MOTION_EPHEMERAL_CACHE") == "1":
-            cache = TemporaryDirectory(prefix="spherex-motion-")
+        if calibration_cache is not None:
+            command += ("--calibration-cache-dir", calibration_cache)
+        cache = temporary_cache("spherex-motion-")
     with cache as cache_dir:
         if cache_dir is not None:
             command += ("--cache-dir", cache_dir)
-        output = await run_detector(command, payload, len(job.frames))
+        output = await run_detector(command, payload)
     try:
         report = DetectorResult.model_validate_json(output)
     except ValidationError as exc:
@@ -182,7 +185,7 @@ async def analyze(job):
     return format_result(report, job.patch, len(job.frames), visit_ids)
 
 
-async def run_detector(command, payload, frame_count):
+async def run_detector(command, payload):
     try:
         proc = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -192,7 +195,8 @@ async def run_detector(command, payload, frame_count):
         log.warning("Could not launch SPHEREx motion detector: %s", exc)
         raise MotionError("The motion detector could not start.") from exc
     try:
-        async with asyncio.timeout(motion_timeout(frame_count)):
+        # Cold archive reads can dominate even a two-exposure analysis.
+        async with asyncio.timeout(MAX_MOTION_SECONDS):
             proc.stdin.write(json.dumps(payload).encode())
             await proc.stdin.drain()
             proc.stdin.close()

@@ -2,7 +2,7 @@
 
 import asyncio
 from collections import OrderedDict
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import date
 from functools import partial
 from pathlib import Path
@@ -23,7 +23,7 @@ from .manual import (
     CALIBRATION_BATCH, PREVIEW_CACHE_SIZE, calibrate, discover_inventory, exposure_preview,
     indexed_visits, render_selection, run_manual,
 )
-from .motion import MotionError, analyze, available as motion_available, motion_timeout
+from .motion import MAX_MOTION_SECONDS, MotionError, analyze, available as motion_available, temporary_cache
 from .playback import MAX_FRAMES, PlaybackJob, group_visits, render_image_math, run_playback, visit_dates_by_key
 from .spectrum import SpectrumJob, run_spectrum
 
@@ -106,8 +106,12 @@ class SpectrumRequest(BaseModel):
 @asynccontextmanager
 async def lifespan(app):
     limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
-    async with httpx.AsyncClient(timeout=httpx.Timeout(12, connect=8), limits=limits) as client:
-        app.state.archive = client
+    async with AsyncExitStack() as stack:
+        app.state.archive = await stack.enter_async_context(
+            httpx.AsyncClient(timeout=httpx.Timeout(12, connect=8), limits=limits)
+        )
+        # Only the fixed set of release/detector calibrations is shared between runs.
+        app.state.motion_calibration_cache = stack.enter_context(temporary_cache("spherex-motion-calibration-"))
         app.state.lookups = asyncio.Semaphore(4)
         app.state.motion = asyncio.Semaphore(1)
         app.state.image_math = asyncio.Semaphore(2)
@@ -322,7 +326,7 @@ async def playback_motion(job_id: str, request: Request):
         if withdrawn_sequence(request, job_id):
             raise HTTPException(409, WITHDRAWN_MOTION)
         if job.motion_result is None:
-            result = await analyze(job)
+            result = await analyze(job, calibration_cache=request.app.state.motion_calibration_cache)
             if withdrawn_sequence(request, job_id):
                 raise HTTPException(409, WITHDRAWN_MOTION)
             if result["status"] != "inspected" or any(result.get("visits", [])):
@@ -332,7 +336,7 @@ async def playback_motion(job_id: str, request: Request):
 
     try:
         return await read_exposure(request, inspect, "This sequence could not be analyzed.",
-                                   timeout=motion_timeout(len(job.frames)) + 5, limit=request.app.state.motion)
+                                   timeout=MAX_MOTION_SECONDS + 5, limit=request.app.state.motion)
     except MotionError as exc:
         raise HTTPException(503, str(exc)) from exc
     except HTTPException as exc:

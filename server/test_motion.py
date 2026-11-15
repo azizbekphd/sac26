@@ -13,7 +13,7 @@ import numpy as np
 
 from .app import app
 from .exposure import Exposure
-from .motion import DetectorResult, MotionError, analyze, format_result
+from .motion import MAX_MOTION_SECONDS, DetectorResult, MotionError, analyze, format_result
 from .motion_adapter import ROOT, Rejected, inspect, inspect_tracks, validate_request
 from .playback import Center, PlaybackJob, PlaybackSearch, ProjectedExposure
 
@@ -104,8 +104,12 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
                 "dict(candidate,score=30)])))\n"
             )
             command.chmod(0o700)
-            with patch.dict(os.environ, {"SPHEREX_MOTION_COMMAND": str(command)}):
+            with (
+                patch.dict(os.environ, {"SPHEREX_MOTION_COMMAND": str(command)}),
+                patch("server.motion.asyncio.timeout", wraps=asyncio.timeout) as timeout,
+            ):
                 report = await analyze(PlaybackJob("test", patch=PATCH, frames=frames()))
+                timeout.assert_called_once_with(MAX_MOTION_SECONDS)
                 same_visit = [{**frame, "visit": 1} for frame in frames()]
                 rejected = await analyze(PlaybackJob("test", patch=PATCH, frames=same_visit))
                 self.assertEqual((rejected["status"], rejected["candidates"]), ("rejected", []))
@@ -137,7 +141,40 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
                 for response in responses:
                     self.assertEqual(response.status_code, 200)
                     self.assertEqual(response.json(), empty)
-                detector.assert_awaited_once_with(job)
+                detector.assert_awaited_once_with(job, calibration_cache=app.state.motion_calibration_cache)
+
+    @patch.dict(os.environ, {"SPHEREX_MOTION_EPHEMERAL_CACHE": "1"})
+    async def test_retry_reuses_calibration_cache_with_fresh_exposure_directory(self):
+        command = (sys.executable, "-m", "server.motion_adapter")
+        paths = []
+
+        async def detector(args, _payload):
+            calibration = Path(args[args.index("--calibration-cache-dir") + 1])
+            science = Path(args[args.index("--cache-dir") + 1])
+            self.assertTrue(calibration.is_dir())
+            self.assertTrue(science.is_dir())
+            self.assertNotEqual(calibration, science)
+            paths.append((calibration, science))
+            return b'{"status":"incomplete","reason":"archive_or_calibration_unavailable"}'
+
+        async with (
+            app.router.lifespan_context(app),
+            httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client,
+        ):
+            job = PlaybackJob("test", status="ready", patch=PATCH, frames=frames())
+            app.state.playback[job.id] = job
+            with (
+                patch("server.motion.detector_command", return_value=command),
+                patch("server.motion.run_detector", side_effect=detector),
+            ):
+                for _ in range(2):
+                    response = await client.post(f"/api/playback/{job.id}/motion")
+                    self.assertEqual(response.json()["status"], "incomplete")
+                    self.assertFalse(paths[-1][1].exists())
+        (first_calibration, first_science), (retry_calibration, retry_science) = paths
+        self.assertEqual(first_calibration, retry_calibration)
+        self.assertNotEqual(first_science, retry_science)
+        self.assertFalse(first_calibration.exists())
 
     async def test_exploratory_playback_offers_motion_for_any_frame_selection(self):
         async with (
@@ -163,7 +200,7 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
                     ):
                         self.assertTrue((await client.get(path)).json()["motionAvailable"])
                         self.assertEqual((await client.post(path + "/motion")).json(), result)
-                        detector.assert_awaited_once_with(job)
+                        detector.assert_awaited_once_with(job, calibration_cache=app.state.motion_calibration_cache)
 
     def test_track_measurements_use_original_visit_indices(self):
         result = DetectorResult.model_validate({
@@ -315,5 +352,5 @@ class MotionTests(unittest.IsolatedAsyncioTestCase):
                 detector.assert_not_awaited()
 
                 self.assertEqual((await client.post(path + "/motion")).json(), result)
-                detector.assert_awaited_once_with(sequence)
+                detector.assert_awaited_once_with(sequence, calibration_cache=app.state.motion_calibration_cache)
                 self.assertEqual((await client.get(path)).json()["motionResult"], result)

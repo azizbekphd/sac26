@@ -340,7 +340,7 @@ def inspect_tracks(exposures, visits, grid, shape, issues):
     return dict(status="inspected", candidates=candidates, visits=issues)
 
 
-def inspect(request, cache_dir, offline=False, diagnostics=None):
+def inspect(request, cache_dir, offline=False, diagnostics=None, *, calibration_cache_dir=None):
     ra, dec, size, frames = validate_request(request)
     visits = [item["visit"] for item in frames]
     minimum_visits = min(len(frames), 3)
@@ -359,28 +359,33 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
     from frozen_revised.proposals import native_candidates, FitCache
 
     iers.conf.auto_download = False
-    archive = Archive(cache_dir)
-    original_request = archive.session.request
+    def open_archive(directory):
+        archive = Archive(directory)
+        original_request = archive.session.request
 
-    def public_request(method, url, **kwargs):
-        parsed = urlsplit(url)
-        require(
-            parsed.scheme == "https"
-            and parsed.netloc == S3_HOST
-            and parsed.username is None,
-            "unsupported_archive_endpoint",
-        )
-        if offline:
-            raise Rejected("offline_cache_miss")
-        kwargs["allow_redirects"] = False
-        response = original_request(method, url, **kwargs)
-        require(
-            response.status_code in [200, 206],
-            "archive_http_" + str(response.status_code),
-        )
-        return response
+        def public_request(method, url, **kwargs):
+            parsed = urlsplit(url)
+            require(
+                parsed.scheme == "https"
+                and parsed.netloc == S3_HOST
+                and parsed.username is None,
+                "unsupported_archive_endpoint",
+            )
+            if offline:
+                raise Rejected("offline_cache_miss")
+            kwargs["allow_redirects"] = False
+            response = original_request(method, url, **kwargs)
+            require(
+                response.status_code in [200, 206],
+                "archive_http_" + str(response.status_code),
+            )
+            return response
 
-    archive.session.request = public_request
+        archive.session.request = public_request
+        return archive
+
+    archive = open_archive(cache_dir)
+    calibration_archive = open_archive(calibration_cache_dir) if calibration_cache_dir is not None else archive
     exposures = []
     # Fit on the native frames. Enclose the rotated field and leave room for
     # PSF fits at its edges. Small fields share the 6′ registration context.
@@ -393,7 +398,7 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
         release = frame["release"]
         calibration_url = f"{S3_ROOT}{release}/spectral_wcs/{CAL_VERSION}/{det}/spectral_wcs_D{det}_spx_{CAL_VERSION}.fits"
         if (release, det) not in calibrations:
-            cp = archive.get(calibration_url, ".fits")
+            cp = calibration_archive.get(calibration_url, ".fits")
             calibrations[release, det] = SpectralCalibration.read(cp, calibration_url)
         row = {
             "cloud_access": json.dumps(
@@ -543,6 +548,7 @@ def inspect(request, cache_dir, offline=False, diagnostics=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--cache-dir", type=Path, default=ROOT / "cache")
+    parser.add_argument("--calibration-cache-dir", type=Path)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--diagnostics", type=Path)
     args = parser.parse_args()
@@ -551,7 +557,8 @@ def main():
         require(len(payload) <= 65536, "request_too_large")
         request = json.loads(payload)
         with redirect_stdout(sys.stderr):
-            result = inspect(request, args.cache_dir, args.offline, args.diagnostics)
+            result = inspect(request, args.cache_dir, args.offline, args.diagnostics,
+                             calibration_cache_dir=args.calibration_cache_dir)
     except (Rejected, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         reason = (
             str(exc) if isinstance(exc, Rejected) else "malformed_or_unsupported_input"
