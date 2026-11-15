@@ -7,12 +7,14 @@ archive frames, and writes one DetectorResult JSON object to stdout.
 """
 
 import asyncio
+from contextlib import nullcontext
 import json
 import logging
 from math import isfinite
 import os
 from pathlib import Path
 import sys
+from tempfile import TemporaryDirectory
 from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -162,8 +164,24 @@ async def analyze(job):
     if visit_ids is not None and len(set(visit_ids)) < min(len(visit_ids), 3):
         return format_result(DetectorResult(status="rejected", reason="insufficient_independent_visits"),
                              job.patch, len(job.frames), visit_ids)
-    if command[1:] == ("-m", "server.motion_adapter") and visit_ids is not None:
-        payload["visits"] = visit_ids
+    cache = nullcontext()
+    if command[1:] == ("-m", "server.motion_adapter"):
+        if visit_ids is not None:
+            payload["visits"] = visit_ids
+        if os.environ.get("SPHEREX_MOTION_EPHEMERAL_CACHE") == "1":
+            cache = TemporaryDirectory(prefix="spherex-motion-")
+    with cache as cache_dir:
+        if cache_dir is not None:
+            command += ("--cache-dir", cache_dir)
+        output = await run_detector(command, payload, len(job.frames))
+    try:
+        report = DetectorResult.model_validate_json(output)
+    except ValidationError as exc:
+        raise MotionError("The motion detector returned an invalid result.") from exc
+    return format_result(report, job.patch, len(job.frames), visit_ids)
+
+
+async def run_detector(command, payload, frame_count):
     try:
         proc = await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -173,7 +191,7 @@ async def analyze(job):
         log.warning("Could not launch SPHEREx motion detector: %s", exc)
         raise MotionError("The motion detector could not start.") from exc
     try:
-        async with asyncio.timeout(motion_timeout(len(job.frames))):
+        async with asyncio.timeout(motion_timeout(frame_count)):
             proc.stdin.write(json.dumps(payload).encode())
             await proc.stdin.drain()
             proc.stdin.close()
@@ -184,11 +202,7 @@ async def analyze(job):
                     raise MotionError("The motion detector returned too much data.")
             if await proc.wait() != 0:
                 raise MotionError("The motion detector could not analyze this sequence.")
-        try:
-            report = DetectorResult.model_validate_json(output)
-        except ValidationError as exc:
-            raise MotionError("The motion detector returned an invalid result.") from exc
-        return format_result(report, job.patch, len(job.frames), visit_ids)
+        return output
     except (BrokenPipeError, ConnectionResetError) as exc:
         raise MotionError("The motion detector stopped before reading the sequence.") from exc
     finally:

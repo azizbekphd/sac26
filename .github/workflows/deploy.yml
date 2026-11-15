@@ -1,0 +1,98 @@
+name: Verify and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements.txt
+      - run: >-
+          python -m unittest server.test_catalogs server.test_manual server.test_motion
+          server.test_playback server.test_spectrum
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npx playwright-core install --with-deps chromium
+      - run: npm run test:browser
+
+  deploy:
+    needs: verify
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.GCP_PROJECT_ID != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    concurrency:
+      group: cloud-run-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT: ${{ vars.GCP_PROJECT_ID }}
+      REGION: us-east1
+      SERVICE: sac26
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: google-github-actions/auth@v3
+        id: google
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SERVICE_ACCOUNT }}
+          token_format: access_token
+          create_credentials_file: false
+      - uses: google-github-actions/setup-gcloud@v3
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+      - name: Fetch the validated detector
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+        run: gcloud storage cp "gs://${PROJECT}-sac26-motion/motion-detector.tar.gz" ./motion-detector.tar.gz
+      - name: Build and smoke-test the container
+        run: |
+          image="$REGION-docker.pkg.dev/$PROJECT/$SERVICE/$SERVICE:$GITHUB_SHA"
+          echo "IMAGE=$image" >> "$GITHUB_ENV"
+          docker build --platform linux/amd64 -t "$image" .
+          container=$(docker run --rm -d -p 127.0.0.1:8080:8080 "$image")
+          trap 'docker stop "$container" >/dev/null' EXIT
+          if ! curl --fail --silent --show-error --retry 15 --retry-connrefused --retry-delay 1 \
+              http://127.0.0.1:8080/ -o /tmp/sac26-index.html; then
+            docker logs "$container"
+            exit 1
+          fi
+          grep -Fq 'Planet X and SPHEREx' /tmp/sac26-index.html
+          curl --fail --silent --show-error -D /tmp/sac26-embed.headers -o /dev/null http://127.0.0.1:8080/embed
+          grep -Fqi "frame-ancestors 'self' https:" /tmp/sac26-embed.headers
+          status=$(curl --silent --show-error -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/playback/missing)
+          test "$status" = 404
+      - name: Push and deploy the tested image
+        env:
+          CLOUDSDK_AUTH_ACCESS_TOKEN: ${{ steps.google.outputs.access_token }}
+        run: |
+          printf '%s' "$CLOUDSDK_AUTH_ACCESS_TOKEN" | docker login "$REGION-docker.pkg.dev" \
+            --username oauth2accesstoken --password-stdin
+          docker push "$IMAGE"
+          digest=$(docker image inspect "$IMAGE" --format='{{index .RepoDigests 0}}')
+          gcloud run deploy "$SERVICE" --project "$PROJECT" --region "$REGION" --image "$digest" \
+            --service-account "sac26-runtime@$PROJECT.iam.gserviceaccount.com" \
+            --scaling=1 --no-cpu-throttling --cpu=1 --memory=2Gi --concurrency=16 --timeout=300s \
+            --startup-probe=httpGet.path=/,httpGet.port=8080,periodSeconds=5,failureThreshold=12 --quiet

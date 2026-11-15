@@ -6,8 +6,10 @@
 !index.html
 !tsconfig.json
 !vite.config.ts
-!backend/
-!backend/*.py
+!server/
+!server/*.py
+server/test_*.py
+!motion-detector.tar.gz
 !src/
 !src/**
 !public/
