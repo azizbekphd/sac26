@@ -1,9 +1,9 @@
 {
-  "tag": "spherex-index-v1-43710192884-1",
-  "sha256": "9a474db7888c32f012920b34646c25eb464a6bdeef644146d5565faf3ea6c9fe",
-  "builtAt": "2026-11-15T11:43:21+00:00",
+  "tag": "spherex-index-v1-45034069958-1",
+  "sha256": "7e2a6b2fbe2d67cc7c47ad0beca98fbf8221f99c6fbf6a488b2d9a2db671255a",
+  "builtAt": "2026-11-22T14:45:37+00:00",
   "counts": {
     "dr1": 1179406,
-    "qr3": 448824
+    "qr3": 470514
   }
 }
